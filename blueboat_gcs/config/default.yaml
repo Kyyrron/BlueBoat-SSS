@@ -1,0 +1,51 @@
+# BlueBoat GCS — field configuration.
+# Every key here overrides the typed defaults in config/settings.py.
+# Unknown keys raise at startup on purpose (fail loudly before a sea trial).
+
+topics:
+  processed_ping: /sss_processor/processed
+  odom: /blueboat/odom
+  navsat: /mavros/global_position/global
+  compass_hdg: /mavros/global_position/compass_hdg
+  vfr_hud: /mavros/vfr_hud
+  ping_enable: /side_scan_sonar/ping/enable
+  svlog_enable: /sss_processor/log/enable
+  # ---- placeholders: set these once the other repositories are connected ----
+  detections: /sss_ai/detections
+  pinger: /blueboat/pinger_coordinates  # Float32MultiArray [x_world, y_world]
+  planned_path: /set_path            # nav_msgs/Path from path_publisher.py
+  seabed_analysis: /sss_ai/seabed_analysis  # std_msgs/String JSON
+
+pipeline:
+  launch_command: ["ros2", "launch", "blueboat_sss", "SSS_processing_launch.py"]
+  publish_ping_enable: true
+  start_delay_s: 2.0
+  stop_grace_s: 5.0            # SIGINT -> SIGTERM after this grace
+  stop_term_grace_s: 3.0       # SIGTERM -> SIGKILL after this grace
+  leftover_process_patterns: ["sss_processor_node"]
+
+mosaic:
+  cell_size_m: 0.25
+  render_hz: 4.0
+  densify: true          # SonarView-grade rasterization (rasterizer.py)
+  bilinear_splat: true   # anti-aliased accumulation; false = legacy scatter
+
+alignment:                 # sea-trial pose alignment (see settings.py)
+  pose_source: auto        # auto | embedded | gcs
+  gps_fallback: true       # dead-reckon pose from GPS+compass if odom is dead
+  pinger_frame: robot      # robot (USBL-native, vehicle-relative) | world
+
+seabed:                    # AI seabed imaging (waterfall domain)
+  rows: 256                # pings per image
+  stride: 128              # new image every N pings (50 % overlap)
+  columns: 800
+
+interpolation:
+  max_gap_m: 0.75
+  min_neighbors: 3
+
+map:
+  frame_yaw_offset_deg: 0.0
+  use_satellite: true
+
+data_root: ../../../data/SSS_data
