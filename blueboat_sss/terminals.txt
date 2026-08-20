@@ -16,7 +16,7 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
 
     cd ~/ros2_ws/
     source env.sh
-    cd src/BlueBoat-SideScanSonar/blueboat_mcs
+    cd src/BlueBoat-SideScanSonar/BlueBoat-MCS
     python3 run.py
 
 -- SSS
@@ -25,7 +25,7 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
 
     cd ~/ros2_ws/
     source env.sh
-    cd src/BlueBoat-SideScanSonar/blueboat_sss
+    cd src/BlueBoat-SideScanSonar/BlueBoat-SSS/blueboat_sss
     python3 -m blueboat_gcs.main
 
     Puis lancer rosbag ou launch file simple
@@ -34,13 +34,13 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
 
 ----- App Simu SSS
 
-    cd src/BlueBoat-SideScanSonar/blueboat_sss_sim
+    cd src/BlueBoat-SideScanSonar/BlueBoat-SSS-Sim/blueboat_sss_sim
     ros2 run blueboat_sss_sim generate_mission \
         --config $(ros2 pkg prefix blueboat_sss_sim)/share/blueboat_sss_sim/config/default_mission.yaml \
         --out ~/runs/r2 --seed 7 --speed 0.5
 
         # in ros2_ws/
-    cd ../../..
+    cd ../../../..
     ros2 launch blueboat_sss_sim full_mission_launch.py mission_dir:=$HOME/runs/r2
 
     ros2 run blueboat_sss_sim export_scene_maps --bundle ~/runs/r2
@@ -70,11 +70,11 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
     1. Python files
     After an experiment: build the map (from /ros2_ws)
 
-    python3 src/BlueBoat-SideScanSonar/custom_scripts/processed_sss_printer.py 
+    python3 src/BlueBoat-SideScanSonar/BlueBoat-SSS/blueboat_sss/custom_scripts/processed_sss_printer.py 
 
     Svlog_to_rosbag (from /ros2_ws)
 
-    python3 src/BlueBoat-SideScanSonar/custom_scripts/svlog_to_rosbag.py 
+    python3 src/BlueBoat-SideScanSonar/BlueBoat-SSS/blueboat_sss/custom_scripts/svlog_to_rosbag.py 
 
     2. Launch file
 

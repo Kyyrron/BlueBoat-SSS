@@ -17,8 +17,6 @@ install(PROGRAMS src/_custom_libraries/svlog_helper.py
 install(PROGRAMS src/_custom_libraries/math_helper.py
         DESTINATION lib/${PROJECT_NAME})
 
-install(PROGRAMS src/processed_sss_listener.py
-        DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/sss_node.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/sss_processor_node.py
