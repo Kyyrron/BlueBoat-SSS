@@ -1,0 +1,7 @@
+__pycache__/
+data/
+*.svlog
+*.mcap
+metadata.yaml
+acados_ocp.json
+c_generated_code/
