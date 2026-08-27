@@ -33,6 +33,17 @@ class SonarPing:
         -y = starboard (concatenation of the two sides).
     intensity_db:
         Per-sample intensity [dB], aligned with ``y_local``.
+    slant_range_m:
+        The sonar's *configured* range for this ping [m] (``length_mm``
+        / 1000). Optional, 0.0 when unknown. This is the geometrically
+        stable across-track extent: unlike ``max|y_local|`` it does not
+        move when the altitude estimate wobbles, so the waterfall uses
+        it to keep a fixed column scale (a wandering altitude estimate
+        otherwise rescales every row and makes the image ripple).
+    sides:
+        Which sides this ping actually carries: "both", "port" or
+        "starboard". Pings are never dropped just because one side is
+        missing, so consumers may see one-sided rows.
     """
 
     t: float
@@ -42,3 +53,5 @@ class SonarPing:
     water_depth: float
     y_local: np.ndarray  # float64, shape (N,)
     intensity_db: np.ndarray  # float32, shape (N,)
+    slant_range_m: float = 0.0
+    sides: str = "both"

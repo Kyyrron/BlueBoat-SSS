@@ -304,7 +304,7 @@ class MosaicGrid:
     """
 
     def __init__(self, cell_size_m: float = 0.25,
-                 initial_half_extent_m: float = 50.0, log_root: Path = Path(os.path.expanduser("../../../data/SSS_data"))) -> None:
+                 initial_half_extent_m: float = 50.0, log_root: Path = Path(os.path.expanduser("../../../../data/SSS_data"))) -> None:
         self._cell = cell_size_m
         n = int(math.ceil(2 * initial_half_extent_m / cell_size_m))
         self._sum:   np.ndarray = np.zeros((n, n), dtype=np.float64)

@@ -194,6 +194,56 @@ on the same synthetic clock from real `LOCAL_POSITION_NED` — which is exactly 
 These are safety nets, not a substitute for correct robot-side odom; the console
 warning is deliberately explicit so the operator knows to fix the source.
 
+### 3.1quinquies Sonar stream integrity, depth compensation & resolution (new)
+
+Full measurements and the robot-side patches are in
+`docs/SONARVIEW_SVLOG_ANALYSIS.md`. Operational summary:
+
+**Side routing.** Never trust the device/topic tag. Every profile packet carries its
+own `channel_number` (0 = port, 1 = starboard) and `transducer_heading_deg`
+(-90/+90); on real dual-Omniscan logs these agreed with each other on 100 % of
+packets but disagreed with the `src` tag on 19.8 %. The svlog reader now routes on
+`channel_number` and assembles rows by `ping_number`, which removed the mirrored and
+swapped rows entirely (11.4 % and 15.0 % of rows before).
+
+**No ping is ever dropped.**
+* The reader emits a row for every `ping_number`, including one-sided ones (that is
+  also why single-transducer logs, like Cerulean's harbour demo, now open).
+* The bottom tracker never withholds a ping: `FBRTracker.update` returns
+  locked -> provisional -> last-known, and `resolve_altitude` falls back to 0.0
+  (no correction). The only remaining drop reason is a genuinely missing pose.
+* Live, `SonarListener` uses `sonar_stream.queue_depth` (200) because the processor
+  publishes BEST_EFFORT and BEST_EFFORT never retransmits. Do **not** set the
+  subscriber to RELIABLE alone - that is QoS-incompatible with a BEST_EFFORT
+  publisher and receives nothing; change both ends together.
+* `SonarListener` counts gaps in the device's own `ping_number` and mismatched
+  port/starboard ping numbers, and reports both in the embedded console, so
+  acquisition loss is never mistaken for a display bug.
+
+**`~/raw` must stay published.** `sss_processor_node` subscribes to it and those
+framed packets are what it writes into the `.svlog`. The GCS does not subscribe to it.
+
+**Depth compensation** (`Depth comp.` in the right panel, `depth.mode` in config) is
+the altitude used for slant-range correction - the same control SonarView exposes:
+`auto` (bottom detect), `manual`, `off` (no correction, equal to SonarView's
+"Manual / 0 m"). The waterfall changes with it because the waterfall is displayed in
+corrected ground range, not raw slant range; only intensity-vs-sample-index is truly
+raw. On shallow data a wrong altitude is worse than none, so `off` is the safe choice
+when bottom detection is unreliable. In the replay window, changing it re-processes
+the log.
+
+**Mosaic resolution** is no longer a fixed 0.25 m. `MosaicService` derives the
+ground-sample distance from the median across-track sample spacing over the outer half
+of the swath (21 mm on a 25.4 m/1200-sample log, 134 mm on an 80 m/600 one), clamped by
+`mosaic.min/max_cell_size_m`. The `Resolution` selector offers Auto plus fixed values;
+changing it rebuilds the grid and clears accumulated data.
+
+**Acquisition settings matter more than any of the above.** Set the range from the
+water depth (~4x the deepest water), not from the area you hope to cover. The 80 m used
+in the sea trials cost 4x coarser sampling, half the ping rate, a 3x longer pulse, and
+broke bottom detection outright. `launch/SSS_processing_launch.py` now defaults to
+20 m.
+
 ### 3.2 AI detections — `ros/detections_listener.py` (placeholder)
 * Expected topic: `topics.detections` (default `/sss_ai/detections`)
 * Expected type: `vision_msgs/Detection2DArray` with, per detection:

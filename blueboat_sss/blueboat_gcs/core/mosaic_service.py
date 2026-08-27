@@ -40,12 +40,21 @@ class MosaicService(QObject):
     raster_updated = Signal(QImage, tuple, float)
     #: All accumulated SSS data was discarded ("Clear SSS data").
     cleared = Signal()
+    #: Emitted when the ground-sample distance changes [m/cell].
+    resolution_changed = Signal(float)
 
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
         self._config = config
+        # Resolution is adaptive: `_cell_size` starts at the configured
+        # value and is refined from the first ping's actual across-track
+        # sample spacing when mosaic.auto_cell_size is set (see
+        # _auto_tune_cell_size). A fixed 25 cm grid was throwing away
+        # most of the sensor's resolution on short-range logs.
+        self._cell_size = float(config.mosaic.cell_size_m)
+        self._cell_tuned = not config.mosaic.auto_cell_size
         self._grid = self._new_grid()
-        self._rasterizer = PingRasterizer(config.mosaic.cell_size_m)
+        self._rasterizer = PingRasterizer(self._cell_size)
         self._renderer = MosaicRenderer(
             percentiles=tuple(config.mosaic.contrast_percentiles))
         self._interpolate = False
@@ -62,11 +71,64 @@ class MosaicService(QObject):
 
     def _new_grid(self) -> MosaicGrid:
         return MosaicGrid(
-            cell_size_m=self._config.mosaic.cell_size_m,
+            cell_size_m=self._cell_size,
             initial_half_extent_m=self._config.mosaic.initial_half_extent_m)
+
+    # ---- resolution -----------------------------------------------------------
+    def _auto_tune_cell_size(self, ping: SonarPing) -> None:
+        """Derive the ground-sample distance from the data itself.
+
+        The natural limit is the across-track sample spacing,
+        range / num_results (33 mm for a 20 m / 600-sample log, 133 mm
+        for our 80 m setting). Rendering finer than that invents detail;
+        rendering much coarser — as the old fixed 0.25 m grid did —
+        discards it. One sample per cell is the honest choice, clamped
+        to keep memory sane on very long ranges.
+        """
+        y = np.abs(ping.y_local)
+        y = np.sort(y[np.isfinite(y)])
+        if y.size < 8:
+            return
+        # Ground-range spacing is not uniform: near nadir it stretches
+        # (dg/di = slant/ground * ds/di), and it tightens to the slant
+        # sample spacing at long range, where most of the swath area
+        # lies. Take the median spacing over the outer half of the
+        # swath — that is the resolution actually worth rendering.
+        d = np.diff(y[y.size // 2:])
+        d = d[d > 0]
+        if d.size == 0:
+            return
+        spacing = float(np.median(d))
+        if spacing <= 0.0:
+            return
+        cell = min(max(spacing, self._config.mosaic.min_cell_size_m),
+                   self._config.mosaic.max_cell_size_m)
+        self._cell_tuned = True
+        if abs(cell - self._cell_size) / max(self._cell_size, 1e-6) < 0.15:
+            return                                  # close enough, no rebuild
+        self.set_cell_size(cell)
+
+    def set_cell_size(self, cell_m: float) -> None:
+        """Change mosaic resolution (rebuilds the empty grid)."""
+        cell_m = min(max(float(cell_m), self._config.mosaic.min_cell_size_m),
+                     self._config.mosaic.max_cell_size_m)
+        if abs(cell_m - self._cell_size) < 1e-9:
+            return
+        self._cell_size = cell_m
+        self._grid = self._new_grid()
+        self._rasterizer = PingRasterizer(cell_m)
+        self._dirty = True
+        self.cleared.emit()
+        self.resolution_changed.emit(cell_m)
+
+    @property
+    def cell_size_m(self) -> float:
+        return self._cell_size
 
     # ---- ingestion ------------------------------------------------------------
     def on_sonar_ping(self, ping: SonarPing) -> None:
+        if not self._cell_tuned:
+            self._auto_tune_cell_size(ping)
         if self._config.mosaic.densify:
             xw, yw, v, rng = self._rasterizer.rasterize(ping)
         else:                                   # legacy point-scatter path

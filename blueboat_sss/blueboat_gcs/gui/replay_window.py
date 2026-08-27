@@ -217,6 +217,8 @@ class ReplayWindow(QMainWindow):
         p.priority_changed.connect(self.mosaic_service.set_priority_mode)
         p.display_changed.connect(self._on_display)
         p.sss_opacity_changed.connect(self.mosaic_layer.set_opacity)
+        p.resolution_changed.connect(self._on_resolution_changed)
+        p.depth_mode_changed.connect(self._on_depth_mode_changed)
         p.clear_sss_clicked.connect(self._clear_outputs)
         p.clear_overlays_clicked.connect(self._clear_overlays)
         p.measure_toggled.connect(self._on_measure_toggled)
@@ -477,6 +479,39 @@ class ReplayWindow(QMainWindow):
                 rclpy.shutdown()
 
     # ------------------------------------------------------------- helpers --
+    def _on_resolution_changed(self, cell_m: float) -> None:
+        if cell_m <= 0.0:
+            self.mosaic_service._cell_tuned = False
+        else:
+            self.mosaic_service.set_cell_size(cell_m)
+
+    def _on_depth_mode_changed(self, mode: str, manual_m: float) -> None:
+        """Reprocess the loaded log with a new depth-compensation source.
+
+        Slant-range correction happens at decode time, so the mission is
+        re-read; that is exactly what SonarView does when you change the
+        Depth Compensation source (and why its waterfall changes too --
+        the waterfall is displayed in corrected ground range, not raw
+        slant range)."""
+        self._config.depth.mode = mode
+        self._config.depth.manual_m = manual_m
+        from ..core.svlog import load_svlog
+        progress = QProgressDialog(
+            f"Re-processing with depth compensation: {mode}...", None, 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        try:
+            self._mission = load_svlog(
+                self._mission.path,
+                progress=lambda f: progress.setValue(int(f * 100)),
+                depth_mode=mode, manual_depth_m=manual_m)
+        finally:
+            progress.close()
+        self._clear_outputs()
+        self.trajectory_layer.clear()
+        self.statusBar().showMessage(
+            f"Re-processed with depth compensation '{mode}' - "
+            f"{self._mission.ping_count} pings. Press Render range.", 12000)
+
     def _on_view_mode(self, mode: str) -> None:
         waterfall = (mode == rp.VIEW_WATERFALL)
         self._stack.setCurrentWidget(self.waterfall_view if waterfall
@@ -536,7 +571,9 @@ def open_svlog_dialog(parent, config: AppConfig) -> Optional[ReplayWindow]:
     progress.setMinimumDuration(0)
     try:
         mission = load_svlog(
-            Path(path), progress=lambda f: progress.setValue(int(f * 100)))
+            Path(path), progress=lambda f: progress.setValue(int(f * 100)),
+            depth_mode=config.depth.mode,
+            manual_depth_m=config.depth.manual_m)
     except (OSError, ValueError) as exc:
         progress.close()
         QMessageBox.critical(parent, "Open SVLOG",
@@ -546,8 +583,10 @@ def open_svlog_dialog(parent, config: AppConfig) -> Optional[ReplayWindow]:
     if mission.ping_count == 0:
         QMessageBox.warning(
             parent, "Open SVLOG",
-            "No processable ping pairs found in this log\n"
-            "(missing pose data before pings, or FBR never bootstrapped).")
+            "No usable pings found in this log.\n\n"
+            "Every profile lacked a pose (no LOCAL_POSITION_NED before the "
+            "sonar data). Single-sided logs and logs without a bottom lock "
+            "now load normally.")
         return None
     win = ReplayWindow(mission, config, parent=parent)
     win.show()

@@ -74,7 +74,16 @@ class WaterfallService(QObject):
         y = ping.y_local
         if y.size < 2:
             return
-        r = float(np.abs(y).max())
+        # Column scale: prefer the sonar's CONFIGURED slant range, which
+        # is constant for a given setting. max|y_local| depends on the
+        # altitude estimate (ground = sqrt(slant^2 - h^2)), so when the
+        # bottom detection wobbles — 4.7 m to 45 m on real sea-trial
+        # data — every row gets a different scale and the waterfall
+        # ripples. Falling back to max|y_local| keeps older logs and the
+        # simulator working.
+        r = float(ping.slant_range_m) if ping.slant_range_m > 0.0 else 0.0
+        if r <= 0.0:
+            r = float(np.abs(y).max())
         if r <= 0.0:
             return
         self._range_m = r

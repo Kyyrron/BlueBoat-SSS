@@ -25,10 +25,21 @@ pipeline:
   leftover_process_patterns: ["sss_processor_node"]
 
 mosaic:
-  cell_size_m: 0.25
+  auto_cell_size: true     # derive resolution from the log (range/num_results)
+  cell_size_m: 0.10        # fallback / manual value when auto is off
+  min_cell_size_m: 0.02
+  max_cell_size_m: 1.00
   render_hz: 4.0
   densify: true          # SonarView-grade rasterization (rasterizer.py)
   bilinear_splat: true   # anti-aliased accumulation; false = legacy scatter
+
+sonar_stream:              # live ProcessedSSSPing reception
+  queue_depth: 200         # BEST_EFFORT cannot retransmit -> buffer instead
+  warn_on_ping_gap: true
+
+depth:                     # slant-range correction source
+  mode: auto               # auto | manual | off  (off == SonarView "Manual 0 m")
+  manual_m: 0.0
 
 alignment:                 # sea-trial pose alignment (see settings.py)
   pose_source: auto        # auto | embedded | gcs
@@ -48,4 +59,4 @@ map:
   frame_yaw_offset_deg: 0.0
   use_satellite: true
 
-data_root: ../../../data/SSS_data
+data_root: ../../../../data/SSS_data

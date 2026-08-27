@@ -210,6 +210,8 @@ class MainWindow(QMainWindow):
         self.right_panel.priority_changed.connect(
             self.recording.note_priority_mode)
         self.right_panel.display_changed.connect(self._on_display_changed)
+        self.right_panel.resolution_changed.connect(self._on_resolution_changed)
+        self.right_panel.depth_mode_changed.connect(self._on_depth_mode_changed)
         self.right_panel.clear_overlays_clicked.connect(
             self._on_clear_overlays)
         self.right_panel.clear_sss_clicked.connect(self._on_clear_sss)
@@ -290,6 +292,23 @@ class MainWindow(QMainWindow):
         # Same detection on the waterfall view (row found by ping time).
         self.waterfall_service.add_detection(det.t, det.x, det.y,
                                              det.class_name)
+
+    # ---- display settings ---------------------------------------------------
+    def _on_resolution_changed(self, cell_m: float) -> None:
+        """0 = auto (re-derive from the next ping), else a fixed GSD."""
+        if cell_m <= 0.0:
+            self._mosaic_service._cell_tuned = False
+            self.statusBar().showMessage(
+                "Mosaic resolution: auto (from the sonar's sample spacing).", 6000)
+        else:
+            self._mosaic_service.set_cell_size(cell_m)
+
+    def _on_depth_mode_changed(self, mode: str, manual_m: float) -> None:
+        self._config.depth.mode = mode
+        self._config.depth.manual_m = manual_m
+        self.statusBar().showMessage(
+            f"Depth compensation: {mode}"
+            + (f" ({manual_m:.1f} m)" if mode == "manual" else ""), 6000)
 
     # ---- sea-trial pose alignment ------------------------------------------------
     def _align_ping_pose(self, ping: SonarPing) -> SonarPing:

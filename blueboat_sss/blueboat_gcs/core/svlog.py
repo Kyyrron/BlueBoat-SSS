@@ -109,7 +109,11 @@ def decode_os_mono_profile(payload: bytes) -> dict:
     return {"start_mm": start_mm, "length_mm": length_mm,
             "num_results": num_results, "max_pwr_db": max_pwr_db,
             "min_pwr_db": min_pwr_db, "pwr": pwr,
-            "timestamp_ms": timestamp_ms}
+            "timestamp_ms": timestamp_ms, "ping_number": ping_number,
+            # Authoritative side identity (see load_svlog): the device's
+            # own channel tag, plus the transducer bearing as fallback.
+            "channel_number": channel_number, "gain_index": gain_index,
+            "transducer_heading_deg": transducer_heading_deg}
 
 
 def ned_to_enu_xyz(x_n: float, y_e: float, z_d: float):
@@ -205,10 +209,25 @@ class _SideTracker:
 
 
 class FBRTracker:
+    """Dual-side altitude tracker with a *provisional* output.
+
+    The original tracker returned ``None`` until ten consecutive
+    detections agreed to within 0.30 m, and the caller dropped every
+    ping until then — which silently discarded the start of every
+    mission and, whenever the lock was lost, arbitrary chunks in the
+    middle. SonarView displays data from the very first ping, so we
+    match that: ``update`` always returns the best altitude available
+    (locked > provisional > last known), and ``locked`` reports whether
+    the strict agreement criterion is currently satisfied, so callers
+    can flag quality without throwing data away.
+    """
+
     def __init__(self) -> None:
         self._port = _SideTracker()
         self._stbd = _SideTracker()
         self._altitude: Optional[float] = None
+        self._last_known: Optional[float] = None
+        self.locked = False
 
     def update(self, port_alt, stbd_alt) -> Optional[float]:
         p, s = self._port.update(port_alt), self._stbd.update(stbd_alt)
@@ -218,7 +237,46 @@ class FBRTracker:
             self._altitude = p
         elif s is not None:
             self._altitude = s
-        return self._altitude
+        else:
+            self._altitude = None
+        self.locked = self._altitude is not None
+        if self._altitude is not None:
+            self._last_known = self._altitude
+            return self._altitude
+        # Not locked: provisional estimate from the raw detections so the
+        # ping is still usable, then fall back to the last known value.
+        raw = [v for v in (port_alt, stbd_alt) if v is not None]
+        if raw:
+            self._last_known = max(raw)
+            return self._last_known
+        return self._last_known
+
+
+def resolve_altitude(tracker: "FBRTracker", port_alt, stbd_alt,
+                     mode: str = "auto",
+                     manual_m: float = 0.0) -> Tuple[float, bool]:
+    """Depth-compensation policy -> (altitude_m, locked).
+
+    Mirrors SonarView's "Depth Compensation" source selector:
+
+    * ``auto``   — bottom detection (our FBR tracker), provisional value
+      accepted so no ping is ever discarded; falls back to 0.0 (no
+      correction) while nothing has ever been detected;
+    * ``manual`` — a fixed operator-supplied altitude;
+    * ``off``    — altitude 0: ground range = slant range, no water
+      column removed. This is SonarView's "Manual / 0 m" mode, which on
+      shallow data (h << R) is very close to the corrected geometry and
+      is far more robust than a wrong altitude, because an over-estimated
+      altitude both deletes real samples and warps the near range.
+    """
+    if mode == "off":
+        return 0.0, True
+    if mode == "manual":
+        return float(manual_m), True
+    alt = tracker.update(port_alt, stbd_alt)
+    if alt is None:
+        return 0.0, False
+    return float(alt), tracker.locked
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +297,10 @@ class SvlogMission:
     origin: Optional[Tuple[float, float]] = None    # (lat, lon) at (x0, y0)
     origin_xy: Tuple[float, float] = (0.0, 0.0)
     ping_count: int = 0
-    dropped_bootstrap: int = 0
+    dropped_bootstrap: int = 0      # legacy field, kept for compatibility
+    dropped_no_pose: int = 0        # no odom had arrived yet
+    unlocked_pings: int = 0         # emitted with a provisional altitude
+    both_sides: int = 0             # rows carrying port AND starboard
 
     @property
     def pings(self) -> List[SonarPing]:
@@ -247,9 +308,27 @@ class SvlogMission:
 
 
 def load_svlog(path: Path,
-               progress: Optional[Callable[[float], None]] = None
-               ) -> SvlogMission:
+               progress: Optional[Callable[[float], None]] = None,
+               depth_mode: str = "auto",
+               manual_depth_m: float = 0.0) -> SvlogMission:
     """Read + process an entire .svlog into a SvlogMission.
+
+    Two behaviours differ deliberately from the original implementation,
+    both driven by measurements on real logs (see
+    docs/SONARVIEW_SVLOG_ANALYSIS.md):
+
+    1. **Side routing uses the packet's own ``channel_number``**, never
+       the device/``src`` tag. In a real dual-Omniscan recording 19.8 %
+       of packets carried the wrong ``src``, which put starboard data on
+       the port side (and vice-versa) and produced the mirrored mosaic.
+       ``channel_number`` and ``transducer_heading_deg`` agree on 100 %
+       of packets in every log inspected, so the packet is trusted over
+       its envelope.
+    2. **Pings are assembled, never paired-and-dropped.** Profiles are
+       grouped by ``ping_number`` and every group is emitted, even when
+       only one side is present (that also makes single-transducer logs,
+       like Cerulean's own harbour demo, load normally). The previous
+       50 ms pairing threw away 10.4 % of the available rows.
 
     ``progress`` (0..1) is called periodically for GUI progress dialogs.
     """
@@ -272,13 +351,12 @@ def load_svlog(path: Path,
     latest_lpn: Optional[dict] = None
     last_state_emit_ns = -10**18
     state_period_ns = int(1e9 / 5.0)                # 5 Hz, like live GUI
-
-    # Pairing + processing state.
-    port_buf: Deque[Tuple[int, dict]] = deque()
-    stbd_buf: Deque[Tuple[int, dict]] = deque()
-    fbr = FBRTracker()
-    cur_pose: Optional[Tuple[float, float, float]] = None   # x, y, yaw
+    cur_pose: Optional[Tuple[float, float, float]] = None
     cur_speed = 0.0
+
+    #: ping_number -> {channel: profile}; poses/clock captured on arrival.
+    groups: dict = {}
+    order: List[int] = []
 
     def emit_state(t_ns: int) -> None:
         nonlocal last_state_emit_ns
@@ -296,62 +374,29 @@ def load_svlog(path: Path,
             t=t_ns / 1e9, x=x, y=y, yaw=yaw, lat=lat, lon=lon,
             heading_deg=yaw_to_compass_deg(yaw), speed_mps=cur_speed)))
 
-    def try_pair() -> None:
-        while port_buf and stbd_buf:
-            (p_ns, p), (s_ns, s) = port_buf[0], stbd_buf[0]
-            dt = p_ns - s_ns
-            if abs(dt) <= PAIR_TOLERANCE_NS:
-                port_buf.popleft()
-                stbd_buf.popleft()
-                process_pair(p_ns, p, s)
-            elif dt > 0:
-                stbd_buf.popleft()
-            else:
-                port_buf.popleft()
-
-    def process_pair(t_ns: int, p: dict, s: dict) -> None:
-        if cur_pose is None:
-            return                                   # no odom yet: drop
-        p_db = scale_to_db(p["pwr"], p["min_pwr_db"], p["max_pwr_db"])
-        s_db = scale_to_db(s["pwr"], s["min_pwr_db"], s["max_pwr_db"])
-        p_alt = detect_fbr_slant_m(p_db, p["start_mm"], p["length_mm"],
-                                   p["num_results"])
-        s_alt = detect_fbr_slant_m(s_db, s["start_mm"], s["length_mm"],
-                                   s["num_results"])
-        altitude = fbr.update(p_alt, s_alt)
-        if altitude is None:
-            mission.dropped_bootstrap += 1
-            return
-        p_y, p_i = project_side(p_db, p["start_mm"], p["length_mm"],
-                                p["num_results"], altitude,
-                                TRANSDUCER_Y_OFFSET_PORT_M, +1.0)
-        s_y, s_i = project_side(s_db, s["start_mm"], s["length_mm"],
-                                s["num_results"], altitude,
-                                TRANSDUCER_Y_OFFSET_STBD_M, -1.0)
-        x, y, yaw = cur_pose
-        mission.events.append(("ping", t_ns / 1e9, SonarPing(
-            t=t_ns / 1e9, robot_x=x, robot_y=y, yaw=yaw,
-            water_depth=altitude + TRANSDUCER_SUBMERSION_M,
-            y_local=np.concatenate([p_y, s_y]),
-            intensity_db=np.concatenate([p_i, s_i]))))
-        mission.ping_count += 1
-
     packets = list(walk_packets(data))
     for k, pkt in enumerate(packets):
         if progress is not None and k % 2000 == 0:
-            progress(k / max(len(packets), 1))
+            progress(0.5 * k / max(len(packets), 1))
         pid = struct.unpack_from("<H", pkt, 4)[0]
-        src = pkt[6]
         payload = pkt[8:-2]
-        if pid == OS_MONO_PROFILE_ID and src in (DEVICE_ID_PORT,
-                                                 DEVICE_ID_STBD):
+        if pid == OS_MONO_PROFILE_ID:
             t_ns = tick(None)
             try:
                 d = decode_os_mono_profile(payload)
             except ValueError:
                 continue
-            (port_buf if src == DEVICE_ID_PORT else stbd_buf).append((t_ns, d))
-            try_pair()
+            # Authoritative side: the packet's own channel_number, with
+            # the transducer bearing as a fallback for exotic writers.
+            ch = d["channel_number"]
+            if ch not in (0, 1):
+                ch = 1 if d["transducer_heading_deg"] > 0 else 0
+            key = d["ping_number"]
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {"t_ns": t_ns, "pose": cur_pose}
+                order.append(key)
+            g[ch] = d
         elif pid == MAVLINK_WRAPPER_ID:
             try:
                 m = json.loads(payload.decode("utf-8")).get("message", {})
@@ -379,6 +424,58 @@ def load_svlog(path: Path,
                 cur_pose = (px, py, latest_yaw)
                 cur_speed = math.hypot(vx, vy)
                 emit_state(t_ns)
+
+    # ---- assemble: one row per ping_number, one-sided rows included ----
+    fbr = FBRTracker()
+    order.sort()                       # restores acquisition order exactly
+    for i, key in enumerate(order):
+        if progress is not None and i % 500 == 0:
+            progress(0.5 + 0.5 * i / max(len(order), 1))
+        g = groups[key]
+        pose = g["pose"]
+        if pose is None:
+            mission.dropped_no_pose += 1
+            continue                   # genuinely unplaceable (no odom yet)
+        p, s = g.get(0), g.get(1)
+        db_p = alt_p = db_s = alt_s = None
+        if p is not None:
+            db_p = scale_to_db(p["pwr"], p["min_pwr_db"], p["max_pwr_db"])
+            alt_p = detect_fbr_slant_m(db_p, p["start_mm"], p["length_mm"],
+                                       p["num_results"])
+        if s is not None:
+            db_s = scale_to_db(s["pwr"], s["min_pwr_db"], s["max_pwr_db"])
+            alt_s = detect_fbr_slant_m(db_s, s["start_mm"], s["length_mm"],
+                                       s["num_results"])
+        altitude, locked = resolve_altitude(fbr, alt_p, alt_s,
+                                            depth_mode, manual_depth_m)
+        if not locked:
+            mission.unlocked_pings += 1
+        ys, ins = [], []
+        if p is not None:
+            y, iv = project_side(db_p, p["start_mm"], p["length_mm"],
+                                 p["num_results"], altitude,
+                                 TRANSDUCER_Y_OFFSET_PORT_M, +1.0)
+            ys.append(y); ins.append(iv)
+        if s is not None:
+            y, iv = project_side(db_s, s["start_mm"], s["length_mm"],
+                                 s["num_results"], altitude,
+                                 TRANSDUCER_Y_OFFSET_STBD_M, -1.0)
+            ys.append(y); ins.append(iv)
+        if not ys:
+            continue
+        ref = p if p is not None else s
+        x, y0, yaw = pose
+        mission.events.append(("ping", g["t_ns"] / 1e9, SonarPing(
+            t=g["t_ns"] / 1e9, robot_x=x, robot_y=y0, yaw=yaw,
+            water_depth=altitude + TRANSDUCER_SUBMERSION_M,
+            y_local=np.concatenate(ys),
+            intensity_db=np.concatenate(ins),
+            slant_range_m=ref["length_mm"] / 1000.0,
+            sides=("both" if (p is not None and s is not None)
+                   else ("port" if p is not None else "starboard")))))
+        mission.ping_count += 1
+        if p is not None and s is not None:
+            mission.both_sides += 1
 
     mission.events.sort(key=lambda e: e[1])
     if mission.events:

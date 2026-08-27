@@ -268,6 +268,24 @@ strip — manual zoom −/+ (sharing the wheel-zoom math) and an "AI detections"
 gating the marker overlay — which, being children of the view, appear in both the main
 and replay windows with no extra wiring.
 
+### 2.19 Sonar stream integrity & adaptive rendering (update)
+Driven by measurements on paired SonarView/our-stack recordings
+(`docs/SONARVIEW_SVLOG_ANALYSIS.md`). Four decisions:
+(1) **the packet is authoritative, not its envelope** - side comes from
+`channel_number` (fallback: sign of `transducer_heading_deg`), because 19.8 % of real
+packets carried a wrong `src` tag and produced the mirrored mosaic;
+(2) **assemble, never pair-and-drop** - rows are grouped by `ping_number` and emitted
+even when one-sided, which recovered 10.4 % of discarded rows and made single-
+transducer logs loadable;
+(3) **never withhold a ping for lack of a depth lock** - the FBR tracker returns
+locked/provisional/last-known and `resolve_altitude` implements SonarView's
+auto|manual|off source selector;
+(4) **nothing is rendered at a fixed resolution** - `MosaicService` derives the
+ground-sample distance from the data's own across-track sample spacing, and
+`SonarPing.slant_range_m` gives the waterfall a column scale that does not move when
+the altitude estimate wobbles (live, it is recovered exactly as
+`hypot(ground_max, water_depth)`).
+
 ## 3. Module map
 
 | Path | Responsibility |
@@ -287,6 +305,7 @@ and replay windows with no extra wiring.
 | `ros/sonar_listener.py` | `/sss_processor/processed` → `SonarPing` |
 | `ros/telemetry_listener.py` | odom + NavSatFix + compass + VfrHud → `RobotState` (5 Hz); GPS dead-reckoning fallback |
 | `utils/pose_alignment.py` | frozen-pose detector, GPS pose synthesizer, robot→world (sea-trial fix) |
+| `ros/sonar_listener.py` | ProcessedSSSPing → SonarPing; stream-health counters, slant-range recovery |
 | `ros/detections_listener.py` | **placeholder** — AI detections integration point |
 | `ros/pinger_listener.py` | USBL pinger (Float32MultiArray [x, y] on /blueboat/pinger_coordinates) |
 | `ros/path_listener.py` | planned mission path (`nav_msgs/Path` from path_publisher.py) |

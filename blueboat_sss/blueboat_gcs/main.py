@@ -64,8 +64,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             from .ros.sonar_listener import SonarListener
             from .ros.telemetry_listener import TelemetryListener
             node = ros_manager.node
-            SonarListener(node, signals, config.topics.processed_ping)
-            TelemetryListener(node, signals, config.topics)
+            SonarListener(node, signals, config.topics.processed_ping,
+                          queue_depth=config.sonar_stream.queue_depth,
+                          warn_on_ping_gap=config.sonar_stream.warn_on_ping_gap)
+            TelemetryListener(node, signals, config.topics,
+                              gps_fallback=config.alignment.gps_fallback)
             DetectionsListener(node, signals, config.topics.detections)
             PingerListener(node, signals, config.topics.pinger)
             PathListener(node, signals, config.topics.planned_path)

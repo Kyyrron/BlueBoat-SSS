@@ -193,7 +193,7 @@ class SSSProcessorNode(Node):
         #self.date = datetime.today().strftime('%Y_%m_%d-%H_%M')
         #self.declare_parameter("log_folder", self.date)
         #self.folder_name = self.get_parameter("log_folder").value
-        self.log_root = Path(os.path.expanduser("../../../data/SSS_data")) #/ self.folder_name
+        self.log_root = Path(os.path.expanduser("../../../../data/SSS_data")) #/ self.folder_name
         #self.log_root.mkdir(parents=True, exist_ok=True)
 
         self.get_logger().info(f"log directory: {self.log_root}")

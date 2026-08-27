@@ -70,7 +70,15 @@ class PipelineConfig:
 
 @dataclass
 class MosaicConfig:
-    cell_size_m: float = 0.25          # same rationale as the old listener
+    # Mosaic ground-sample distance. NOT a fixed constant any more:
+    # with auto_cell_size the grid adapts to the data actually loaded
+    # (across-track sample spacing = range / num_results, clamped), so a
+    # 20 m / 600-sample log renders at ~3 cm instead of being blurred to
+    # 25 cm, which is most of the resolution gap against SonarView.
+    cell_size_m: float = 0.10
+    auto_cell_size: bool = True
+    min_cell_size_m: float = 0.02
+    max_cell_size_m: float = 1.00
     initial_half_extent_m: float = 30.0
     render_hz: float = 4.0             # GUI raster refresh rate
     contrast_percentiles: List[float] = field(default_factory=lambda: [2.0, 98.0])
@@ -83,6 +91,56 @@ class MosaicConfig:
     # both to false to recover the legacy point-scatter mosaic (A/B).
     densify: bool = True
     bilinear_splat: bool = True
+
+
+@dataclass
+class SonarStreamConfig:
+    """Live sonar stream reception (ros/sonar_listener.py).
+
+    ``queue_depth``: subscriber history depth. The processor publishes
+    ProcessedSSSPing BEST_EFFORT, so a subscriber may only be
+    BEST_EFFORT too (RELIABLE would be QoS-incompatible and receive
+    nothing at all). BEST_EFFORT does not retransmit, so the only
+    protection against losing pings while the GUI thread is busy is a
+    deep queue: 10 slots is 0.5 s at 20 Hz, which a single mosaic
+    re-render can overrun. 200 slots is ~10 s of headroom and costs
+    only a few MB.
+
+    ``warn_on_ping_gap``: log when the device's own ping_number skips,
+    so real acquisition loss is visible in the console instead of
+    silently thinning the mosaic (our sea-trial logs lost ~8 % of pings
+    upstream of the GCS; SonarView's recordings lose none).
+    """
+
+    queue_depth: int = 200
+    warn_on_ping_gap: bool = True
+
+
+@dataclass
+class DepthConfig:
+    """Depth compensation — the altitude used for slant-range correction.
+
+    Mirrors SonarView's "Depth Compensation" source selector, because the
+    same trade-off applies to us (see docs/SONARVIEW_SVLOG_ANALYSIS.md):
+
+    * ``auto``   — bottom detection (FBR). Never drops a ping: an
+      unlocked tracker falls back to a provisional or last-known value.
+    * ``manual`` — fixed altitude in ``manual_m``.
+    * ``off``    — no correction (ground range = slant range). This is
+      SonarView's "Manual / 0 m"; for shallow water with h << R it is
+      geometrically almost identical and far more robust than a wrong
+      altitude, which both deletes real samples and warps the near range.
+
+    ``warn_bottom_fraction``: if the detected bottom sits closer than
+    this fraction of the ping, the range setting is too long for the
+    depth and bottom detection becomes unreliable (our 80 m sea-trial
+    logs put the bottom at 8 % — SonarView reported "Detected N/A" on
+    exactly those files).
+    """
+
+    mode: str = "auto"                 # auto | manual | off
+    manual_m: float = 0.0
+    warn_bottom_fraction: float = 0.12
 
 
 @dataclass
@@ -162,9 +220,11 @@ class AppConfig:
     interpolation: InterpolationConfig = field(default_factory=InterpolationConfig)
     seabed: SeabedConfig = field(default_factory=SeabedConfig)
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
+    depth: DepthConfig = field(default_factory=DepthConfig)
+    sonar_stream: SonarStreamConfig = field(default_factory=SonarStreamConfig)
     map: MapConfig = field(default_factory=MapConfig)
     sim: SimConfig = field(default_factory=SimConfig)
-    data_root: str = "../../../data/SSS_data"   # same root as the existing pipeline
+    data_root: str = "../../../../data/SSS_data"   # same root as the existing pipeline
 
 
 def _apply(obj: Any, data: dict, path: str = "") -> None:

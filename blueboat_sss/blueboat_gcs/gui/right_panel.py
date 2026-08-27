@@ -33,6 +33,8 @@ class RightPanel(QWidget):
     clear_overlays_clicked = Signal()
     clear_sss_clicked = Signal()
     sss_opacity_changed = Signal(float)    # 0.0 .. 1.0
+    resolution_changed = Signal(float)     # mosaic cell size [m], 0 = auto
+    depth_mode_changed = Signal(str, float)  # (auto|manual|off, manual_m)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -137,6 +139,48 @@ class RightPanel(QWidget):
             "Oldest (first pass), Newest (last pass).")
         form.addRow("Priority", self._priority)
 
+        # ---- resolution --------------------------------------------------------
+        # SonarView does not render at a fixed ground-sample distance and
+        # neither do we any more: "Auto" follows the sonar's own sample
+        # spacing (range / num_results), which is where most of the
+        # apparent sharpness difference came from.
+        self._resolution = QComboBox()
+        self._resolution.addItem("Auto (from data)", 0.0)
+        for cm in (2, 5, 10, 15, 25, 50):
+            self._resolution.addItem(f"{cm} cm", cm / 100.0)
+        self._resolution.setToolTip(
+            "Mosaic ground-sample distance.\n"
+            "Auto uses the sonar's across-track sample spacing.\n"
+            "Changing it rebuilds the mosaic, so previous data is cleared.")
+        self._resolution.currentIndexChanged.connect(
+            lambda i: self.resolution_changed.emit(
+                float(self._resolution.itemData(i))))
+        form.addRow("Resolution", self._resolution)
+
+        # ---- depth compensation -------------------------------------------------
+        # Same control SonarView exposes: the altitude used for
+        # slant-range correction. "Off" == their Manual/0 m mode, which
+        # is the robust choice when bottom detection is unreliable.
+        self._depth_mode = QComboBox()
+        for label, key in (("Auto (bottom detect)", "auto"),
+                           ("Manual", "manual"),
+                           ("Off (no correction)", "off")):
+            self._depth_mode.addItem(label, key)
+        self._depth_mode.setToolTip(
+            "Altitude used for slant-range correction.\n"
+            "Auto: track the first bottom return.\n"
+            "Manual: fixed value below.\n"
+            "Off: plot slant range directly (SonarView 'Manual 0 m').")
+        self._depth_manual = QSlider(Qt.Horizontal)
+        self._depth_manual.setRange(0, 300)          # 0.0 .. 30.0 m
+        self._depth_manual.setValue(0)
+        self._depth_manual_lbl = QLabel("0.0 m")
+        self._depth_mode.currentIndexChanged.connect(self._emit_depth)
+        self._depth_manual.valueChanged.connect(self._emit_depth)
+        form.addRow("Depth comp.", self._depth_mode)
+        form.addRow("Manual depth",
+                    self._wrap(self._depth_manual, self._depth_manual_lbl, ""))
+
         # Dynamic range is ALWAYS derived from the data (percentiles).
         # The former manual min/max dB sliders were removed: real
         # Omniscan data (uint16 pwr_results, per-gain min/max_pwr_db
@@ -200,6 +244,13 @@ class RightPanel(QWidget):
         self._bright.setValue(int(d.brightness * 100))
         self._opacity.setValue(100)
         self._emit_display()
+
+    def _emit_depth(self, *_a) -> None:
+        mode = self._depth_mode.currentData()
+        manual = self._depth_manual.value() / 10.0
+        self._depth_manual_lbl.setText(f"{manual:.1f} m")
+        self._depth_manual.setEnabled(mode == "manual")
+        self.depth_mode_changed.emit(mode, manual)
 
     def _emit_opacity(self, value: int) -> None:
         self._opacity_lbl.setText(f"{value} %")
