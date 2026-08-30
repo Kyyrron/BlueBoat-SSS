@@ -4,12 +4,9 @@
 
 from __future__ import annotations
 
-import os
 import math
-from pathlib import Path
 import numpy as np
 from collections import deque
-import matplotlib.pyplot as plt
 from typing import Deque, List, Optional, Sequence, Tuple
 
 def project_to_world(
@@ -81,10 +78,13 @@ def find_noise_window_start(
     pwr_db : sequence of float
         Per-sample intensity in dB (already scaled from u16 via scale_to_db).
     search_max : int
-        How many samples from the start to consider. Must be smaller than
-        the expected sample index of the shallowest plausible FBR — for
-        example, 60 samples × 25 mm/sample = 1.5 m of slant range. For
-        deployments where altitude could be < 1.5 m the value can be lowered.
+        How many samples from the start to consider. This is a SAMPLE
+        COUNT, so the slant range it covers scales with
+        `length_mm / num_results`: 60 samples is 2.0 m at the 33.3 mm/sample
+        default (20 m / 600), 3.0 m at 30 m / 600, and 8.0 m at 80 m / 600.
+        It must stay smaller than the expected sample index of the
+        shallowest plausible FBR, so lower it — or shorten the range — for
+        deployments whose altitude falls below that reach.
     drop_db : float
         How far below the ringing peak we consider "settled". 10 dB is the
         empirical value from the pool run and matches the literature
@@ -93,9 +93,9 @@ def find_noise_window_start(
         How many consecutive samples must be below target to count as
         settled. Guards against single-sample dips inside the ringing tail.
     fallback : int
-        Returned when no settle is found in [0, search_max). 30 ≈ 0.75 m
-        for the Omniscan's typical 25 mm sample spacing — past any sensible
-        ringing tail, before any sensible bottom return.
+        Returned when no settle is found in [0, search_max). Also a sample
+        count: 30 ≈ 1.0 m at the 33.3 mm/sample default (20 m / 600) — past
+        any sensible ringing tail, before any sensible bottom return.
 
     Returns
     -------
@@ -169,6 +169,81 @@ def project_side(
         y_out.append(float(side_sign * (transducer_y_offset_m + ground)))
         db_out.append(float(pwr_db[i]))
     return y_out, db_out
+
+
+class PingCounterOffset:
+    """Estimator for the constant offset between the two devices' ping counters.
+
+    The two Omniscan 450 units are independent devices with independent
+    `ping_number` counters, and the offset between them is arbitrary but
+    constant for a power-up cycle. Measured across the project's field
+    `.svlog` corpus it is 0 on ten logs, -1 on four and +60 on two, so the
+    raw counter cannot be used directly as a cross-side assembly key: on a
+    +60 log it would pair a port ping with a starboard ping acquired ~1.7 s
+    earlier.
+
+    The offset is recovered by voting: each ping is compared against the
+    opposite side's *temporally nearest* ping, and the mode of
+    `port_ping_number - starboard_ping_number` over a rolling window is the
+    estimate.
+
+    Voting against the most recent opposite-side ping instead of the nearest
+    one is **bimodal** -- it splits roughly evenly between the true offset
+    and offset +-1 depending on interleave phase -- so a vote is deferred by
+    `defer` arrivals, until both the earlier and the later opposite-side
+    neighbours are available. With that deferral the winning mode holds
+    >=94 % of votes on every two-sided log in the corpus.
+    """
+
+    def __init__(self, window: int = 64, defer: int = 4) -> None:
+        self._defer = defer
+        self._recent: dict = {0: deque(maxlen=2 * defer + 1),
+                              1: deque(maxlen=2 * defer + 1)}
+        self._pending: Deque[Tuple[int, int, int]] = deque()
+        self._votes: Deque[int] = deque(maxlen=window)
+        self._offset = 0
+
+    @property
+    def offset(self) -> int:
+        """Value to add to a starboard `ping_number` to get the port key."""
+        return self._offset
+
+    @property
+    def votes(self) -> int:
+        return len(self._votes)
+
+    @property
+    def confidence(self) -> float:
+        """Share of the rolling window agreeing with the current estimate."""
+        if not self._votes:
+            return 0.0
+        return self._votes.count(self._offset) / len(self._votes)
+
+    def observe(self, channel: int, ping_number: int, stamp_ns: int) -> None:
+        """Feed one arriving ping. `channel` is 0 = port, 1 = starboard."""
+        self._recent[channel].append((stamp_ns, ping_number))
+        self._pending.append((channel, ping_number, stamp_ns))
+        if len(self._pending) <= self._defer:
+            return
+        ch, pn, ts = self._pending.popleft()
+        opposite = self._recent[1 - ch]
+        if not opposite:
+            return
+        _, opn = min(opposite, key=lambda e: abs(e[0] - ts))
+        self._votes.append((pn - opn) if ch == 0 else (opn - pn))
+        # Mode of the rolling window; ties resolve to the incumbent, which
+        # keeps the estimate from flapping between two equally-supported
+        # values.
+        best, best_n = self._offset, self._votes.count(self._offset)
+        for cand in set(self._votes):
+            n = self._votes.count(cand)
+            if n > best_n:
+                best, best_n = cand, n
+        self._offset = best
+
+    def key(self, channel: int, ping_number: int) -> int:
+        """Assembly key: the ping number expressed on the port counter."""
+        return ping_number if channel == 0 else ping_number + self._offset
 
 
 class _SideTracker:
@@ -259,6 +334,15 @@ class FBRTracker:
     and returns noise, the other side bootstraps and carries the estimate
     by itself. The system produces an altitude as soon as EITHER side is
     self-consistent for `bootstrap_pings` detections.
+
+    `update` never withholds a usable value: it returns the best altitude
+    available -- locked, else provisional (this ping's own raw detections),
+    else the last known one -- and `locked` reports whether the strict
+    agreement criterion is currently met. Callers flag quality with
+    `locked`; they do not gate emission on it, because withholding pings
+    until lock silently discards the start of every mission (NON-NEGOTIABLE
+    #2). `None` comes back only when nothing has ever been detected, and
+    means "apply no slant correction", not "drop this ping".
     """
 
     def __init__(self, bootstrap_pings: int, agreement_tol_m: float,
@@ -268,6 +352,8 @@ class FBRTracker:
         self._stbd = _SideTracker(bootstrap_pings, agreement_tol_m,
                                   outlier_tol_m, relock_after)
         self._altitude: Optional[float] = None
+        self._last_known: Optional[float] = None
+        self.locked = False
 
     @property
     def is_bootstrapped(self) -> bool:
@@ -289,117 +375,19 @@ class FBRTracker:
             self._altitude = p
         elif s is not None:
             self._altitude = s
-        # else: neither side locked -- keep last altitude (may be None during
-        # initial bootstrap, or a held value if both sides transiently lost
-        # the bottom before re-locking).
-        return self._altitude
-
-
-class MosaicGrid:
-    """Auto-growing 2D running-mean raster of sonar intensity.
-
-    World extent is anchored at (0, 0) and grows in `chunk` increments as
-    samples land outside the current bounds. Each cell stores (sum, count)
-    so the displayed image is the mean intensity per cell.
-    """
-
-    def __init__(self, cell_size_m: float = 0.25,
-                 initial_half_extent_m: float = 50.0, log_root: Path = Path(os.path.expanduser("../../../../data/SSS_data"))) -> None:
-        self._cell = cell_size_m
-        n = int(math.ceil(2 * initial_half_extent_m / cell_size_m))
-        self._sum:   np.ndarray = np.zeros((n, n), dtype=np.float64)
-        self._count: np.ndarray = np.zeros((n, n), dtype=np.uint32)
-        # World coordinates of the lower-left corner of cell [0, 0].
-        self._x0: float = -initial_half_extent_m
-        self._y0: float = -initial_half_extent_m
-        self._chunk = int(math.ceil(50.0 / cell_size_m))  # grow by 50 m
-
-        self.log_root = log_root
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return self._sum.shape
-
-    @property
-    def extent(self) -> tuple[float, float, float, float]:
-        h, w = self._sum.shape
-        return (self._x0, self._x0 + w * self._cell,
-                self._y0, self._y0 + h * self._cell)
-
-    def _world_to_cell(self, x: np.ndarray, y: np.ndarray
-                       ) -> tuple[np.ndarray, np.ndarray]:
-        cx = ((x - self._x0) / self._cell).astype(np.int32)
-        cy = ((y - self._y0) / self._cell).astype(np.int32)
-        return cx, cy
-
-    def _ensure_contains(self, xmin: float, xmax: float,
-                         ymin: float, ymax: float) -> None:
-        h, w = self._sum.shape
-        pad_left = pad_right = pad_bot = pad_top = 0
-        if xmin < self._x0:
-            pad_left = int(math.ceil((self._x0 - xmin) / self._cell))
-            pad_left = max(pad_left, self._chunk)
-        if xmax >= self._x0 + w * self._cell:
-            pad_right = int(math.ceil(
-                (xmax - (self._x0 + w * self._cell)) / self._cell)) + 1
-            pad_right = max(pad_right, self._chunk)
-        if ymin < self._y0:
-            pad_bot = int(math.ceil((self._y0 - ymin) / self._cell))
-            pad_bot = max(pad_bot, self._chunk)
-        if ymax >= self._y0 + h * self._cell:
-            pad_top = int(math.ceil(
-                (ymax - (self._y0 + h * self._cell)) / self._cell)) + 1
-            pad_top = max(pad_top, self._chunk)
-        if pad_left or pad_right or pad_bot or pad_top:
-            self._sum = np.pad(
-                self._sum, ((pad_bot, pad_top), (pad_left, pad_right))
-            )
-            self._count = np.pad(
-                self._count, ((pad_bot, pad_top), (pad_left, pad_right))
-            )
-            self._x0 -= pad_left * self._cell
-            self._y0 -= pad_bot * self._cell
-
-    def add_samples(self, x: np.ndarray, y: np.ndarray,
-                    intensity: np.ndarray) -> None:
-        if x.size == 0:
-            return
-        self._ensure_contains(float(x.min()), float(x.max()),
-                              float(y.min()), float(y.max()))
-        cx, cy = self._world_to_cell(x, y)
-        h, w = self._sum.shape
-        ok = (cx >= 0) & (cx < w) & (cy >= 0) & (cy < h)
-        # `np.add.at` does unbuffered scatter-add so duplicate (cx,cy)
-        # indices accumulate properly.
-        np.add.at(self._sum,   (cy[ok], cx[ok]), intensity[ok])
-        np.add.at(self._count, (cy[ok], cx[ok]), 1)
-
-    def render(self) -> np.ndarray:
-        """Return the mean-intensity raster (NaN where no samples)."""
-        with np.errstate(invalid="ignore", divide="ignore"):
-            img = np.where(self._count > 0, self._sum / self._count, np.nan)
-        return img
-
-    def save(self, prefix: str | Path) -> tuple[Path, Path]:
-        """Save raster as compact .npz and quick-look .png."""
-        prefix = Path(prefix)
-        img = self.render()
-        npz_path = self.log_root / prefix.with_suffix(".npz")
-        png_path = self.log_root / prefix.with_suffix(".png")
-        np.savez_compressed(
-            npz_path,
-            mean_intensity=img.astype(np.float32),
-            count=self._count,
-            cell_size_m=self._cell,
-            x0=self._x0,
-            y0=self._y0,
-        )
-        # Quick-look PNG with sensible percentile contrast.
-        valid = img[np.isfinite(img)]
-        if valid.size > 0:
-            vmin, vmax = np.percentile(valid, [2, 98])
         else:
-            vmin, vmax = 0.0, 1.0
-        plt.imsave(png_path, img,
-                   origin="lower", cmap="copper", vmin=vmin, vmax=vmax)
-        return npz_path, png_path
+            self._altitude = None
+
+        self.locked = self._altitude is not None
+        if self._altitude is not None:
+            self._last_known = self._altitude
+            return self._altitude
+
+        # Not locked. Prefer a provisional estimate from this ping's own raw
+        # detections over holding a stale value, then fall back to the last
+        # known altitude. Either keeps the ping usable; neither is presented
+        # as a locked estimate.
+        raw = [v for v in (port_alt, stbd_alt) if v is not None]
+        if raw:
+            self._last_known = max(raw)
+        return self._last_known

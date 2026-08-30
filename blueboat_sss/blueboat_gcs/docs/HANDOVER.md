@@ -39,6 +39,7 @@ recording session: it publishes `true` once on the processor's log/enable topic
 <data_root>/sessions/2026_07_08-14_02_31/
     metadata.json            # times, ping/detection counts, config snapshot,
                              # priority mode, display settings, adopted svlogs
+    *.svlog                  # adopted from the processor (see note)
     mosaic/
         sonar_mosaic.npz     # raw planes (legacy keys + closest/oldest/newest)
         sonar_mosaic.png     # quick-look through the display pipeline
@@ -47,13 +48,12 @@ recording session: it publishes `true` once on the processor's log/enable topic
         waterfall.png        # quick-look
         waterfall_raw.npz    # untouched ping buffer -> AI dataset source
     detections/detections.csv
-    svlog/*.svlog            # adopted from the processor (see note)
 ```
 
 Processing scripts can treat any `sessions/*/` directory as a complete, closed
 experiment. Note on the `.svlog`: it is written by `sss_processor_node` wherever that
 node decides; after the session ends, every `*.svlog` under `data_root` whose mtime
-falls inside the session window is *moved* into `svlog/`. If your processor writes
+falls inside the session window is *moved* to the session root. If your processor writes
 elsewhere, extend the sweep in `core/recording_session.py::_adopt_svlogs`. If no
 recording session was active, STOP and application close export **nothing** — data
 only leaves the application through recording sessions.
@@ -268,10 +268,10 @@ equivalent from the GUI's perspective.
 * **Frame alignment**: the converter assumes the odom frame is ENU (mavros
   convention). If your odom frame is heading-aligned at boot, set
   `map.frame_yaw_offset_deg` (this supersedes `math_helper.local_to_enu(yaw0)`).
-* **Launch file installation**: add `launch/SSS_processing_launch.py` to the
-  `blueboat_sss` package install rules, next to `SSS_launch.py`. The old
-  `SSS_launch.py` remains valid for the legacy workflow; long-term, remove
-  `processed_sss_listener.py` from it once the team has switched to the GCS.
+* **Launch files**: `blueboat_sss` ships two — `launch/SSS_processing_launch.py`
+  (processor; what START runs) and `launch/SSS_simple_launch.py` (acquisition only).
+  Both are installed by `install(DIRECTORY launch ...)` in `CMakeLists.txt`. The
+  matplotlib listener node is gone; this app replaces it.
 * **Transducer offsets**: still `TODO = 0.0` in `sss_processor_node.py` — measure and
   fill before localization-accuracy experiments (C3); the GUI displays whatever the
   processor publishes.

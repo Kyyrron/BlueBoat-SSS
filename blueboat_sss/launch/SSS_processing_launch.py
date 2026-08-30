@@ -21,15 +21,18 @@ Usage
         range_length_mm:=25000 num_results:=1200
     ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True
 
-Install alongside the existing ``SSS_launch.py`` in the blueboat_sss
-package (add it to the launch install rule in CMakeLists.txt / setup.py).
+This file and ``SSS_simple_launch.py`` are the two launch files in the
+package; both are installed by ``install(DIRECTORY launch ...)`` in
+CMakeLists.txt.
 
 Note on acquisition settings (see docs/SONARVIEW_SVLOG_ANALYSIS.md): the
-Cerulean harbour reference log uses a 25.4 m range with 1200 samples per
-ping at 20 Hz, which gives both a wider swath and finer range sampling
-than our 15 m / 600 defaults. The defaults below are left unchanged so
-this file does not silently alter field behaviour; override them on the
-command line when you want to reproduce that configuration.
+defaults below are 20 m / 600, i.e. 33.3 mm range sampling — the
+no-argument default, sized from water depth (~4x the deepest expected)
+rather than from the area to cover. project_synthesis.md 8.5 reserves
+30 m per side for coverage passes and 15 m for revisit passes; pass those
+explicitly per run. The Cerulean harbour reference log uses 25.4 m with
+1200 samples per ping at 20 Hz, which is also reachable from the command
+line.
 """
 
 from simple_launch import SimpleLauncher
@@ -45,7 +48,7 @@ def generate_launch_description():
 
     # ---- sss_node parameters (only used when with_acquisition:=True) --------
     sl_range_start_mm    = sl.declare_arg('range_start_mm',    default_value=0)
-    sl_range_length_mm   = sl.declare_arg('range_length_mm',   default_value=30000)
+    sl_range_length_mm   = sl.declare_arg('range_length_mm',   default_value=20000)
     sl_msec_per_ping     = sl.declare_arg('msec_per_ping',     default_value=0)
     sl_gain_index        = sl.declare_arg('gain_index',        default_value=-1)
     sl_num_results       = sl.declare_arg('num_results',       default_value=600)

@@ -12,6 +12,7 @@ Session folder layout (consumed by future processing scripts)::
 
     <data_root>/sessions/2026_07_08-14_02_31/
         metadata.json               # times, config snapshot, counters...
+        *.svlog                     # adopted from the processor (see below)
         mosaic/
             sonar_mosaic.npz        # raw planes (legacy keys + priorities)
             sonar_mosaic.png
@@ -21,14 +22,13 @@ Session folder layout (consumed by future processing scripts)::
             waterfall_raw.npz       # untouched ping buffer (AI datasets)
         detections/
             detections.csv          # uid, t, x, y, class, confidence
-        svlog/
-            *.svlog                 # adopted from the processor (see below)
 
 The .svlog adoption: the file is written by ``sss_processor_node``
 wherever *it* decides — the GCS cannot redirect it. After the session
 ends, every ``*.svlog`` found under ``data_root`` whose modification
-time falls inside the session window is *moved* into ``svlog/``. If the
-processor writes elsewhere, add that directory to the sweep list.
+time falls inside the session window is *moved* to the **session root**,
+alongside ``metadata.json``. If the processor writes elsewhere, add that
+directory to the sweep list.
 """
 
 from __future__ import annotations
@@ -145,21 +145,23 @@ class RecordingManager(QObject):
                             f"{det.confidence:.3f}", f"{det.extent_m:.2f}"])
 
     def _adopt_svlogs(self, session: Path, start_wall: float) -> List[str]:
-        """Move .svlog files written during the session into svlog/."""
+        """Move .svlog files written during the session to the session root."""
         adopted: List[str] = []
         root = Path(self._config.data_root).expanduser()
         lo = start_wall - _SVLOG_MTIME_SLACK_S
         hi = time.time() + _SVLOG_MTIME_SLACK_S
         if not root.exists():
             return adopted
+        sessions_root = root / "sessions"
         for f in root.rglob("*.svlog"):
-            if session in f.parents:
+            # Anything already filed in a session -- this one or an earlier
+            # one -- is settled and is never moved again. Recorded .svlog are
+            # primary field data (CLAUDE.md NON-NEGOTIABLE #6).
+            if sessions_root in f.parents:
                 continue
             try:
                 if lo <= f.stat().st_mtime <= hi:
-                    dest = session # / "svlog"
-                    # dest.mkdir(exist_ok=True)
-                    shutil.move(str(f), dest / f.name)
+                    shutil.move(str(f), session / f.name)
                     adopted.append(f.name)
             except OSError:
                 continue

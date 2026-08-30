@@ -5,9 +5,16 @@ Side Scan Sonar processor node for the BlueBoat.
 Two responsibilities, both consumers of the side scan sonar streams:
 
 1. **Processing.** Consume parsed `OmniscanProfile` packets from the port +
-   starboard transducers and produce one merged `ProcessedSSSPing` per
-   matched pair: dB-scaled samples, FBR-based altitude tracking, slant-range
+   starboard transducers and produce one `ProcessedSSSPing` per acquired
+   ping: dB-scaled samples, FBR-based altitude tracking, slant-range
    correction, water-column drop, robot pose snapped from /blueboat/odom.
+
+   Rows are assembled by `ping_number`, normalised across the two devices
+   (they are independent units with independent counters). A row is emitted
+   with whichever sides arrived; one-sided rows are published rather than
+   discarded, and no ping is withheld while the altitude tracker bootstraps
+   (NON-NEGOTIABLE #2). The only ping that does not reach the output is one
+   with no `/blueboat/odom` pose to place it at.
 
 2. **SonarView .svlog logging.** Consume the raw framed packets published
    on `~/raw` topics by `sss_node`, interleave them with mavlink wrapper
@@ -41,11 +48,12 @@ from __future__ import annotations
 
 import math
 import os
+import struct
 import sys
 from datetime import datetime
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Deque, Optional, Tuple
 
@@ -75,6 +83,7 @@ from svlog_helper import (
     DEFAULT_MAVLINK_FILTER,
     DEVICE_ID_PORT,
     DEVICE_ID_STBD,
+    OS_MONO_PROFILE_ID,
     SvlogWriter,
     build_mavlink_wrapper,
     build_session_metadata,
@@ -82,6 +91,7 @@ from svlog_helper import (
 )
 from sss_helper import (
     FBRTracker,
+    PingCounterOffset,
     detect_fbr_slant_m,
     project_side,
     scale_to_db,
@@ -91,6 +101,16 @@ from math_helper import (
     stamp_to_ns,
     quat_to_euler_rpy,
 )
+
+
+# ---------------------------------------------------------------------------
+# OS_MONO_PROFILE frame offsets, used to read side identity straight out of the
+# raw framed packet (8-byte Ping-Protocol header + payload offset).
+# NON-NEGOTIABLE #1: side identity comes from the packet, never from the topic
+# it arrived on nor from the src tag already in the frame.
+# ---------------------------------------------------------------------------
+CHANNEL_BYTE: int = 34   # payload offset 26, uint8: 0 = port, 1 = starboard
+HEADING_BYTE: int = 52   # payload offset 44, float32 LE: transducer_heading_deg
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +131,9 @@ NOISE_FLOOR_WINDOW:       int   = 20    # samples used to estimate noise floor
 FBR_THRESHOLD_DELTA_DB:   float = 8.0   # dB above noise floor
 WITHIN_PING_PERSISTENCE:  int   = 3     # consecutive samples above threshold
 
-RINGING_SEARCH_MAX:       int   = 60    # search horizon in samples (1.5 m at 25 mm/sample)
+RINGING_SEARCH_MAX:       int   = 60    # search horizon in SAMPLES, not metres: its physical
+                                        # reach scales with range_length_mm / num_results.
+                                        # 2.0 m at the 33.3 mm/sample default (20 m / 600).
 RINGING_DROP_DB:          float = 10.0  # how far below the ringing peak counts as 'settled'
 RINGING_PERSISTENCE:      int   = 5     # consecutive samples below target
 
@@ -120,8 +142,35 @@ ALTITUDE_AGREEMENT_TOL_M: float = 0.30  # max spread within a side's bootstrap w
 ALTITUDE_OUTLIER_TOL_M:   float = 1.0   # post-lock per-ping jump rejected as outlier
 ALTITUDE_RELOCK_AFTER:    int   = 15    # consecutive rejects force a side to re-bootstrap
 
-TIME_MATCH_TOLERANCE_NS:  int   = 50_000_000  # port-vs-starboard pairing window
 ODOM_BUFFER_SECONDS:      float = 5.0
+
+# ---------------------------------------------------------------------------
+# Row assembly (NON-NEGOTIABLE #2: never drop a ping).
+#
+# Rows are keyed on `ping_number`, normalised across the two devices by
+# `PingCounterOffset`. The two Omniscan units are independent devices with
+# independent counters whose relative offset is arbitrary but constant per
+# power-up (0, -1 and +60 all measured in the field corpus -- see
+# blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md), so the raw counter is not a
+# usable cross-side key on its own.
+#
+# A group is emitted as soon as both sides are in it. An incomplete group is
+# emitted ONE-SIDED once it falls too far behind, by ping number or by wall
+# clock, whichever comes first -- never discarded, and never held forever.
+# ---------------------------------------------------------------------------
+ASSEMBLY_MAX_LAG_PINGS:   int   = 128          # 2x the worst measured in-flight lag (63)
+ASSEMBLY_MAX_LAG_NS:      int   = 1_000_000_000
+ASSEMBLY_MAX_GROUPS:      int   = 256          # hard cap; oldest is force-flushed
+ASSEMBLY_FLUSH_PERIOD_S:  float = 0.2          # tail flush when the stream stops
+OFFSET_VOTE_WINDOW:       int   = 64
+OFFSET_VOTE_DEFER:        int   = 4            # below this the estimator goes bimodal
+# The estimator needs a few pings before it has voted at all. Pings that
+# arrive first are held rather than keyed at a provisional offset, because
+# keying them wrongly splits their rows -- and the start of the mission is
+# exactly what NON-NEGOTIABLE #2 exists to protect. The cap bounds the hold
+# for a single-transducer run, where no vote is ever cast.
+OFFSET_MIN_VOTES:         int   = 8
+OFFSET_PREROLL_MAX:       int   = 24
 
 # ---------------------------------------------------------------------------
 # Odom buffer
@@ -171,10 +220,16 @@ class SSSProcessorNode(Node):
         super().__init__("sss_processor")
 
         # ---- Processing state ---------------------------------------------
-        self._port_buf: Deque[OmniscanProfile] = deque()
-        self._stbd_buf: Deque[OmniscanProfile] = deque()
+        # ping_number (normalised onto the port counter) -> group.
+        # Insertion-ordered, and the keys are monotone in acquisition order,
+        # so the oldest group is always the first one.
+        self._groups: "OrderedDict[int, dict]" = OrderedDict()
+        self._offset = PingCounterOffset(window=OFFSET_VOTE_WINDOW,
+                                         defer=OFFSET_VOTE_DEFER)
+        # Arrivals held until the counter offset is known; None once drained.
+        self._preroll: Optional[list] = []
+        self._max_key_seen: Optional[int] = None
         self._buf_lock = threading.Lock()
-        self._tol_ns = TIME_MATCH_TOLERANCE_NS
 
         self._odom_buf = _OdomBuffer(int(ODOM_BUFFER_SECONDS * 1e9))
         self._fbr = FBRTracker(
@@ -185,7 +240,12 @@ class SSSProcessorNode(Node):
         )
 
         self._dropped_no_odom = 0
-        self._dropped_bootstrap = 0
+        # Pings emitted while the FBR tracker was not locked. These are
+        # EMITTED, not dropped (NON-NEGOTIABLE #2); the counter reports
+        # altitude quality, never data loss.
+        self._unlocked_pings = 0
+        self._emitted = 0
+        self._one_sided = 0
         self._already_bootstrapped_logged = False
 
         # ---- Logging + mavlink envelope state ------------------------------
@@ -193,13 +253,32 @@ class SSSProcessorNode(Node):
         #self.date = datetime.today().strftime('%Y_%m_%d-%H_%M')
         #self.declare_parameter("log_folder", self.date)
         #self.folder_name = self.get_parameter("log_folder").value
-        self.log_root = Path(os.path.expanduser("../../../../data/SSS_data")) #/ self.folder_name
-        #self.log_root.mkdir(parents=True, exist_ok=True)
-
+        # Relative to the launch working directory, and resolved once here so
+        # that every path this node reports afterwards is absolute -- "where
+        # did my recording go?" must not need the reader to know the cwd.
+        self.log_root = Path(
+            os.path.expanduser("../../../../data/SSS_data")  #/ self.folder_name
+        ).resolve()
+        # Created at startup so a bad log path is known before the mission
+        # rather than at Record ON. Failing is not fatal: processing and
+        # logging are independent, and a processor that refused to start
+        # would drop pings over a recording problem. SvlogWriter.start()
+        # retries it.
+        try:
+            self.log_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.get_logger().error(
+                f"cannot create the log directory {self.log_root}: {exc}; "
+                "processing continues, recording will fail until this is fixed"
+            )
         self.get_logger().info(f"log directory: {self.log_root}")
         self._svlog = SvlogWriter(
             log_dir=self.log_root,
             metadata_provider=self._build_metadata,
+            # svlog_helper is ROS-free by contract, so it cannot reach a ROS
+            # logger itself; this is how a write failure reaches /rosout and
+            # the GCS console.
+            error_reporter=lambda message: self.get_logger().error(message),
         )
 
         # Aux mavros signals used to enrich GLOBAL_POSITION_INT.
@@ -254,6 +333,11 @@ class SSSProcessorNode(Node):
 
         self._pub = self.create_publisher(ProcessedSSSPing, "~/processed", sonar_qos)
 
+        # Emits groups the arrival path can no longer reach, so the tail of a
+        # run is not stranded when the stream stops (NON-NEGOTIABLE #2).
+        self._flush_timer = self.create_timer(ASSEMBLY_FLUSH_PERIOD_S,
+                                              self._flush_pending)
+
         self.get_logger().info(
             "sss_processor ready (log OFF):\n"
             "  port  ← /side_scan_sonar/port/profile\n"
@@ -262,8 +346,11 @@ class SSSProcessorNode(Node):
             "  stbd raw  ← /side_scan_sonar/starboard/raw\n"
             "  odom  ← /blueboat/odom\n"
             "  out   → ~/processed\n"
+            "  rows assembled by ping_number (offset-normalised across the two\n"
+            "  devices); one-sided rows are emitted, never dropped\n"
             f"  bootstrap: {BOOTSTRAP_PINGS} self-consistent pings per side within "
-            f"{ALTITUDE_AGREEMENT_TOL_M*100:.0f} cm (either side suffices)\n"
+            f"{ALTITUDE_AGREEMENT_TOL_M*100:.0f} cm (either side suffices); pings are\n"
+            "  emitted with a provisional altitude until then\n"
             "  Toggle logging with:\n"
             "  ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: true'"
         )
@@ -271,22 +358,29 @@ class SSSProcessorNode(Node):
     # ----- shutdown ---------------------------------------------------------
     def shutdown(self) -> None:
         self.get_logger().info("stopping sss_processor")
+        # Anything still buffered is emitted rather than discarded.
+        self._flush_pending(drain_all=True)
+        self.get_logger().info(
+            f"emitted {self._emitted} row(s), {self._one_sided} one-sided, "
+            f"{self._unlocked_pings} with a provisional altitude, "
+            f"{self._dropped_no_odom} dropped for missing odom; "
+            f"ping-counter offset {self._offset.offset:+d} "
+            f"({self._offset.confidence * 100:.0f}% of {self._offset.votes} votes)"
+        )
         self._svlog.stop()
 
     # ----- sonar subscribers ------------------------------------------------
     def _on_port(self, msg: OmniscanProfile) -> None:
-        with self._buf_lock:
-            self._port_buf.append(msg)
-            self._drain_matches()
+        self._accept(msg)
 
     def _on_starboard(self, msg: OmniscanProfile) -> None:
-        with self._buf_lock:
-            self._stbd_buf.append(msg)
-            self._drain_matches()
+        self._accept(msg)
 
     def _on_odom(self, msg: Odometry) -> None:
         self._odom_buf.push(msg)
 
+    # The device id passed here is only the fallback: _write_raw_with_src_tag
+    # tags each frame from the packet's own channel_number (NON-NEGOTIABLE #1).
     def _on_port_raw(self, msg: UInt8MultiArray) -> None:
         self._write_raw_with_src_tag(msg, DEVICE_ID_PORT)
 
@@ -295,12 +389,25 @@ class SSSProcessorNode(Node):
 
     def _on_log_enable(self, msg: Bool) -> None:
         if msg.data:
-            self._svlog.start()
-            self.get_logger().info(f"logging -> {self.log_root}")
+            # start() reports its own reason and returns None on failure. The
+            # GCS has no feedback topic, so this error line on /rosout is what
+            # tells the operator the Record button is lying.
+            path = self._svlog.start()
+            if path is None:
+                self.get_logger().error(
+                    f"RECORDING FAILED: nothing is being written to "
+                    f"{self.log_root}"
+                )
+            else:
+                self.get_logger().info(f"logging -> {path}")
         else:
-            self._svlog.current_path
+            # Read the path before stop() clears it, so the operator is told
+            # which file was closed rather than only which directory.
+            path = self._svlog.current_path
             self._svlog.stop()
-            self.get_logger().info(f"stopped logging ({self.log_root})")
+            self.get_logger().info(
+                f"stopped logging ({path if path is not None else self.log_root})"
+            )
 
     # ----- mavros subscribers -----------------------------------------------
     def _on_mavros_rel_alt(self, msg: Float64) -> None:
@@ -531,12 +638,34 @@ class SSSProcessorNode(Node):
         }
 
     # ----- svlog helpers ----------------------------------------------------
-    def _write_raw_with_src_tag(self, msg: UInt8MultiArray, src_device_id: int) -> None:
+    @staticmethod
+    def _src_from_packet(raw: bytes, fallback: int) -> int:
+        """Device id read out of the packet; the topic is only a fallback.
+
+        NON-NEGOTIABLE #1. `channel_number` is authoritative; where the device
+        leaves it outside (0, 1) the transducer bearing (-90 = port,
+        +90 = starboard) decides. The two agree on 100 % of packets in every
+        field recording measured, so the fallback only ever fires where
+        `channel_number` carries nothing usable.
+        """
+        if (len(raw) > CHANNEL_BYTE
+                and int.from_bytes(raw[4:6], "little") == OS_MONO_PROFILE_ID):
+            ch = raw[CHANNEL_BYTE]
+            if ch in (0, 1):
+                return DEVICE_ID_PORT if ch == 0 else DEVICE_ID_STBD
+            if len(raw) >= HEADING_BYTE + 4:
+                heading, = struct.unpack_from("<f", raw, HEADING_BYTE)
+                if heading:
+                    return DEVICE_ID_STBD if heading > 0 else DEVICE_ID_PORT
+        return fallback
+
+    def _write_raw_with_src_tag(self, msg: UInt8MultiArray, fallback_src: int) -> None:
         if not self._svlog.active:
             return
+        raw = bytes(bytearray(msg.data))
         try:
             tagged = retag_packet_src_device_id(
-                bytes(bytearray(msg.data)), src_device_id
+                raw, self._src_from_packet(raw, fallback_src)
             )
             self._svlog.write(tagged)
         except ValueError as exc:
@@ -551,112 +680,246 @@ class SSSProcessorNode(Node):
             mavlink_filter=DEFAULT_MAVLINK_FILTER,
         )
 
-    # ----- two-pointer time matcher -----------------------------------------
-    def _drain_matches(self) -> None:
-        """Emit every possible match from the heads of both buffers.
+    # ----- row assembly -----------------------------------------------------
+    def _accept(self, msg: OmniscanProfile) -> None:
+        """Route one profile into its ping-number group and emit what is ready.
 
-        Called under self._buf_lock. Standard two-pointer merge: if the
-        oldest port and oldest starboard are within tolerance, match;
-        otherwise drop whichever is older (no partner left to find).
+        NON-NEGOTIABLE #2: nothing is discarded here. A group leaves either
+        complete (both sides) or one-sided via `_flush_stale`, and every
+        arriving ping belongs to exactly one group.
+
+        NON-NEGOTIABLE #1: the side comes from the packet's own
+        `channel_number`, not from the subscription that delivered it, so a
+        profile published on the wrong topic still lands on the right side.
         """
-        while self._port_buf and self._stbd_buf:
-            p = self._port_buf[0]
-            s = self._stbd_buf[0]
-            p_ns = stamp_to_ns(p.header.stamp)
-            s_ns = stamp_to_ns(s.header.stamp)
-            dt = p_ns - s_ns
-            if abs(dt) <= self._tol_ns:
-                self._port_buf.popleft()
-                self._stbd_buf.popleft()
-                self._emit_merged(p, s)
-            elif dt > 0:
-                self._stbd_buf.popleft()
+        channel = self._channel_of(msg)
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        ready = []
+        with self._buf_lock:
+            self._offset.observe(channel, int(msg.ping_number), stamp_ns)
+
+            if self._preroll is not None:
+                # Hold until the offset is established, then key the whole
+                # pre-roll at once. Keying a ping at a provisional offset
+                # would split its row when the real offset arrives.
+                self._preroll.append((channel, msg, stamp_ns))
+                if (self._offset.votes < OFFSET_MIN_VOTES
+                        and len(self._preroll) < OFFSET_PREROLL_MAX):
+                    return
+                held, self._preroll = self._preroll, None
+                for ch, held_msg, held_ns in held:
+                    ready.extend(self._insert(ch, held_msg, held_ns))
             else:
-                self._port_buf.popleft()
+                ready.extend(self._insert(channel, msg, stamp_ns))
+            ready.extend(self._collect_stale(stamp_ns))
+        # Publish outside the lock: _emit_group does the heavy numeric work
+        # and must not block the other side's callback.
+        for group in ready:
+            self._emit_group(group)
+
+    def _insert(self, channel: int, msg: OmniscanProfile, stamp_ns: int) -> list:
+        """Place one profile in its group; return the group if it is complete.
+
+        Called under self._buf_lock.
+        """
+        key = self._offset.key(channel, int(msg.ping_number))
+        self._max_key_seen = (key if self._max_key_seen is None
+                              else max(self._max_key_seen, key))
+        group = self._groups.get(key)
+        if group is None:
+            group = self._groups[key] = {"first_ns": stamp_ns}
+        group[channel] = msg
+        if 0 in group and 1 in group:
+            del self._groups[key]
+            return [group]
+        return []
+
+    def _collect_stale(self, now_ns: int) -> list:
+        """Remove groups that have waited long enough to be emitted one-sided.
+
+        Called under self._buf_lock. Bounded three ways, so no group is ever
+        held indefinitely: by how far its ping number has fallen behind the
+        newest one seen, by wall clock, and by a hard cap on live groups.
+        """
+        out = []
+        while self._groups:
+            key, group = next(iter(self._groups.items()))
+            behind = (self._max_key_seen is not None
+                      and self._max_key_seen - key > ASSEMBLY_MAX_LAG_PINGS)
+            stale = now_ns - group["first_ns"] > ASSEMBLY_MAX_LAG_NS
+            over_cap = len(self._groups) > ASSEMBLY_MAX_GROUPS
+            if not (behind or stale or over_cap):
+                break
+            del self._groups[key]
+            out.append(group)
+        return out
+
+    def _flush_pending(self, drain_all: bool = False) -> None:
+        """Timer/shutdown path: emit groups the arrival path can no longer reach.
+
+        Without this the last group of a run would sit in the buffer until
+        the next ping, which may never come -- the stream stopping is exactly
+        when it must not be lost.
+        """
+        now_ns = self.get_clock().now().nanoseconds
+        with self._buf_lock:
+            ready = []
+            # A run shorter than the pre-roll would otherwise strand every
+            # ping it produced. Only force it once it has gone stale, though:
+            # draining a pre-roll that is still filling would key it at a
+            # half-learned offset, which is what it exists to avoid.
+            if self._preroll and (drain_all or
+                                  now_ns - self._preroll[0][2] > ASSEMBLY_MAX_LAG_NS):
+                held, self._preroll = self._preroll, None
+                for ch, msg, ns in held:
+                    ready.extend(self._insert(ch, msg, ns))
+            if drain_all:
+                ready.extend(self._groups.values())
+                self._groups.clear()
+            else:
+                ready.extend(self._collect_stale(now_ns))
+        for group in ready:
+            self._emit_group(group)
 
     # ----- processing -------------------------------------------------------
-    def _emit_merged(self, port: OmniscanProfile, stbd: OmniscanProfile) -> None:
-        log = self.get_logger()
+    @staticmethod
+    def _channel_of(msg: OmniscanProfile) -> int:
+        """Side identity (0 = port, 1 = starboard) from the message itself.
 
-        # 1. Odom must exist; if SSS started before robot_interface, drop early pings.
+        NON-NEGOTIABLE #1, and the same rule the svlog writer applies to raw
+        frames: `channel_number` decides, with the transducer bearing as the
+        fallback for devices that leave it outside (0, 1). `msg.side` is a
+        label attached by the acquisition worker that published it and is
+        deliberately not read, nor is the topic it arrived on.
+        """
+        ch = msg.channel_number
+        if ch not in (0, 1):
+            ch = 1 if msg.transducer_heading_deg > 0 else 0
+        return ch
+
+    @classmethod
+    def _side_geometry(cls, msg: OmniscanProfile) -> Tuple[float, float]:
+        """(side_sign, transducer y offset) from the message itself.
+
+        Sign convention on the wire is +y = port, -y = starboard.
+        """
+        if cls._channel_of(msg) == 0:
+            return +1.0, TRANSDUCER_Y_OFFSET_PORT_M
+        return -1.0, TRANSDUCER_Y_OFFSET_STBD_M
+
+    def _fbr_of(self, msg: Optional[OmniscanProfile]):
+        """(dB samples, FBR slant range) for one side, or (None, None)."""
+        if msg is None:
+            return None, None
+        db = scale_to_db(msg.pwr_results, msg.min_pwr_db, msg.max_pwr_db)
+        alt = detect_fbr_slant_m(
+            db, msg.start_mm, msg.length_mm, msg.num_results,
+            noise_floor_window=NOISE_FLOOR_WINDOW,
+            threshold_delta_db=FBR_THRESHOLD_DELTA_DB,
+            persistence=WITHIN_PING_PERSISTENCE,
+            ringing_search_max=RINGING_SEARCH_MAX,
+            ringing_drop_db=RINGING_DROP_DB,
+            ringing_persistence=RINGING_PERSISTENCE,
+        )
+        return db, alt
+
+    def _emit_group(self, group: dict) -> None:
+        """Publish one assembled row. May carry one side only.
+
+        ONE-SIDED ROW CONVENTION (the message type is fixed -- CM-1, so this
+        is expressed in the existing fields): the absent side has
+        `*_ping_number = 0`, a zeroed `*_stamp`, and empty `*_intensity_db` /
+        `*_y`. **A consumer tests presence with `*_ping_number != 0`**, not
+        with array length: `project_side` can legitimately return an empty
+        array for a side that IS present, when the altitude estimate exceeds
+        the whole swath.
+        """
+        log = self.get_logger()
+        port: Optional[OmniscanProfile] = group.get(0)
+        stbd: Optional[OmniscanProfile] = group.get(1)
+        ref = port if port is not None else stbd
+        if ref is None:                      # defensive; groups always hold one
+            return
+
+        # 1. Odom is a hard gate: a ping with no pose is unplaceable. This is
+        #    the one legitimate drop, and it is owned by BlueBoat-Control
+        #    (/blueboat/odom reads zero on the real boat) rather than here.
         if not self._odom_buf.has_data():
             self._dropped_no_odom += 1
             if self._dropped_no_odom == 1 or self._dropped_no_odom % 20 == 0:
                 log.warn(
-                    f"dropping ping pair: no /blueboat/odom yet "
+                    f"dropping ping: no /blueboat/odom yet "
                     f"(total dropped: {self._dropped_no_odom})"
                 )
             return
 
-        # 2. dB conversion.
-        port_db = scale_to_db(port.pwr_results, port.min_pwr_db, port.max_pwr_db)
-        stbd_db = scale_to_db(stbd.pwr_results, stbd.min_pwr_db, stbd.max_pwr_db)
+        # 2. dB conversion + FBR detection, per side that is present.
+        port_db, port_alt = self._fbr_of(port)
+        stbd_db, stbd_alt = self._fbr_of(stbd)
 
-        # 3. FBR detection per side.
-        port_alt = detect_fbr_slant_m(
-            port_db, port.start_mm, port.length_mm, port.num_results,
-            noise_floor_window=NOISE_FLOOR_WINDOW,
-            threshold_delta_db=FBR_THRESHOLD_DELTA_DB,
-            persistence=WITHIN_PING_PERSISTENCE,
-            ringing_search_max=RINGING_SEARCH_MAX,        
-            ringing_drop_db=RINGING_DROP_DB,             
-            ringing_persistence=RINGING_PERSISTENCE, 
-        )
-        stbd_alt = detect_fbr_slant_m(
-            stbd_db, stbd.start_mm, stbd.length_mm, stbd.num_results,
-            noise_floor_window=NOISE_FLOOR_WINDOW,
-            threshold_delta_db=FBR_THRESHOLD_DELTA_DB,
-            persistence=WITHIN_PING_PERSISTENCE,
-            ringing_search_max=RINGING_SEARCH_MAX,        
-            ringing_drop_db=RINGING_DROP_DB,             
-            ringing_persistence=RINGING_PERSISTENCE, 
-        )
-
-        # 4. Update the cross-ping altitude tracker.
+        # 3. Altitude. The tracker never withholds: locked, else provisional,
+        #    else last known. `None` means nothing has ever been detected, and
+        #    resolves to 0.0 -- no slant correction, ground range = slant
+        #    range. That is an identity transform, not a fabricated altitude,
+        #    and it matches the GCS "Depth comp. = off" value exactly.
+        #    NON-NEGOTIABLE #2: no ping is withheld while the tracker
+        #    bootstraps.
         altitude = self._fbr.update(port_alt, stbd_alt)
         if altitude is None:
-            self._dropped_bootstrap += 1
-            if self._dropped_bootstrap == 1 or self._dropped_bootstrap % BOOTSTRAP_PINGS == 0:
+            altitude = 0.0
+        if not self._fbr.locked:
+            self._unlocked_pings += 1
+            if self._unlocked_pings == 1 or self._unlocked_pings % 50 == 0:
                 log.info(
-                    f"FBR bootstrap in progress "
-                    f"({self._dropped_bootstrap} ping pairs dropped so far; "
-                    f"port_fbr={port_alt}, stbd_fbr={stbd_alt})"
+                    f"FBR not locked: {self._unlocked_pings} ping(s) emitted with a "
+                    f"provisional altitude so far (port_fbr={port_alt}, "
+                    f"stbd_fbr={stbd_alt}); none dropped"
                 )
-            return
-        if not self._already_bootstrapped_logged:
-            log.info(f"FBR bootstrapped: altitude = {altitude:.2f} m above seabed")
+        elif not self._already_bootstrapped_logged:
+            log.info(f"FBR locked: altitude = {altitude:.2f} m above seabed")
             self._already_bootstrapped_logged = True
 
-        # 5. Water depth = transducer altitude + submersion.
+        # 4. Water depth = transducer altitude + submersion.
         water_depth = altitude + TRANSDUCER_SUBMERSION_M
 
-        # 6. Slant-range correct each side; drop water-column samples.
-        port_y, port_int = project_side(
-            port_db, port.start_mm, port.length_mm, port.num_results,
-            altitude_m=altitude,
-            transducer_y_offset_m=TRANSDUCER_Y_OFFSET_PORT_M,
-            side_sign=+1.0,
-        )
-        stbd_y, stbd_int = project_side(
-            stbd_db, stbd.start_mm, stbd.length_mm, stbd.num_results,
-            altitude_m=altitude,
-            transducer_y_offset_m=TRANSDUCER_Y_OFFSET_STBD_M,
-            side_sign=-1.0,
-        )
+        # 5. Slant-range correct each present side; drop water-column samples.
+        #    The geometry comes from each message's own channel_number, not
+        #    from the subscription it arrived on (NON-NEGOTIABLE #1), so a
+        #    packet delivered to the wrong topic still lands on the right side.
+        port_y, port_int = [], []
+        stbd_y, stbd_int = [], []
+        if port is not None:
+            sign, offset = self._side_geometry(port)
+            port_y, port_int = project_side(
+                port_db, port.start_mm, port.length_mm, port.num_results,
+                altitude_m=altitude,
+                transducer_y_offset_m=offset,
+                side_sign=sign,
+            )
+        if stbd is not None:
+            sign, offset = self._side_geometry(stbd)
+            stbd_y, stbd_int = project_side(
+                stbd_db, stbd.start_mm, stbd.length_mm, stbd.num_results,
+                altitude_m=altitude,
+                transducer_y_offset_m=offset,
+                side_sign=sign,
+            )
 
-        # 7. Snap robot pose using port stamp (pair is within tolerance).
-        merged_ns = stamp_to_ns(port.header.stamp)
-        odom = self._odom_buf.nearest(merged_ns)
+        # 6. Snap robot pose from whichever side is present. Both halves of a
+        #    complete row are the same acquisition instant, so either stamp
+        #    resolves to the same odom sample.
+        odom = self._odom_buf.nearest(stamp_to_ns(ref.header.stamp))
         if odom is None:
             self._dropped_no_odom += 1
             return
 
-        # 8. Assemble + publish.
+        # 7. Assemble + publish.
+        zero_stamp = TimeMsg()
         out = ProcessedSSSPing()
-        out.port_stamp = port.header.stamp
-        out.starboard_stamp = stbd.header.stamp
-        out.port_ping_number = port.ping_number
-        out.starboard_ping_number = stbd.ping_number
+        out.port_stamp = port.header.stamp if port is not None else zero_stamp
+        out.starboard_stamp = stbd.header.stamp if stbd is not None else zero_stamp
+        out.port_ping_number = port.ping_number if port is not None else 0
+        out.starboard_ping_number = stbd.ping_number if stbd is not None else 0
         out.robot_x = float(odom.pose.pose.position.x)
         out.robot_y = float(odom.pose.pose.position.y)
         out.robot_orientation = odom.pose.pose.orientation
@@ -667,6 +930,10 @@ class SSSProcessorNode(Node):
         out.starboard_intensity_db = stbd_int
         out.starboard_y = stbd_y
         self._pub.publish(out)
+
+        self._emitted += 1
+        if port is None or stbd is None:
+            self._one_sided += 1
 
 
 # ---------------------------------------------------------------------------

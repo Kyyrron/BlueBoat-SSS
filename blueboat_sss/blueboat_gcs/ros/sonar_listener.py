@@ -41,7 +41,9 @@ class SonarListener:
         # Stream health counters (also read by tests).
         self.received = 0
         self.device_gaps = 0        # pings the device numbered but we never saw
-        self.crossed_pairs = 0      # port/starboard halves from different pings
+        self.crossed_pairs = 0      # halves whose counter gap left its usual value
+        self.one_sided = 0          # rows carrying a single side
+        self._pair_delta: Optional[int] = None   # the boat's steady counter offset
         self._last_port_pn: Optional[int] = None
         self._warned_cross = False
         self._next_gap_warn = 50
@@ -74,20 +76,27 @@ class SonarListener:
         self.received += 1
         pn = int(getattr(msg, "port_ping_number", 0))
         spn = int(getattr(msg, "starboard_ping_number", 0))
-        if pn and spn and pn != spn:
-            # The processor paired two different pings: on our sea-trial
-            # data this happened on 27 % of rows and is what produces the
-            # torn/mirrored mosaic. Report it once; the fix is robot-side
-            # (see docs/SONARVIEW_SVLOG_ANALYSIS.md §9).
-            self.crossed_pairs += 1
-            if self._warn_gaps and not self._warned_cross:
-                self._warned_cross = True
-                self._signals.log_line.emit(
-                    "app",
-                    "SONAR: port/starboard halves come from different pings "
-                    f"(#{pn} vs #{spn}). The processor is pairing by arrival "
-                    "time; it should assemble by ping_number and route by "
-                    "channel_number (see HANDOVER 'Sonar stream integrity').")
+        if not (pn and spn):
+            self.one_sided += 1
+        else:
+            # The two Omniscan units run independent ping counters, so the
+            # gap between the halves of a correctly assembled row is the
+            # boat's constant device offset (0, -1 and +60 all measured in
+            # the field corpus) -- NOT zero. What signals a torn row is the
+            # gap *changing*, so the first row sets the expectation and
+            # departures from it are the defect.
+            if self._pair_delta is None:
+                self._pair_delta = pn - spn
+            elif pn - spn != self._pair_delta:
+                self.crossed_pairs += 1
+                if self._warn_gaps and not self._warned_cross:
+                    self._warned_cross = True
+                    self._signals.log_line.emit(
+                        "app",
+                        "SONAR: port/starboard halves are no longer a fixed "
+                        f"counter offset apart (#{pn} vs #{spn}; expected a gap "
+                        f"of {self._pair_delta}). Either a device restarted its "
+                        "counter or rows are being torn.")
         if pn and self._last_port_pn is not None:
             missing = pn - self._last_port_pn - 1
             if 0 < missing < 1000:
@@ -113,8 +122,11 @@ class SonarListener:
         ground_max = float(np.abs(y_local).max()) if y_local.size else 0.0
         depth = float(msg.water_depth)
         slant_range = float(np.hypot(ground_max, depth))
+        # One-sided rows zero the absent side's stamp (presence is
+        # `*_ping_number != 0`), so take the stamp of a side that is there.
+        stamp = msg.port_stamp if pn else msg.starboard_stamp
         ping = SonarPing(
-            t=msg.port_stamp.sec + msg.port_stamp.nanosec * 1e-9,
+            t=stamp.sec + stamp.nanosec * 1e-9,
             robot_x=float(msg.robot_x),
             robot_y=float(msg.robot_y),
             yaw=quat_to_yaw(q.x, q.y, q.z, q.w),
@@ -122,7 +134,9 @@ class SonarListener:
             y_local=y_local,
             intensity_db=intensity,
             slant_range_m=slant_range,
-            sides=("both" if (len(msg.port_y) and len(msg.starboard_y))
-                   else ("port" if len(msg.port_y) else "starboard")),
+            # Presence is the ping number, not the array length: a present
+            # side legitimately projects to zero samples when the altitude
+            # estimate covers the whole swath.
+            sides=("both" if (pn and spn) else ("port" if pn else "starboard")),
         )
         self._signals.sonar_ping.emit(ping)

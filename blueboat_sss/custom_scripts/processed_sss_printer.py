@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Offline plotter for the rasterised sonar mosaic produced by
-processed_sss_listener.py.
+Offline plotter for the rasterised sonar mosaic produced by the BlueBoat GCS.
 
-The listener writes:
+The GCS writes these on STOP and on window close (into the recording
+session's mosaic/ folder, and into data/SSS_data/<date>/):
     sonar_mosaic.npz       -- mean_intensity, count, cell_size_m, x0, y0
     sonar_mosaic.png       -- quick-look preview
     boat_trajectory.csv    -- per-ping (t, x, y, depth)
@@ -29,7 +29,7 @@ def main() -> None:
 
     path_from_ws = "data/SSS_data/"
     prefix = path_from_ws + "2026_06_12-17_12/" # Name of the experiment's folder
-    default_mosaic = prefix + "sonar_mosaic.npz" # Output of processed_sss_listener.py node.
+    default_mosaic = prefix + "sonar_mosaic.npz" # Output of the GCS.
     default_trajectory = prefix + "boat_trajectory.csv" # Same
 
     ap = argparse.ArgumentParser()

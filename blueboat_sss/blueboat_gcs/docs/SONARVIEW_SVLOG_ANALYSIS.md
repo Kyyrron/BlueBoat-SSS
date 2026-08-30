@@ -8,6 +8,12 @@ Evidence base (all numbers measured, nothing assumed):
 | `diffDepthCompensation.svlog` | **SonarView** | 9.8 MB, 4900 profiles, dual Omniscan, same boat |
 | `harbor_scan_combined.svlog` | Cerulean demo | 18 MB, 4278 profiles, single Omniscan |
 
+`reflection_evidence.svlog` is a shorthand used throughout this document; on disk the
+file is `ShiraishiJima/MainReflectionEvidence+misspingsWaterfall/2026-07-23-11-45-00.svlog`.
+
+Every number below is reproducible with
+`python3 -m blueboat_gcs.analysis.svlog_forensics --compare <the three files>`.
+
 ---
 
 ## 1. The headline result: our raw acoustics are fine
@@ -54,9 +60,17 @@ dropping the row.
 
 ## 3. Real ping loss (robot-side, not fixable inside the GCS)
 
-`ping_number` gaps in our file: **356 missing on channel 0, 192 on channel 1**
-(~8 %), with PRI stalls up to **548 ms**. SonarView's recording on the same hardware
-has **zero** missing ping numbers and a PRI of 50.0 ms (p95 51 ms).
+`ping_number` gaps in our file, routed by `channel_number`: **211 missing on channel 0
+(7.7 %) and 49 on channel 1 (1.8 %)** against a span of 2755 pings per side — 260 in
+total, which is the same 260 one-sided rows §2 counts. PRI is a rock-stable 110 ms
+(p99 110 ms) interrupted by eight stalls over 500 ms, the longest 3287 ms on channel 0
+and 4382 ms on channel 1. SonarView's recording on the same hardware has **zero**
+missing ping numbers and a PRI of 50.0 ms (p95 51 ms).
+
+> Routing matters for this statistic too. Keyed on the `src` tag — the routing §9.1
+> replaced — the same file reports 356 and 192 (548 total), because the 19.8 % of
+> packets carrying a wrong tag are counted as gaps on both sides at once. The
+> channel-routed figures above are the real loss.
 
 **Correction to an earlier note in this document:** `~/raw` must NOT be disabled.
 `sss_processor_node` subscribes to `/side_scan_sonar/{port,starboard}/raw` and those
@@ -100,7 +114,7 @@ mistaken for a display problem.
 | Range sampling | **133 mm** | 33 mm | 21 mm |
 | PRI | **110 ms (9.1 Hz)** | 50 ms (20 Hz) | 50 ms (20 Hz) |
 | Transmit pulse | **213 µs** | 66 µs | 44 µs |
-| Bottom return at sample | **49 / 600** | 270 / 600 | 137 / 1200 |
+| Bottom return at sample | **49 / 600** | 269 / 600 | 137 / 1200 |
 
 The 80 m range is the cause of four separate symptoms at once: 4× coarser sampling,
 half the ping rate, a 3× longer pulse (16 cm vs 5 cm range resolution), and a bottom
@@ -108,13 +122,67 @@ return so close to the transmit ringing that **bottom detection stops working** 
 which is precisely why SonarView shows `Detected N/A` on our file no matter which
 source is selected.
 
-**Fix (implemented).** `launch/SSS_processing_launch.py` default range is now
-**20000 mm**. Rule: set the range from the water depth (~4× the deepest water
-expected), never from the area you hope to cover.
+The last symptom is not merely "close to the ringing", it is structural.
+`find_noise_window_start` searches only the first `RINGING_SEARCH_MAX = 60` samples,
+and `detect_fbr_slant_m` begins its bottom search at `nw_start + NOISE_FLOOR_WINDOW`
+— no earlier than sample ≈50 with the fallback `nw_start = 30`. Because that horizon
+is a **sample count**, its physical meaning scales with `range_length_mm /
+num_results`, which sets a minimum detectable altitude per range setting (600
+samples):
 
-`doppler_enable` in the device options is Cerulean's speed-over-ground (Doppler)
-processing; it appears alongside a 16-byte, 0.31 Hz status packet (`id 2194`) that we
-do not parse and do not need — it carries no imagery.
+| `range_length_mm` | mm/sample | FBR floor (≈sample 50) |
+|---|---|---|
+| 80000 (our sea trial) | 133 | **6.7 m** — bottom measured at sample 49 ≈ 6.5 m, inside the noise-floor window and therefore unfindable |
+| 30000 | 50 | 2.5 m |
+| **20000 (current default)** | **33.3** | **1.67 m** |
+| 15000 | 25 | 1.25 m |
+
+Against the site depths in `project_synthesis.md` §3.3 — 0.5–5 m at the beach test
+site, 2–6 m in the marina — a 30 m range puts the floor above the shallow end of
+both; 20 m clears it.
+
+**Fix (implemented).** The default range is **20000 mm** at all three sites that
+declare it — `src/sss_node.py`, `launch/SSS_processing_launch.py` and
+`launch/SSS_simple_launch.py`. At the default `num_results = 600` that gives **33.3 mm
+per sample**, matching the SonarView reference column above. Rule: set the range from
+the water depth (~4× the deepest water expected), never from the area you hope to
+cover.
+
+This is the no-argument default, chosen to be safe at the shallow end of our sites. It
+does not replace `project_synthesis.md` §8.5, which reserves **30 m per side for
+coverage passes and 15 m for revisit passes**; those remain the experiment settings and
+are passed explicitly per run, as `terminals.txt` already does.
+
+### Packet id 2194 — Omniscan status
+
+Established from the bytes, across all three reference logs (`core/svlog.py`
+`decode_omniscan_status`, pinned by `tests/test_svlog_replay.py`):
+
+* 26-byte frame, **16-byte payload**, layout `<ffI3xB`;
+* the `uint32` is on the **same device clock as `timestamp_ms`** — inside that
+  channel's profile time range, monotonic, and never more than half a ping interval
+  from the nearest profile (median 11–13 ms, max 25 ms against a 50 ms PRI). It is
+  sampled independently on that clock, not copied from a profile: only ~3 % land
+  exactly on one;
+* byte 15 is `channel_number`, agreeing with the frame's `src` tag on every packet seen;
+* **~0.9 Hz per device** (1.11 s median interval), i.e. one per ~22 pings at 20 Hz.
+  Counts: 192 (Cerulean demo), 218 (SonarView 20 m), 418 (Tire4 25 m).
+
+The earlier figure of **0.31 Hz was wrong**, and wrong for an instructive reason: it
+divided the Cerulean demo's 192 packets by the file's whole 611.5 s span, which
+contains a 397.8 s gap in which nothing was recorded. Against the 213.8 s the sonar
+was actually acquiring it is 0.90 Hz. That is the segmentation defect below, showing
+up as a rate.
+
+**Not established: what the two floats are.** They are device-specific, span ~45–75
+with the pair 17–19 apart, and drift by under 1 over a whole log. They correlate with
+nothing acoustic — |r| < 0.2 against the same channel's `max_pwr_db`, `min_pwr_db`,
+`gain_index` and raw power statistics — so they are housekeeping telemetry rather
+than signal statistics. `doppler_enable` in the device options is Cerulean's
+speed-over-ground (Doppler) processing and this packet appears alongside it, but
+nothing measured here ties the two together; the association is a guess and is
+recorded as one. The packet carries no imagery, so nothing downstream needs it. The
+loader counts it (`SvlogMission.unparsed_packets`) rather than skipping it silently.
 
 Gain: both stacks run auto-gain. SonarView's settles at `gain_index` 4 for 96 % of
 pings; ours moved across 4–7 but changed on <1 % of pings, so gain is **not** a
@@ -154,12 +222,14 @@ The old tracker returned `None` until 10 consecutive detections agreed within 0.
 and the caller **dropped every ping** until then — losing the start of every mission
 and arbitrary chunks whenever lock was lost.
 
-**Fix (implemented).** `FBRTracker.update` now always returns the best available
-altitude (locked → provisional → last known) and exposes `locked` separately, so
-quality can be reported without discarding data. `resolve_altitude` falls back to
-0.0 (no correction) when nothing has ever been detected. **No ping is ever dropped
+**Fix (implemented, both stacks).** `FBRTracker.update` now always returns the best
+available altitude (locked → provisional → last known) and exposes `locked`
+separately, so quality can be reported without discarding data; the caller falls back
+to 0.0 (no correction) when nothing has ever been detected. **No ping is ever dropped
 for lack of a depth lock.** On `reflection_evidence.svlog`, 593 pings that were
-previously discarded are now displayed with a provisional altitude.
+previously discarded are now displayed with a provisional altitude. The robot side
+carries the same behaviour in `sss_helper.FBRTracker`, and counts pings emitted while
+unlocked (`_unlocked_pings`) rather than pings dropped.
 
 The only remaining drop reason is a genuinely missing pose (no `LOCAL_POSITION_NED`
 before the sonar data): 0 pings in our file, 6 in SonarView's.
@@ -196,77 +266,171 @@ and the simulator that do not provide it.
 
 ---
 
-## 9. Robot-side patches still required
+## 9. Robot-side state
 
-### 9.1 The mis-tagging is written by the processor
+### 9.1 Side identity is read from the packet (done)
 
-`_write_raw_with_src_tag()` tags each packet with the device id implied by **the topic
-it arrived on**, not by the packet's own identity:
-
-```python
-def _on_port_raw(self, msg):      self._write_raw_with_src_tag(msg, DEVICE_ID_PORT)
-def _on_starboard_raw(self, msg): self._write_raw_with_src_tag(msg, DEVICE_ID_STBD)
-```
-
-Whenever a packet reaches the wrong topic, the wrong `src` is burned into the `.svlog`
-permanently — which is why **SonarView also renders our files with banded artifacts**.
-The packet already knows which channel it is: for `OS_MONO_PROFILE` (id 2198),
-`channel_number` is payload byte 26, i.e. **byte 34 of the framed packet** (verified
-against all 5250 packets in `reflection_evidence.svlog`, zero mismatches).
+`_write_raw_with_src_tag()` used to tag each packet with the device id implied by **the
+topic it arrived on**, burning a wrong `src` permanently into the `.svlog` — which is
+why SonarView also rendered our files with banded artifacts. It now derives the tag from
+the packet: for `OS_MONO_PROFILE` (id 2198), `channel_number` is payload byte 26, i.e.
+**byte 34 of the framed packet**, with `transducer_heading_deg` (payload byte 44, **byte
+52** of the frame, float32 LE) as the fallback where `channel_number` is outside `(0, 1)`.
+The device id the raw callbacks pass is only the fallback.
 
 ```python
-from .svlog_helper import OS_MONO_PROFILE_ID, DEVICE_ID_PORT, DEVICE_ID_STBD
-
-_CHANNEL_BYTE = 34          # 8-byte frame header + payload offset 26
+CHANNEL_BYTE = 34           # 8-byte frame header + payload offset 26
+HEADING_BYTE = 52           # 8-byte frame header + payload offset 44
 
 @staticmethod
 def _src_from_packet(raw: bytes, fallback: int) -> int:
     """Device id from the packet itself; the topic is only a fallback."""
-    if (len(raw) > _CHANNEL_BYTE
+    if (len(raw) > CHANNEL_BYTE
             and int.from_bytes(raw[4:6], "little") == OS_MONO_PROFILE_ID):
-        ch = raw[_CHANNEL_BYTE]
+        ch = raw[CHANNEL_BYTE]
         if ch in (0, 1):
             return DEVICE_ID_PORT if ch == 0 else DEVICE_ID_STBD
+        if len(raw) >= HEADING_BYTE + 4:
+            heading, = struct.unpack_from("<f", raw, HEADING_BYTE)
+            if heading:
+                return DEVICE_ID_STBD if heading > 0 else DEVICE_ID_PORT
     return fallback
-
-def _write_raw_with_src_tag(self, msg, fallback_src: int) -> None:
-    if not self._svlog.active:
-        return
-    raw = bytes(bytearray(msg.data))
-    try:
-        self._svlog.write(retag_packet_src_device_id(
-            raw, self._src_from_packet(raw, fallback_src)))
-    except ValueError as exc:
-        self.get_logger().warn(f"dropping malformed raw packet: {exc}")
 ```
 
-This alone makes every future `.svlog` correct in **both** our GCS and SonarView.
+Measured over the whole corpus: `channel_number` and `transducer_heading_deg` agree on
+**100 %** of packets in every file (`ch 0 ⟺ hdg −90`, `ch 1 ⟺ hdg +90`). Three of our
+recordings carry a wrong `src` on 10.6 / 19.8 / 29.5 % of packets; two more carry
+`channel_number = 255` on every packet, so only the heading fallback identifies their
+side — and on those two the `src` tag is close to a **coin flip**, disagreeing with the
+transducer heading on **51.6 %** (`2026-07-21-15-50-26`) and **41.1 %**
+(`2026-07-22-13-43-08`) of packets. They are the worst files in the corpus, not clean
+ones: routing by the tag would scramble about half of each.
 
-### 9.2 Live projection and assembly
+Replaying `reflection_evidence.svlog` (5250 profiles, 19.8 % mis-tagged) through the
+processor and re-recording gives **0.0 % mismatch with all 5250 profiles preserved**.
 
-The live path is projected on the robot, so the mirror must also be fixed there:
+### 9.2 Live projection (done) and assembly (done)
+
+The live path is projected on the robot, so the mirror had to be fixed there too.
+`_emit_group` resolves both the sign and the transducer offset per message through
+`_side_geometry`, applying the identical rule:
 
 ```python
-# side from the message, not from the subscription it arrived on
-side_sign = +1.0 if msg.channel_number == 0 else -1.0
-if msg.channel_number not in (0, 1):                    # defensive fallback
-    side_sign = -1.0 if msg.transducer_heading_deg > 0 else +1.0
+ch = msg.channel_number
+if ch not in (0, 1):                    # defensive fallback
+    ch = 1 if msg.transducer_heading_deg > 0 else 0
+side_sign = +1.0 if ch == 0 else -1.0
 ```
 
-and pings should be assembled by `ping_number` instead of paired within 50 ms, with
-one-sided pings published rather than dropped, and no ping withheld while the bottom
-tracker bootstraps. Until that lands, the GCS reports the symptom (`port/starboard
-halves come from different pings`) in the console.
+Field assignment is unchanged: a message that arrived on the port topic still fills
+`port_y` / `port_intensity_db`, with a negative `y` when the packet says starboard.
+Consumers merge on the sign, not the field name.
 
-**Recorded `.svlog` files replayed in the GCS are already correct**, because the replay
-path does its own routing and assembly.
+Assembly now matches the replay path: rows are keyed by `ping_number`, one-sided rows
+are published rather than dropped, and no ping is withheld while the bottom tracker
+bootstraps. A missing `/blueboat/odom` pose is the only remaining robot-side drop.
+
+### 9.3 The two devices do not share a ping counter
+
+Assembling on the raw `ping_number` is **not** safe, and this was measured only after
+the assembly work started. The two Omniscan 450 units are independent devices with
+independent counters. Their relative offset is constant for a power-up cycle but
+otherwise arbitrary. Over the whole corpus (18 files, 16 two-sided), pairing each ping
+with the opposite side's temporally nearest one:
+
+| `port_pn − stbd_pn` | logs |
+|---|---|
+| `0` | 10 |
+| `−1` | 4 — `2026-07-22-14-18-55`, `HarbourCleanExample`, `example-disturbances`, `toOptimize-harbourScan` |
+| `+60` | 2 — `diffDepthCompensation`, `2026-07-21-15-50-26` |
+
+On the `+60` logs, grouping by the raw counter merges halves that are **seconds** apart:
+
+| log | halves merged, raw key | halves merged, aligned key |
+|---|---|---|
+| `diffDepthCompensation.svlog` | median 2982 ms, max 3217 ms | max 20 ms |
+| `2026-07-21-15-50-26.svlog` | median 1737 ms, max 1740 ms | max 6 ms |
+| `toOptimize-harbourScan.svlog` | median 40 ms | max 116 ms |
+
+At survey speed that is metres of boat travel inside one row. This is **not** the
+`channel_number = 255` anomaly — `diffDepthCompensation.svlog` has clean
+`channel_number` 0/1 and still shows `+60`.
+
+The offset is recovered by voting each ping against the opposite side's *temporally
+nearest* one (`sss_helper.PingCounterOffset`,
+`blueboat_gcs.core.svlog.estimate_counter_offset`). Voting against the most recently
+*seen* opposite ping instead is **bimodal**, splitting roughly evenly between the true
+offset and offset ±1 depending on interleave phase (`Tire4-25m`: 0×4687 vs −1×4561),
+so each vote is deferred by four arrivals until both neighbours are available. With
+that deferral the winning mode holds ≥ 94 % of votes on every two-sided log, and 100 %
+on ten of them.
+
+Both stacks apply the correction: `sss_processor_node` learns it incrementally and
+holds a short pre-roll so the first pings of a mission are keyed correctly; the GCS
+replay path establishes it in a pre-pass over the file, **per session segment** — a
+device power cycle between two recordings in one file reassigns the offset.
+
+### 9.4 The devices do not share a clock with the autopilot either
+
+A `.svlog` carries two independent clocks, and neither is wall time:
+
+| | counts from | measured range |
+|---|---|---|
+| `OS_MONO_PROFILE.timestamp_ms` | the **sonar's** boot | e.g. 3 003 574 → 3 615 124 ms |
+| mavlink `time_boot_ms` | the **autopilot's** boot | e.g. 358 667 → 970 247 ms |
+
+The offset between them is per-file and arbitrary — **2 644 886, 58 363, 56 171 and
+57 566 ms** on four corpus logs — while the two tick at the same rate: their spans
+agree to 30 ms over 611 s. So one measured constant puts both streams on one timeline
+(`estimate_boot_skew`, the median of `timestamp_ms − time_boot_ms` taken against the
+most recent profile). It is stable enough for a single file-wide value: the p1–p99
+spread is 50–120 ms over a whole log, and the two segments of the Cerulean demo agree
+to 20 ms.
+
+Two failure modes are real in the corpus and are handled separately, because the two
+clocks fail separately:
+
+* **`timestamp_ms` unusable** (zeros, or a backwards jump beyond
+  `STAMP_BACKSTEP_TOLERANCE_MS` = 1 s) → the whole timeline falls back to the 20 ms
+  tick. The test is applied **per channel per segment**, never over file order: the
+  writer batches by channel, so file order is non-monotonic on real logs (145, 125 and
+  1076 inversions on three files) while each channel's own sequence is monotonic on
+  every log. One log does swap 9 adjacent pings out of ~17 000, each by exactly one
+  29 ms ping interval — a writer artefact the final event sort absorbs, and far too
+  small to justify discarding a good clock, which is what the 1 s tolerance encodes.
+* **`time_boot_ms` frozen** — `No_sonarVNotOK_usOK_SimpleCurve` carries one single
+  value on all 2008 of its mavlink packets. Anchoring poses to it would collapse every
+  `RobotState` onto one instant. There the sonar clock still carries the timeline and
+  poses ride it instead, rather than the good clock being discarded along with the bad.
+
+### 9.5 One file can hold several recording sessions
+
+Packet id 10 marks the start of a session. Cerulean's own harbour demo holds **two**:
+165.1 s of acquisition, a **397.8 s** gap, then 48.7 s — 611.5 s of span for 213.8 s
+of data. The loader used to dispatch only ids 150 and 2198, so id 10 was decoded and
+discarded and the two sessions were concatenated. Consequences, all of them silent:
+
+* the mission reported **251.6 s** on the flat tick instead of 611.5 s;
+* the waterfall stacked the last row of session 1 against the first of session 2 as
+  neighbours, which reads as continuous seabed;
+* the mosaic rasterizer would densify a swath straight across the join wherever the
+  boat had not moved more than its 2.5 m guard;
+* two seabed image tiles spanned the gap — 256-row windows whose rows are 397.8 s
+  apart, with a fictitious speed spike, and nothing in the PNG to show it.
+
+Sessions are now `SvlogMission.segments`, the dead time between them is a `MissionGap`
+event, and every accumulator breaks on it (waterfall seam, rasterizer reset,
+trajectory subpath, seabed window flush). Replay skips the gap and says so, while the
+slider keeps true mission time. `acquisition_s` (segments summed) and `duration_s`
+(span, gaps included) are both reported, and agree with `svlog_forensics` on every
+corpus log.
 
 ## 10. What I still need
 
 * A short `.svlog` recorded **after** the range change (20 m) to confirm the ping-rate
   and resolution gains on our own hardware.
-* A `.svlog` recorded after the §9.1 retag patch, to confirm 0 % mis-tagging at the
-  source.
+* A `.svlog` recorded on the two Omniscan units after the §9.1 retag patch. Replay
+  confirms 0 % mis-tagging; only real acquisition can confirm it at the source.
 * Whether SonarView still out-renders us at *identical* range settings once the
   mis-tagging is gone — my current assumption is that the residual gap was mostly the
   fixed 0.25 m mosaic grid (now adaptive) plus the mis-tagged 19.8 %, but that needs a

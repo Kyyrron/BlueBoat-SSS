@@ -341,7 +341,7 @@ class SideScanSonarNode(Node):
         # ---- Run-dependent parameters --------------------------------------
 
         self.declare_parameter("range_start_mm", 0)
-        self.declare_parameter("range_length_mm", 30000)
+        self.declare_parameter("range_length_mm", 20000)
         self.declare_parameter("msec_per_ping", 0)
         self.declare_parameter("gain_index", -1)
         self.declare_parameter("num_results", 600)

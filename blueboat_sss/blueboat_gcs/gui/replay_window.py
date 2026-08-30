@@ -75,9 +75,12 @@ class ReplayWindow(QMainWindow):
         super().__init__(parent)
         self._mission = mission
         self._config = config
+        sessions = (f", {len(mission.segments)} sessions"
+                    if len(mission.segments) > 1 else "")
         self.setWindowTitle(
             f"SVLOG replay — {mission.path.name}   "
-            f"({mission.ping_count} pings, {_fmt_t(mission.duration_s)})")
+            f"({mission.ping_count} pings, {_fmt_t(mission.duration_s)}"
+            f"{sessions})")
         self.resize(1400, 900)
 
         # ---- second instance of the live stack -------------------------------
@@ -134,11 +137,21 @@ class ReplayWindow(QMainWindow):
 
         self._connect()
         self._on_range_changed(*self._range.values())
+        notes = []
+        if len(mission.segments) > 1:
+            gaps = ", ".join(f"{g.seconds:.0f} s" for g in mission.gaps)
+            notes.append(f"{len(mission.segments)} recording sessions, "
+                         f"gaps of {gaps} (skipped during replay)")
+        if mission.synthetic_clock:
+            notes.append("no usable timestamps in this log: the timeline is "
+                         "synthetic, so x1 is not real time")
+        if not mission.origin:
+            notes.append("no GPS in this log: satellite layer unavailable, "
+                         "local frame only")
         self.statusBar().showMessage(
             "Render range for an instant picture, or Replay to watch the "
-            "mission live." + ("" if mission.origin else
-                               "   (no GPS in this log: satellite layer "
-                               "unavailable, local frame only)"))
+            "mission live."
+            + ("   (" + "; ".join(notes) + ")" if notes else ""))
 
     # ------------------------------------------------------------------ UI --
     def _build_replay_bar(self) -> None:
@@ -241,6 +254,26 @@ class ReplayWindow(QMainWindow):
         self.waterfall_service.on_sonar_ping(ping)
         self.right_panel.altitude_plot.append(ping.water_depth)
 
+    def _dispatch(self, kind: str, obj) -> None:
+        if kind == "ping":
+            self._on_ping(obj)
+        elif kind == "state":
+            self._on_state(obj)
+        elif kind == "gap":
+            self._on_gap(obj)
+
+    def _on_gap(self, gap) -> None:
+        """Session boundary: break every accumulator rather than join across it.
+
+        The same pair the live window arms on START and on telemetry resumption
+        (main_window ``_on_start`` / ``_on_telemetry_stale``), plus the waterfall
+        seam. Without the rasterizer reset the mosaic would densify a straight
+        swath between the last ping of one session and the first of the next.
+        """
+        self.trajectory_layer.begin_new_segment()
+        self.mosaic_service.reset_tracking()
+        self.waterfall_service.break_row()
+
     def _on_state(self, state: RobotState) -> None:
         self.trajectory_layer.add_pose(state.x, state.y, state.yaw)
         for card in (self.right_panel.point_a, self.right_panel.point_b):
@@ -279,7 +312,7 @@ class ReplayWindow(QMainWindow):
                                    len(events), self)
         progress.setWindowModality(Qt.WindowModal)
         for k, (kind, _t, obj) in enumerate(events):
-            (self._on_ping if kind == "ping" else self._on_state)(obj)
+            self._dispatch(kind, obj)
             if k % 500 == 0:
                 progress.setValue(k)
         progress.setValue(len(events))
@@ -316,8 +349,19 @@ class ReplayWindow(QMainWindow):
         while (self._cursor < len(events)
                and events[self._cursor][1] <= min(self._replay_t, t1)):
             kind, _t, obj = events[self._cursor]
-            (self._on_ping if kind == "ping" else self._on_state)(obj)
+            self._dispatch(kind, obj)
             self._cursor += 1
+            if kind == "gap":
+                # The timeline is the log's own clock, so a session boundary is
+                # real dead time - 397.8 s of it on the Cerulean demo. Holding
+                # it would freeze x1 replay for most of the run, so the clock
+                # jumps to the next session and says so; the slider still reads
+                # true mission time, so nothing is silently stitched together.
+                self._replay_t = max(self._replay_t, obj.t + obj.seconds)
+                self.statusBar().showMessage(
+                    f"skipped {obj.seconds:.1f} s gap \u2192 session "
+                    f"{obj.to_segment + 1}/{len(self._mission.segments)}",
+                    8000)
         self._pos_lbl.setText(
             f"{_fmt_t(min(self._replay_t, t1))} / {_fmt_t(t1)}")
         if self._replay_t >= t1 or self._cursor >= len(events):
@@ -334,7 +378,8 @@ class ReplayWindow(QMainWindow):
         progress.setWindowModality(Qt.WindowModal)
         n = generate_from_pings(
             pings, out, self._config,
-            progress=lambda f: progress.setValue(int(f * 100)))
+            progress=lambda f: progress.setValue(int(f * 100)),
+            breaks=self._mission.gap_times)
         progress.setValue(100)
         QMessageBox.information(
             self, "Seabed images",
@@ -346,7 +391,7 @@ class ReplayWindow(QMainWindow):
         function on each, and display the results exactly as live: markers
         on the map's DetectionLayer and on the waterfall overlay. The
         window is blocked by a modal progress bar while it runs."""
-        from ..core.seabed_imager import SeabedImager
+        from ..core.seabed_imager import SeabedImager, feed_pings
         from ..models.detection import Detection
 
         imager = SeabedImager(self._config)      # dummy analyzer for now
@@ -358,11 +403,8 @@ class ReplayWindow(QMainWindow):
                                    0, len(pings), self)
         progress.setWindowModality(Qt.WindowModal)   # freezes the app
         progress.setMinimumDuration(0)
-        for k, ping in enumerate(pings):
-            imager.on_sonar_ping(ping)
-            if k % 100 == 0:
-                progress.setValue(k)
-        imager.flush()                               # truncated tail image
+        feed_pings(imager, pings, self._mission.gap_times,
+                   progress=lambda f: progress.setValue(int(f * len(pings))))
         progress.setValue(len(pings))
 
         # Make sure there is imagery under the markers: if nothing has

@@ -99,6 +99,22 @@ class WaterfallService(QObject):
         self._filled = min(self._filled + 1, self._rows)
         self._dirty = True
 
+    def break_row(self) -> None:
+        """Insert one blank row, so the rows either side are not neighbours.
+
+        The waterfall's vertical axis is ping index, not time, so nothing in it
+        can express a pause on its own: pings minutes apart would stack as
+        adjacent rows and read as continuous seabed. A ``.svlog`` holding two
+        recording sessions is exactly that case — Cerulean's harbour demo has a
+        397.8 s gap — and the replay window calls this on the ``MissionGap``
+        event. An all-NaN row renders as background, i.e. a visible seam.
+        """
+        self._buf[self._head] = np.nan
+        self._meta[self._head] = np.nan
+        self._head = (self._head + 1) % self._rows
+        self._filled = min(self._filled + 1, self._rows)
+        self._dirty = True
+
     # ---- display -----------------------------------------------------------------
     def set_enabled(self, enabled: bool) -> None:
         """Called when the view mode switches; renders eagerly on entry."""

@@ -1,303 +1,166 @@
 # Side Scan Sonar — Usage Guide
 
-This package launches two nodes:
+Robot-side quick start for the `blueboat_sss` ROS 2 package. The full interface
+reference is `../.claude/CLAUDE.md`; the operator copy-paste command sheet is
+`terminals.txt`.
 
-- **`sss_node`** — drives the pair of Cerulean Omniscan 450 devices and
-  publishes raw `os_mono_profile` packets on `~/port/profile` and
-  `~/starboard/profile`. Optionally writes a single SonarView-compatible
-  `.svlog` containing both channels.
-- **`sss_processor_node`** — subscribes to the raw topics, pairs port +
-  starboard pings by ROS timestamp, descales power to dB, projects every
-  sample to its `(x, y, z)` position in `base_link`, and publishes one
-  `ProcessedSSSPing` per pair on `~/ping`. Optionally records the
-  processed stream to a `ros2 bag` (mcap).
+The package ships two nodes:
 
-Both nodes have independent `~/ping/enable` and `~/log/enable` toggles
-(processor only has logging, since "ping" is owned by `sss_node`).
-Everything is OFF at startup.
+- **`side_scan_sonar`** (`src/sss_node.py`) — drives the pair of Cerulean
+  Omniscan 450 SS units over TCP (port `192.168.2.92:51200`, starboard
+  `192.168.2.93:51200`). Publishes the decoded header on `~/port/profile` and
+  `~/starboard/profile` (`blueboat_interfaces/OmniscanProfile`), and the
+  already-framed Cerulean Ping Protocol packet, verbatim, on `~/port/raw` and
+  `~/starboard/raw` (`std_msgs/UInt8MultiArray`).
+- **`sss_processor`** (`src/sss_processor_node.py`) — slant-range correction,
+  bottom tracking (FBR), port/starboard merge, and `.svlog` writing. Publishes
+  `blueboat_interfaces/ProcessedSSSPing` on `/sss_processor/processed`.
 
-## Launching the node
+Pinging and logging are both **OFF at startup**.
 
-Standalone:
-
-```bash
-ros2 launch blueboat_control SSS_launch.py
-```
-
-With overrides at launch time (any of the parameters listed in
-`SSS_launch.py`):
+## Launching
 
 ```bash
-ros2 launch blueboat_control SSS_launch.py \
-    range_length_mm:=50000 \
-    gain_index:=4 \
-    log_directory:=/userdata/sss_logs
+# Processor only — this is what the GCS START button runs
+ros2 launch blueboat_sss SSS_processing_launch.py
+
+# Acquisition only
+ros2 launch blueboat_sss SSS_simple_launch.py
+ros2 launch blueboat_sss SSS_simple_launch.py range_length_mm:=20000 gain_index:=4
 ```
-
-From another launch file (for the future "boat + sss" composite):
-
-```python
-from simple_launch import SimpleLauncher
-
-def generate_launch_description():
-    sl = SimpleLauncher()
-    # ...your other includes / nodes...
-    sl.include('blueboat_control', 'SSS_launch.py')
-    return sl.launch_description()
-```
-
-The node connects to both Omniscans on startup but **does not start
-pinging or logging** — both are OFF until you flip them on with the
-topics below.
 
 ## Start / stop pinging
 
-Pinging is what actually fires the transducers and produces the data
-streams on `/sss_node/port/profile` and `/sss_node/starboard/profile`.
+Pinging fires the transducers and produces the data streams.
 
 ```bash
-# Start pinging (both sides at once)
-ros2 topic pub --once /sss_node/ping/enable std_msgs/msg/Bool 'data: true'
-
-# Stop pinging
-ros2 topic pub --once /sss_node/ping/enable std_msgs/msg/Bool 'data: false'
-```
-
-Confirm data is flowing:
-
-```bash
-ros2 topic hz /sss_node/port/profile
-ros2 topic hz /sss_node/starboard/profile
-```
-
-### Publishing rate
-
-One ROS message is published per ping packet received — no batching.
-The effective rate is set by the `msec_per_ping` parameter:
-
-- `msec_per_ping = 0` (default) — pings as fast as the hardware can
-  manage, which depends on range. Two-way travel time at 1500 m/s sets
-  the ceiling: roughly **20–25 Hz at 30 m range**, **10 Hz at 75 m**,
-  **~7 Hz at 100 m**.
-- `msec_per_ping = N > 0` — lower-bounds the period at N ms. Set
-  `msec_per_ping=50` for a steady **20 Hz** per side, `100` for 10 Hz,
-  etc. Useful when downstream code expects a constant rate.
-
-### Changing parameters mid-mission
-
-The acquisition parameters (`range_length_mm`, `gain_index`,
-`num_results`, `pulse_len_percent`, `msec_per_ping`, `range_start_mm`)
-are read fresh on every "start". To change range without restarting:
-
-```bash
-ros2 topic pub --once /sss_node/ping/enable std_msgs/msg/Bool 'data: false'
-ros2 param  set /sss_node range_length_mm 50000
-ros2 topic pub --once /sss_node/ping/enable std_msgs/msg/Bool 'data: true'
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: false'
 ```
 
 > ⚠️ Don't leave the Omniscans pinging for long periods out of water —
 > Cerulean's docs note the transmit transducer can heat up and be damaged.
 > A few minutes dry is fine.
 
-## Start / stop raw logging
+## Start / stop `.svlog` recording
 
-Logging writes the raw packet stream to a `.svlog` file in the
-**SonarView single-file format**: both sides interleaved in one file,
-distinguished by the per-packet `channel_number` field. This is the
-same layout SonarView produces when you click its **Record** button —
-the file opens directly in SonarView with both channels visible.
+Logging belongs to the **processor**, not the driver. This is the GCS
+Record ON/OFF toggle.
 
 ```bash
-# Start logging
-ros2 topic pub --once /sss_node/log/enable std_msgs/msg/Bool 'data: true'
-
-# Stop logging
-ros2 topic pub --once /sss_node/log/enable std_msgs/msg/Bool 'data: false'
+ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: true'
+ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: false'
 ```
 
-Logging only writes packets that are actually arriving from the
-devices, so **enable pinging first** (or both at the same time).
-Logging with pinging off creates the file with only its metadata
-header — nothing else gets written until pings start.
+The processor writes `.svlog` to `../../../../data/SSS_data`, resolved relative
+to the **launch working directory** — the same root the GCS uses as `data_root`.
+The node resolves that to an absolute path and creates the directory at startup,
+and enabling logging creates it again if it has gone. If it cannot be created or
+written, the processor logs an **error** (visible on `/rosout` and in the GCS
+console) and recording stays off — it never reports a recording that is not
+there. Every log line names the file, not just the directory.
 
-Each off→on transition rolls a brand new `.svlog`. So a typical
-recording session looks like:
+The file is a SonarView-compatible stream of framed Ping Protocol packets: both
+channels interleaved in one file, distinguished by the per-packet
+`channel_number` field, so it opens directly in SonarView with both channels
+visible. Files roll at 500 MB (`MAX_LOG_SIZE_BYTES` in
+`src/_custom_libraries/svlog_helper.py`).
+
+The `.svlog` is rebuilt from `~/port/raw` and `~/starboard/raw`. Those two
+topics must keep being published, or the logs come out empty.
+
+Recorded `.svlog` files are primary field data — never edit or overwrite them.
+The writer holds to that too: a name collision rolls to `<stamp>-001.svlog`
+rather than replacing the file already there.
+
+## Acquisition parameters
+
+Declared identically in `src/sss_node.py` and both launch files, and re-read on
+every ping enable:
+
+| parameter | default | meaning |
+| ------------------- | ------- | ------------------------------------------ |
+| `range_start_mm`    | 0       | start of the sampled window |
+| `range_length_mm`   | 20000   | swath per side, in mm |
+| `msec_per_ping`     | 0       | 0 = as fast as the hardware manages |
+| `gain_index`        | -1      | -1 = device auto |
+| `num_results`       | 600     | samples per ping |
+| `pulse_len_percent` | 0.002   | transmit pulse as a fraction of range |
+
+**Set the range from the water depth (~4x the deepest expected), not from the
+area you hope to cover.** The 80 m used in the sea trials pushed the bottom
+return to sample 49/600 and broke bottom detection outright. The 20 m default
+gives 33.3 mm range sampling at 600 samples.
+
+To change a parameter without restarting, toggle pinging off, set it, toggle
+back on:
 
 ```bash
-ros2 topic pub --once /sss_node/ping/enable std_msgs/msg/Bool 'data: true'
-ros2 topic pub --once /sss_node/log/enable  std_msgs/msg/Bool 'data: true'
-# ...do the survey...
-ros2 topic pub --once /sss_node/log/enable  std_msgs/msg/Bool 'data: false'
-ros2 topic pub --once /sss_node/ping/enable std_msgs/msg/Bool 'data: false'
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: false'
+ros2 param  set /side_scan_sonar range_length_mm 30000
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
 ```
 
-Files larger than 500 MB roll automatically into a continuation file
-(same naming scheme, fresh metadata header).
+### Publishing rate
 
-## Choosing the log folder
+One ROS message per ping packet received — no batching. `msec_per_ping = 0`
+pings as fast as the hardware manages, which depends on range: two-way travel
+time at ~1500 m/s sets the ceiling, roughly **20–25 Hz at 30 m**, **10 Hz at
+75 m**, **~7 Hz at 100 m**. `msec_per_ping = N > 0` lower-bounds the period at
+N ms — set `50` for a steady 20 Hz per side. Note that `pulse_len_percent`
+scales the transmit pulse with the range, so a long range costs range
+resolution as well as rate.
 
-The folder is the `log_directory` parameter. Default is `~/sss_logs`
-(tilde expansion is handled by the node).
+## Transducer geometry
 
-Override at launch time:
+Not launch parameters — four module-level constants at the top of
+`src/sss_processor_node.py`, all currently `0.0` and carrying `TODO`s:
+`TRANSDUCER_X_OFFSET_M`, `TRANSDUCER_Y_OFFSET_PORT_M`,
+`TRANSDUCER_Y_OFFSET_STBD_M`, `TRANSDUCER_SUBMERSION_M`. Measure them on the
+physical BlueBoat before any localization-accuracy work.
 
-```bash
-ros2 launch blueboat_control SSS_launch.py log_directory:=/userdata/sss_logs
-```
-
-Or in your composite launch file:
-
-```python
-sl.include('blueboat_control', 'SSS_launch.py',
-           launch_arguments={'log_directory': '/userdata/sss_logs'})
-```
-
-The path can be absolute or use `~`. The directory is created on
-startup if it doesn't exist. If you're running the node on the
-BlueBoat onboard computer and want SonarView to pick up your logs
-without copying, point this at `/userdata/SonarView` (the folder
-SonarView watches by default — see the Blue Robotics Omniscan 450 SS
-integration guide).
-
-## What ends up on disk
-
-One `.svlog` file per recording session, in the directory you
-configured:
-
-```
-~/sss_logs/
-├── 2026-05-08-14-03-27.svlog      # session 1 (started 14:03:27)
-└── 2026-05-08-14-19-02.svlog      # session 2 (started 14:19:02)
-```
-
-Each file:
-
-- Opens with a **JSON metadata packet** that declares both transducers
-  in `session_devices` (`tcp://192.168.2.92:51200` and
-  `tcp://192.168.2.93:51200` by default). SonarView reads this to set
-  up the two display channels.
-- Is then a stream of raw Ping-Protocol `os_mono_profile` packets from
-  both devices, **interleaved in arrival order**. Each packet's
-  `channel_number` field tells the player which side it came from.
-- Each packet is framed exactly as Cerulean defines: `BR` sync bytes,
-  little-endian payload length, message id (2198), device IDs, the
-  52-byte fixed payload plus the `pwr_results` array (length =
-  `num_results`), and a 2-byte checksum.
-
-What you can do with it:
-
-- **Open in SonarView** — desktop or BlueOS extension. Both channels
-  show as a normal side-scan waterfall, exactly as if SonarView had
-  recorded the session itself.
-- **Export to XTF or SL2** from SonarView for use in other processing
-  tools (ReefMaster, SonarWiz, etc.).
-- **Replay through this node / `brping`** for offline ROS-side
-  processing. The `examples/omniscan450Example.py` from
-  `bluerobotics/ping-python` accepts a `.svlog` path as input and
-  feeds packets through the same `wait_message()` API as live capture.
-
-## Processed pings (sss_processor_node)
-
-The processor consumes the raw topics, pairs port + starboard pings by
-their ROS arrival timestamps (a two-pointer match within
-`match_tolerance_ms`, default 50 ms), descales the u16 power samples to
-dB, projects each sample to its `(x, y, z)` in `base_link` under a
-horizontal-beam assumption (no bathymetry yet), and publishes one
-`blueboat_interfaces/ProcessedSSSPing` per pair on
-`/sss_processor_node/ping`.
-
-The output message holds, for each side, `num_samples` parallel arrays
-of `x`, `y`, `z`, `intensity_db` — so the consumer reads "intensity at
-this point in the boat frame" without any conversion. In REP-103:
-port samples sit at `+y`, starboard at `-y`.
-
-### Transducer geometry
-
-Three parameters control where the samples land in `base_link`:
-
-| parameter               | meaning                             | default |
-| ----------------------- | ----------------------------------- | ------- |
-| `transducer_x_m`        | longitudinal offset (forward = +)   | 0.0     |
-| `transducer_y_offset_m` | lateral offset from centerline      | 0.0     |
-| `transducer_z_m`        | vertical offset                     | 0.0     |
-
-Sample i on each side sits at slant range `r_i = (start_mm + i *
-length_mm / (num_results - 1)) / 1000` in meters. Port → `(x, +y +
-r_i, z)`, starboard → `(x, -y - r_i, z)`. When you have bathymetry, the
-processor can be upgraded to project onto the seafloor instead of a
-flat plane.
-
-### Start / stop processed-ping logging
-
-This is independent from the raw `.svlog` toggle:
-
-```bash
-# Start recording processed pings (mcap bag)
-ros2 topic pub --once /sss_processor_node/log/enable std_msgs/msg/Bool 'data: true'
-
-# Stop
-ros2 topic pub --once /sss_processor_node/log/enable std_msgs/msg/Bool 'data: false'
-```
-
-The processor spawns a `ros2 bag record --storage mcap` subprocess in
-its own process group, so it won't die when the node receives a
-SIGINT. On stop, the subprocess gets a clean SIGINT and the bag closes
-properly.
-
-### What ends up on disk for processed pings
-
-`ros2 bag` writes a **folder** per session (mcap convention), placed
-next to the raw `.svlog` files:
-
-```
-~/sss_logs/
-├── 2026-05-08-14-03-27.svlog              # raw, from sss_node
-├── 2026-05-08-14-19-02.svlog
-├── processed-2026-05-08-14-03-30/         # processed bag
-│   ├── metadata.yaml
-│   └── processed-2026-05-08-14-03-30_0.mcap
-└── processed-2026-05-08-14-19-05/
-    ├── metadata.yaml
-    └── processed-2026-05-08-14-19-05_0.mcap
-```
-
-Raw and processed get **independent timestamps** (you toggle each
-recorder separately, so they may not start at the exact same moment).
-
-What you can do with a processed bag:
-
-- **`ros2 bag play <folder>`** — replays the `ProcessedSSSPing` topic
-  through ROS exactly as it was published, so downstream nodes (AI
-  patches, georeferencing) can consume it offline without any of the
-  upstream ones running.
-- **`ros2 bag info <folder>`** — total messages, duration, topic list.
-- **Read with `rosbag2_py` in Python** — for analysis notebooks. The
-  mcap format also opens directly in Foxglove Studio.
+In the processed message the sign of `*_y` encodes the side: **+y = port,
+-y = starboard**. Samples are already slant-range corrected and the water
+column is already removed.
 
 ## Quick health check
 
-Useful one-liners for sanity-checking that the node is alive:
-
 ```bash
 # Are the nodes up?
-ros2 node info /sss_node
-ros2 node info /sss_processor_node
+ros2 node info /side_scan_sonar
+ros2 node info /sss_processor
 
 # Are subscribers attached to the control topics?
-ros2 topic info /sss_node/ping/enable
-ros2 topic info /sss_node/log/enable
-ros2 topic info /sss_processor_node/log/enable
+ros2 topic info /side_scan_sonar/ping/enable
+ros2 topic info /sss_processor/log/enable
 
 # Is data actually arriving when ping is on?
-ros2 topic echo /sss_node/port/profile --field ping_number
-ros2 topic hz   /sss_node/starboard/profile
-ros2 topic hz   /sss_processor_node/ping
+ros2 topic echo /side_scan_sonar/port/profile --field ping_number
+ros2 topic hz   /side_scan_sonar/starboard/profile
+ros2 topic hz   /sss_processor/processed
 ```
 
-If `ros2 topic hz /sss_processor_node/ping` is markedly lower than the
-raw-topic rates, the pairing tolerance is probably too tight — bump
-`match_tolerance_ms` up to ~½ of the actual ping period.
+If the raw rates are fine but the processor reports 0 Hz, the most common cause
+is a QoS mismatch. All four sonar publishers are `BEST_EFFORT` / `KEEP_LAST(10)`;
+a `RELIABLE` subscriber is QoS-incompatible and receives *nothing*. Change both
+ends together or not at all.
 
-If raw rates are fine but the processor reports 0 Hz, the most common
-cause is a QoS mismatch. Subscribers to the raw topics must use
-`BEST_EFFORT` / `KEEP_LAST(10)` to connect (this node already does).
+The processor also treats pose as a hard gate: it drops a ping pair outright if
+`/blueboat/odom` has produced nothing, so a silent processor with healthy raw
+topics can equally mean no odom.
+
+## Build
+
+```bash
+cd ~/ros2_ws
+colcon build --packages-select blueboat_sss
+source install/setup.bash
+```
+
+`CMakeLists.txt` installs `launch/` plus the five `src/` scripts flat into
+`lib/blueboat_sss/`; the flat layout is what lets `sss_processor_node.py` import
+`sss_helper` / `svlog_helper` / `math_helper` without a package prefix.
+
+Robot-side dependencies: `bluerobotics-ping` (`brping`), `simple_launch`,
+`scipy`, `mavros_msgs`, `geographic_msgs`, and `blueboat_interfaces` (supplied
+by BlueBoat-Control).

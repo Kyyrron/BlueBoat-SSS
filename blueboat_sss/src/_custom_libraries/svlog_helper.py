@@ -246,6 +246,15 @@ class SvlogWriter:
     file-open time, which is produced by an injected `metadata_provider`
     callable so the caller controls every field.
 
+    Failures are never silent. A recording that cannot be opened or continued
+    reports through the injected `error_reporter` (stderr when none is given)
+    and leaves `active` False -- this module is ROS-free by contract, so the
+    caller supplies whatever logger it has. A run that looks successful and
+    wrote nothing is the one outcome that must be impossible.
+
+    Recorded `.svlog` files are primary field data: an existing file is never
+    truncated or deleted. A name collision rolls to a suffixed name instead.
+
     All public methods are thread-safe; the port-side sonar thread, the
     starboard-side sonar thread and the ROS executor thread may all call
     `write()` concurrently.
@@ -256,10 +265,12 @@ class SvlogWriter:
         log_dir: Path,
         metadata_provider: Callable[[], bytes],
         max_size_bytes: int = MAX_LOG_SIZE_BYTES,
+        error_reporter: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._log_dir = Path(log_dir)
         self._metadata_provider = metadata_provider
         self._max_size_bytes = max_size_bytes
+        self._error_reporter = error_reporter
 
         self._lock = threading.Lock()
         self._active = False
@@ -277,12 +288,27 @@ class SvlogWriter:
             return self._path
 
     def start(self) -> Optional[Path]:
-        """Open a new .svlog and write the session header."""
+        """Open a new .svlog and write the session header.
+
+        Returns the file, or None if the recording could not be opened -- in
+        which case the reason has already gone to the error reporter. Callers
+        must branch on the return value: reporting "recording started" on a
+        None is the silent-failure this guards against.
+        """
         with self._lock:
             if self._active:
                 return self._path
-            #self._log_dir.mkdir(parents=True, exist_ok=True)
-            self._roll_unlocked()
+            try:
+                self._log_dir.mkdir(parents=True, exist_ok=True)
+                self._roll_unlocked()
+            except OSError as exc:
+                self._path = None
+                self._bytes_written = 0
+                self._report(
+                    f"recording NOT started: cannot open a .svlog in "
+                    f"{self._log_dir}: {exc}"
+                )
+                return None
             self._active = True
             return self._path
 
@@ -297,22 +323,37 @@ class SvlogWriter:
         with self._lock:
             if not self._active or self._path is None:
                 return
-            if self._bytes_written > self._max_size_bytes:
-                self._roll_unlocked()
             try:
+                if self._bytes_written > self._max_size_bytes:
+                    self._roll_unlocked()
                 with open(self._path, "ab") as f:
                     f.write(raw_bytes)
                 self._bytes_written += len(raw_bytes)
-            except OSError:
-                # Disk full / unmounted / permissions -- stop quietly.
+            except OSError as exc:
+                # Disk full / unmounted / permissions. Recording stops here,
+                # and says so: `_active` is False from now on, so this fires
+                # once rather than once per ping.
+                failed, self._path = self._path, None
                 self._active = False
-                self._path = None
+                self._report(f"recording STOPPED: writing {failed} failed: {exc}")
+
+    def _report(self, message: str) -> None:
+        """Surface a failure through the caller's logger, else to stderr."""
+        if self._error_reporter is not None:
+            self._error_reporter(message)
+        else:
+            print(f"[svlog] {message}", file=sys.stderr, flush=True)
 
     def _roll_unlocked(self) -> None:
-        name = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        path = self._log_dir / f"{name}.svlog"
-        if path.exists():
-            path.unlink()
+        # An existing .svlog is primary field data and is never deleted or
+        # truncated: a collision (two recordings in the same second, or a
+        # 500 MB roll inside one) takes a suffixed name instead.
+        stem = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        path = self._log_dir / f"{stem}.svlog"
+        serial = 0
+        while path.exists():
+            serial += 1
+            path = self._log_dir / f"{stem}-{serial:03d}.svlog"
         self._path = path
         self._bytes_written = 0
         meta = self._metadata_provider()

@@ -52,7 +52,7 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import (Callable, Iterable, List, Optional, Sequence, Tuple)
 
 import cv2
 import numpy as np
@@ -262,6 +262,23 @@ class SeabedImager(QObject):
             self._emitted_any = True
             self._emit_window(self._rows)
 
+    def break_window(self) -> None:
+        """End the current window at a session boundary and start clean.
+
+        A ``.svlog`` may hold several recording sessions. A 256-row window that
+        straddles the dead time between two of them produces a single image
+        whose rows are minutes apart, with a fictitious speed spike where the
+        boat "jumped" — a corrupt training sample, and one that looks perfectly
+        ordinary in an annotation tool. Flushing the tail and clearing the
+        buffer keeps every image inside one session. ``_next_id`` is deliberately
+        *not* reset, so image ids stay unique and ordered across the whole log.
+        """
+        self.flush()
+        self._buf_rows.clear()
+        self._buf_meta.clear()
+        self._since_last = 0
+        self._last_pose = None
+
     def flush(self) -> None:
         """Emit the final, possibly truncated picture — no data wasted.
 
@@ -323,10 +340,34 @@ class SeabedImager(QObject):
 # ---------------------------------------------------------------------------
 # Offline generation (replay window "Save pictures from the log")
 # ---------------------------------------------------------------------------
+def feed_pings(imager: SeabedImager, pings: Sequence[SonarPing],
+               breaks: Sequence[float] = (),
+               progress: Optional[Callable[[float], None]] = None) -> None:
+    """Feed a decoded log through an imager, breaking at each session boundary.
+
+    ``breaks`` is mission times at which a session ended — normally
+    ``SvlogMission.gap_times``. Every consumer that replays a whole log goes
+    through here so the break rule has one implementation: the offline dataset
+    export and the replay window's AI pass would otherwise drift apart.
+    """
+    pending = sorted(float(b) for b in breaks)
+    for k, ping in enumerate(pings):
+        while pending and ping.t > pending[0]:
+            pending.pop(0)
+            imager.break_window()
+        if progress is not None and k % 200 == 0:
+            progress(k / max(len(pings), 1))
+        imager.on_sonar_ping(ping)
+    imager.flush()                       # truncated tail: no data wasted
+    if progress is not None:
+        progress(1.0)
+
+
 def generate_from_pings(pings: Iterable[SonarPing], out_dir: Path,
                         config: AppConfig,
                         progress: Optional[Callable[[float], None]] = None,
-                        run_analyzer: bool = False) -> int:
+                        run_analyzer: bool = False,
+                        breaks: Sequence[float] = ()) -> int:
     """Run the identical imaging code over a decoded log; returns the
     number of images written to ``out_dir`` (+ inner ``metadata/``)."""
     imager = SeabedImager(config)
@@ -335,12 +376,5 @@ def generate_from_pings(pings: Iterable[SonarPing], out_dir: Path,
         imager._analyzer = lambda img: []        # dataset mode: raw images
     written = []
     imager.image_ready.connect(lambda img: written.append(img.image_id))
-    pings = list(pings)
-    for k, ping in enumerate(pings):
-        if progress is not None and k % 200 == 0:
-            progress(k / max(len(pings), 1))
-        imager.on_sonar_ping(ping)
-    imager.flush()                       # truncated tail: no data wasted
-    if progress is not None:
-        progress(1.0)
+    feed_pings(imager, list(pings), breaks, progress)
     return len(written)
