@@ -143,6 +143,15 @@ ALTITUDE_OUTLIER_TOL_M:   float = 1.0   # post-lock per-ping jump rejected as ou
 ALTITUDE_RELOCK_AFTER:    int   = 15    # consecutive rejects force a side to re-bootstrap
 
 ODOM_BUFFER_SECONDS:      float = 5.0
+# Maximum |odom stamp - profile stamp| for a pose to be usable. Without
+# it, a dead or clock-mismatched /blueboat/odom left the buffer's last
+# sample latched and EVERY ping was stamped with that one stale pose --
+# the "pings pile on one point" field bug. Past the tolerance the ping
+# takes the sanctioned missing-pose drop (NON-NEGOTIABLE #2) with a
+# warning naming the measured skew, instead of a silently wrong pose.
+# 1 s = ~20 odom periods: generous against jitter, tiny against the
+# minutes-scale skews of a genuine clock mismatch.
+ODOM_NEAREST_TOLERANCE_S: float = 1.0
 
 # ---------------------------------------------------------------------------
 # Row assembly (NON-NEGOTIABLE #2: never drop a ping).
@@ -180,10 +189,16 @@ class _OdomBuffer:
     lookup. A linear scan is fine: at 20 Hz odom + 5 s window, ~100 entries.
     """
 
-    def __init__(self, max_age_ns: int) -> None:
+    def __init__(self, max_age_ns: int,
+                 tolerance_ns: int = int(ODOM_NEAREST_TOLERANCE_S * 1e9)
+                 ) -> None:
         self._max_age_ns = max_age_ns
+        self._tolerance_ns = tolerance_ns
         self._samples: Deque[Tuple[int, Odometry]] = deque()
         self._lock = threading.Lock()
+        #: |odom - profile| of the last refused lookup [ns]; the caller
+        #: reads it to name the measured skew in its warning.
+        self.last_refused_dt_ns: Optional[int] = None
 
     def push(self, msg: Odometry) -> None:
         ts = stamp_to_ns(msg.header.stamp)
@@ -198,7 +213,20 @@ class _OdomBuffer:
             return bool(self._samples)
 
     def nearest(self, target_ns: int) -> Optional[Odometry]:
+        """The sample nearest ``target_ns``, or None when nothing lies
+        within the tolerance.
+
+        Pruning also happens here, against the *lookup* stamp: ``push``
+        prunes against arrival, so a topic that went silent kept its
+        last samples forever and served the same stale pose to every
+        later ping. A ping whose nearest pose is farther than the
+        tolerance is unplaceable and takes the sanctioned drop instead
+        (NON-NEGOTIABLE #2 — a missing pose is the one legitimate drop).
+        """
         with self._lock:
+            cutoff = target_ns - self._max_age_ns
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
             if not self._samples:
                 return None
             best_ts, best_msg = self._samples[0]
@@ -207,6 +235,9 @@ class _OdomBuffer:
                 dt = abs(ts - target_ns)
                 if dt < best_dt:
                     best_ts, best_msg, best_dt = ts, msg, dt
+            if best_dt > self._tolerance_ns:
+                self.last_refused_dt_ns = best_dt
+                return None
             return best_msg
 
 
@@ -911,6 +942,14 @@ class SSSProcessorNode(Node):
         odom = self._odom_buf.nearest(stamp_to_ns(ref.header.stamp))
         if odom is None:
             self._dropped_no_odom += 1
+            if self._dropped_no_odom == 1 or self._dropped_no_odom % 20 == 0:
+                dt = self._odom_buf.last_refused_dt_ns
+                detail = ("" if dt is None else
+                          f" (nearest odom is {dt / 1e9:.1f} s away — "
+                          "stale topic or a sonar/odom clock mismatch)")
+                log.warn(
+                    f"dropping ping: no usable /blueboat/odom pose{detail}; "
+                    f"total dropped: {self._dropped_no_odom}")
             return
 
         # 7. Assemble + publish.

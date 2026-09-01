@@ -101,6 +101,12 @@ ros2 param  set /side_scan_sonar range_length_mm 30000
 ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
 ```
 
+The GCS performs this dance itself: the right panel's **Acquisition → Sonar
+range** slider (enabled while the pipeline is running) pauses pinging, sets
+`range_length_mm` via the node's `set_parameters` service, and resumes —
+always, even when the change fails. The commands above remain the manual
+fallback.
+
 ### Publishing rate
 
 One ROS message per ping packet received — no batching. `msec_per_ping = 0`

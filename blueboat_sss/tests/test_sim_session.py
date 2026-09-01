@@ -115,6 +115,8 @@ def test_sim_start_stop_cycle(sim_app):
         observed["cell_size_m"] = h.mosaic.cell_size_m
         chrono = h.window.waterfall_service.chronological()
         observed["waterfall_shape"] = None if chrono is None else chrono.shape
+        observed["anchored"] = h.window.geo.ready
+        observed["world_root_visible"] = h.window.world_root.item.isVisible()
         h.window.toolbar.stop_clicked.emit()
 
     _run_phases(h.app, [
@@ -157,6 +159,16 @@ def test_sim_start_stop_cycle(sim_app):
     assert rows == len(h.pings), (
         f"{rows} waterfall rows for {len(h.pings)} pings — the viz gate "
         "dropped rows that reached the bus")
+
+    # --- the GPS anchor opened during the run ----------------------------------
+    # The simulator emits gps_fix + robot_state at 5 Hz; with min_pairs=5
+    # the translation-only anchor must be valid well inside the run, and
+    # the gated world root must be showing (GPS-anchored map port).
+    assert observed["anchored"], (
+        "the odom<->GPS anchor never became valid during a --sim run")
+    assert observed["world_root_visible"], (
+        "anchor valid but the world root stayed hidden — the gate wiring "
+        "is broken")
 
     # --- NC #9: data leaves the GCS only through a recording session -----------
     assert not h.sessions_dir.exists(), (

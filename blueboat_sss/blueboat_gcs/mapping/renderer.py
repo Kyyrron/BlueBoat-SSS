@@ -114,10 +114,19 @@ class MosaicRenderer:
             vmax = vmin + 1e-6
         return float(vmin), float(vmax)
 
-    def to_rgba(self, values: np.ndarray) -> np.ndarray:
-        """(H, W) float raster (NaN = empty) -> (H, W, 4) uint8 RGBA."""
+    def to_rgba(self, values: np.ndarray,
+                limits: Optional[Tuple[float, float]] = None) -> np.ndarray:
+        """(H, W) float raster (NaN = empty) -> (H, W, 4) uint8 RGBA.
+
+        ``limits`` overrides the value window: the tiled waterfall
+        renders many partial rasters that must share ONE global window,
+        or every tile would stretch its own percentiles and band at the
+        seams. None keeps the per-call behaviour (auto percentiles or
+        the manual DisplaySettings window)."""
         s = self.settings
-        if s.auto_range:
+        if limits is not None:
+            vmin, vmax = limits[0], max(limits[1], limits[0] + 1e-6)
+        elif s.auto_range:
             vmin, vmax = self._auto_limits(values)
         else:
             vmin, vmax = s.vmin_db, max(s.vmax_db, s.vmin_db + 1e-6)
@@ -136,12 +145,14 @@ class MosaicRenderer:
         rgba[..., 3] = np.where(finite, 255, 0)
         return rgba
 
-    def to_qimage(self, values: np.ndarray, flip: bool = True) -> QImage:
+    def to_qimage(self, values: np.ndarray, flip: bool = True,
+                  limits: Optional[Tuple[float, float]] = None) -> QImage:
         """Raster (row 0 = ymin, NaN = empty) -> QImage (row 0 = ymax).
 
-        ``flip=False`` keeps row order (waterfall: row = ping index).
+        ``flip=False`` keeps row order (waterfall: row = ping index);
+        ``limits`` as in :meth:`to_rgba`.
         """
-        rgba = self.to_rgba(values)
+        rgba = self.to_rgba(values, limits=limits)
         if flip:
             # World row 0 is ymin ('origin=lower'); QImage row 0 is drawn
             # at the top and the map view maps scene-y-down to world-y-up.

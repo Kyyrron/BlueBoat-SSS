@@ -220,6 +220,68 @@ class MosaicGrid:
 
         self._dirty = True
 
+    # ---- resolution change ---------------------------------------------------
+    def resample_from(self, old: "MosaicGrid") -> None:
+        """Carry another grid's accumulated data into this *empty* grid.
+
+        Used on resolution changes so the mosaic is never wiped. Old data
+        keeps its native resolution: a coarse cell paints the whole block
+        of finer cells it covered (no finer detail ever existed to
+        recover), and fine cells aggregate into a coarser one. The mean
+        plane transfers its weighted sums, so data acquired after the
+        change blends with the old exactly as if both had always been
+        accumulated here.
+        """
+        mask = (old._count > 0) | (old._wsum > 0)
+        if not mask.any():
+            return
+        iy, ix = np.nonzero(mask)
+        xmin = old._x0 + float(ix.min()) * old._cell
+        xmax = old._x0 + (float(ix.max()) + 1.0) * old._cell
+        ymin = old._y0 + float(iy.min()) * old._cell
+        ymax = old._y0 + (float(iy.max()) + 1.0) * old._cell
+        self._ensure_contains(xmin, xmax, ymin, ymax)
+        h, w = self._sum.shape
+
+        # r×r sub-points per old cell guarantee every overlapped new cell
+        # is hit when refining; r = 1 is the plain aggregation scatter
+        # when coarsening. Sub-points carry the old cell's sums verbatim:
+        # sum and wsum scale together, so the displayed mean is exact
+        # either way, and no transferred cell can fall under the
+        # _MIN_WEIGHT display gate.
+        r = max(1, int(math.ceil(old._cell / self._cell)))
+        offsets = (np.arange(r, dtype=np.float64) + 0.5) / r  # in old cells
+        oxg, oyg = np.meshgrid(offsets, offsets)
+        oxg, oyg = oxg.ravel(), oyg.ravel()
+
+        # Chunked: refining a large survey can expand to tens of millions
+        # of sub-points; bound the temporaries.
+        max_points = 1_000_000
+        cells_per_batch = max(1, max_points // (r * r))
+        for lo in range(0, ix.size, cells_per_batch):
+            bix = ix[lo:lo + cells_per_batch]
+            biy = iy[lo:lo + cells_per_batch]
+            src = (biy, bix)
+            x = old._x0 + (bix[:, None] + oxg[None, :]) * old._cell
+            y = old._y0 + (biy[:, None] + oyg[None, :]) * old._cell
+            cx, cy = self._world_to_cell(x.ravel(), y.ravel())
+            ok = (cx >= 0) & (cx < w) & (cy >= 0) & (cy < h)
+            idx = (cy[ok], cx[ok])
+
+            def spread(plane: np.ndarray) -> np.ndarray:
+                """Old per-cell values repeated onto the r² sub-points."""
+                return np.repeat(plane[src], r * r)[ok]
+
+            np.add.at(self._sum, idx, spread(old._sum))
+            np.add.at(self._wsum, idx, spread(old._wsum).astype(np.float32))
+            np.add.at(self._count, idx,
+                      spread(old._count).astype(np.uint32))
+            np.minimum.at(self._closest_rng, idx, spread(old._closest_rng))
+            self._closest[idx] = spread(old._closest)
+            self._oldest[idx] = spread(old._oldest)
+            self._newest[idx] = spread(old._newest)
+        self._dirty = True
+
     #: A cell is displayed once it has gathered at least this much
     #: bilinear weight — suppresses the faint half-cell halo a pure
     #: splat would produce at the outer swath edge.

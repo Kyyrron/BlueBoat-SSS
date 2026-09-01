@@ -55,7 +55,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         from .ros.pipeline_launcher import PipelineLauncher
         from .ros.ros_manager import RosManager
         ros_manager = RosManager(config, signals)
-        acquisition = PipelineLauncher(config.pipeline, ros_manager, signals)
+        acquisition = PipelineLauncher(config.pipeline, ros_manager, signals,
+                                       acquisition=config.acquisition)
         if ros_manager.start() and ros_manager.node is not None:
             # Listener construction = subscription registration.
             from .ros.detections_listener import DetectionsListener
@@ -64,9 +65,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             from .ros.sonar_listener import SonarListener
             from .ros.telemetry_listener import TelemetryListener
             node = ros_manager.node
-            SonarListener(node, signals, config.topics.processed_ping,
-                          queue_depth=config.sonar_stream.queue_depth,
-                          warn_on_ping_gap=config.sonar_stream.warn_on_ping_gap)
+            ros_manager.sonar_listener = SonarListener(
+                node, signals, config.topics.processed_ping,
+                queue_depth=config.sonar_stream.queue_depth,
+                warn_on_ping_gap=config.sonar_stream.warn_on_ping_gap)
             TelemetryListener(node, signals, config.topics,
                               gps_fallback=config.alignment.gps_fallback)
             DetectionsListener(node, signals, config.topics.detections)

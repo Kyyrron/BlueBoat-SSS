@@ -61,6 +61,19 @@ class SonarListener:
                          depth=int(queue_depth))
         node.create_subscription(ProcessedSSSPing, topic, self._on_msg, qos)
 
+    def reset_pairing(self) -> None:
+        """New acquisition START: forget the per-power-up expectations.
+
+        The device counter offset (``_pair_delta``) and the last seen
+        ``port_ping_number`` belong to one power-up of the sonar pair; a
+        pipeline relaunch may reset either, and carrying them across
+        sessions produced spurious crossed-pair and huge bogus gap
+        warnings. The cumulative counters (received / device_gaps /
+        crossed_pairs / one_sided) are per-application and stay."""
+        self._pair_delta = None
+        self._last_port_pn = None
+        self._warned_cross = False
+
     def _on_msg(self, msg: "ProcessedSSSPing") -> None:
         # Same merging convention as the legacy listener: the sign of
         # y_local encodes the side (port=+, stbd=-), so one array suffices.

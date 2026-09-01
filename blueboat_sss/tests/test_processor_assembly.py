@@ -131,6 +131,14 @@ def node():
 
 
 def feed_odom(node, count=50, period_ns=50_000_000):
+    """Fill the odom buffer from t=0.
+
+    Keep ``count * period_ns`` inside the buffer's 5 s window
+    (ODOM_BUFFER_SECONDS): ``push()`` prunes to the last 5 s, and
+    ``nearest()`` refuses samples farther than the 1 s tolerance from
+    the ping stamp — pre-feeding a longer span than the window silently
+    drops the early samples the pings at t≈0 need. In the field odom is
+    continuous at ~20 Hz, so every ping has a fresh neighbour."""
     for i in range(count):
         node._odom_buf.push(make_odom(i * period_ns, x=float(i)))
 
@@ -147,7 +155,7 @@ def test_every_ping_is_emitted_despite_gaps_and_late_arrivals(node):
     One side is missing on every 10th ping and one side arrives >50 ms late
     on every 7th — the two cases the old arrival-time matcher discarded.
     """
-    feed_odom(node, count=200, period_ns=PING_PERIOD_NS)
+    feed_odom(node, count=70, period_ns=PING_PERIOD_NS)   # covers 0..3.45 s
     n_pings = 60
     late = []
     for i in range(n_pings):
@@ -244,8 +252,16 @@ def test_preroll_is_bounded_and_never_strands_a_ping(node):
 
 
 def test_group_buffer_is_bounded(node):
-    """The live group buffer never grows without limit."""
-    feed_odom(node, count=400, period_ns=PING_PERIOD_NS)
+    """The live group buffer never grows without limit.
+
+    What is under test is the group cap, so the odom dimension is taken
+    out of the way: piling 1024 one-sided groups spans ~51 s of stamps
+    (the flush timer never runs in this synchronous harness, which never
+    happens live — the 1 s lag flush drains groups long before the odom
+    window or the nearest-stamp tolerance could matter)."""
+    node._odom_buf = proc._OdomBuffer(int(120e9), tolerance_ns=int(120e9))
+    feed_odom(node, count=4 * proc.ASSEMBLY_MAX_GROUPS + 10,
+              period_ns=PING_PERIOD_NS)
     for i in range(4 * proc.ASSEMBLY_MAX_GROUPS):
         node._on_port(make_profile(0, 2000 + i, i * PING_PERIOD_NS))
     assert len(node._groups) <= proc.ASSEMBLY_MAX_GROUPS + 1
@@ -299,7 +315,7 @@ def test_unlocked_altitude_is_an_identity_transform_not_a_guess(node):
 
 def test_bootstrap_counter_counts_emissions_never_drops(node):
     """The old _dropped_bootstrap counted discarded pings; nothing is discarded now."""
-    feed_odom(node, count=200, period_ns=PING_PERIOD_NS)
+    feed_odom(node, count=40, period_ns=PING_PERIOD_NS)   # covers 0..1.95 s
     for i in range(30):
         t = i * PING_PERIOD_NS
         node._on_port(make_profile(0, 1 + i, t, bottom_sample=None))
@@ -491,3 +507,37 @@ def test_replay_path_agrees_with_the_processor(rel, expected):
 
     assert mission.counter_offset == expected
     assert mission.ping_count + mission.dropped_no_pose == len(keys)
+
+
+# ---------------------------------------------------------------------------
+# _OdomBuffer nearest-stamp tolerance (the "pings pile on one point" bug)
+# ---------------------------------------------------------------------------
+def test_odom_buffer_serves_a_fresh_nearby_sample():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000, x=3.0))
+    odom = buf.nearest(10_400_000_000)
+    assert odom is not None and odom.pose.pose.position.x == 3.0
+
+
+def test_odom_buffer_refuses_a_sample_beyond_the_tolerance():
+    """A pose 2 s from the ping is a clock mismatch or a dying topic —
+    serving it stamped every ping with one stale pose. The lookup must
+    refuse (the sanctioned NC #2 drop) and record the measured skew."""
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000))
+    assert buf.nearest(12_000_000_000) is None
+    assert buf.last_refused_dt_ns == 2_000_000_000
+
+
+def test_odom_buffer_prunes_stale_samples_at_lookup():
+    """push() only prunes on arrival, so a topic that went silent kept
+    serving its last sample forever; nearest() now prunes against the
+    lookup stamp too."""
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000))
+    assert buf.nearest(60_000_000_000) is None       # 50 s later
+    assert not buf.has_data(), "the stale sample survived the lookup"
+    # A fresh sample brings the buffer back to life.
+    buf.push(make_odom(60_000_000_000, x=7.0))
+    odom = buf.nearest(60_100_000_000)
+    assert odom is not None and odom.pose.pose.position.x == 7.0

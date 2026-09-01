@@ -15,8 +15,9 @@ The listener merges the latest values into a ``RobotState`` and emits it
 on every odom message, throttled to ``EMIT_HZ`` — the panels do not need
 20 Hz updates, and this keeps the queued-signal traffic low.
 
-The GUI-side ``CoordinateConverter`` binds its GPS origin from the first
-RobotState that carries both a local pose and a fix (see main_window).
+The GUI-side ``GeoService`` anchors the map by pairing ``gps_fix``
+emissions (from ``_on_navsat``, at GPS rate) with fresh odom positions;
+``compass_heading`` feeds the live heading policy (see main_window).
 mavros_msgs is optional: without it, speed falls back to the odom twist.
 """
 
@@ -36,7 +37,7 @@ from std_msgs.msg import Float64
 from ..config.settings import RosTopics
 from ..core.signals import AppSignals
 from ..models.robot_state import RobotState
-from ..utils.geodesy import quat_to_yaw, yaw_to_compass_deg
+from ..utils.geodesy import navsat_fix_ok, quat_to_yaw, yaw_to_compass_deg
 from ..utils.pose_alignment import GpsPoseSynthesizer
 
 try:  # pragma: no cover - mavros_msgs may be absent on the basestation
@@ -57,6 +58,8 @@ class TelemetryListener:
         self._lock = threading.Lock()
         self._lat: Optional[float] = None
         self._lon: Optional[float] = None
+        self._navsat_accept_logged = False
+        self._navsat_reject_logged = False
         self._compass_deg: Optional[float] = None
         self._speed: Optional[float] = None
         # GPS dead-reckoning fallback (sea-trial fix): if /blueboat/odom
@@ -89,11 +92,32 @@ class TelemetryListener:
 
     # ---- callbacks (ROS thread) -----------------------------------------------
     def _on_navsat(self, msg: NavSatFix) -> None:
-        if (msg.status.status < 0 or math.isnan(msg.latitude)
-                or math.isnan(msg.longitude)):
+        # Gate is the pure utils/geodesy.navsat_fix_ok: STATUS_UNKNOWN (-2,
+        # the message default — what the MCS bridge's simulated GPS sends)
+        # is a valid fix; only an explicit NO_FIX, non-finite coordinates
+        # or the (0, 0) sentinel are dropped. The first fix of each kind is
+        # logged so a filtered-out GPS feed is visible in the console
+        # instead of looking like "no GPS at all".
+        ok, reason = navsat_fix_ok(int(msg.status.status),
+                                   float(msg.latitude), float(msg.longitude))
+        if not ok:
+            if not self._navsat_reject_logged:
+                self._navsat_reject_logged = True
+                self._signals.log_line.emit(
+                    "app", f"GPS: NavSatFix rejected ({reason}) — fixes are "
+                           "arriving but do not pass the acceptance gate.")
             return
+        if not self._navsat_accept_logged:
+            self._navsat_accept_logged = True
+            self._signals.log_line.emit(
+                "app", f"GPS: first fix accepted at {msg.latitude:.6f}, "
+                       f"{msg.longitude:.6f} (status {msg.status.status}).")
         with self._lock:
             self._lat, self._lon = float(msg.latitude), float(msg.longitude)
+        # GeoService pairing stream: GPS rate, wall-clocked (sim time or
+        # replayed stamps must not break the odom-freshness pairing).
+        self._signals.gps_fix.emit(time.monotonic(), float(msg.latitude),
+                                   float(msg.longitude))
         if self._gps_fallback:
             # Passive tracking: keeps the dead-reckoning reference + last
             # position current so the zero-frozen-odom check in _on_odom
@@ -137,6 +161,8 @@ class TelemetryListener:
             return
         with self._lock:
             self._compass_deg = float(msg.data) % 360.0
+        self._signals.compass_heading.emit(time.monotonic(),
+                                           float(msg.data) % 360.0)
 
     def _on_vfr_hud(self, msg: "VfrHud") -> None:
         with self._lock:

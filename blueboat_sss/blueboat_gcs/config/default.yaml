@@ -12,7 +12,7 @@ topics:
   svlog_enable: /sss_processor/log/enable
   # ---- placeholders: set these once the other repositories are connected ----
   detections: /sss_ai/detections
-  pinger: /blueboat/pinger_coordinates  # Float32MultiArray [x_world, y_world]
+  pinger: /blueboat/pinger_coordinates  # Float32MultiArray: [x,y,z] body frame, or [x,y] world (fixed_pinger)
   planned_path: /set_path            # nav_msgs/Path from path_publisher.py
   seabed_analysis: /sss_ai/seabed_analysis  # std_msgs/String JSON
 
@@ -32,6 +32,10 @@ mosaic:
   render_hz: 4.0
   densify: true          # SonarView-grade rasterization (rasterizer.py)
   bilinear_splat: true   # anti-aliased accumulation; false = legacy scatter
+  waterfall_max_rows: 100000  # live waterfall memory cap [pings]; the buffer
+                              # grows with the mission up to this, then the
+                              # oldest rows are dropped (replay reserves the
+                              # whole log regardless)
 
 sonar_stream:              # live ProcessedSSSPing reception
   queue_depth: 200         # BEST_EFFORT cannot retransmit -> buffer instead
@@ -44,7 +48,10 @@ depth:                     # slant-range correction source
 alignment:                 # sea-trial pose alignment (see settings.py)
   pose_source: auto        # auto | embedded | gcs
   gps_fallback: true       # dead-reckon pose from GPS+compass if odom is dead
-  pinger_frame: robot      # robot (USBL-native, vehicle-relative) | world
+  heading_source: compass  # compass (true-north, live map fix) | embedded
+  compass_stale_s: 2.0     # fall back to odom yaw after this silence
+  pinger_frame: auto       # auto (from wire shape) | robot | world
+  pinger_stale_after_s: 10.0  # hide the marker after this without a fix
 
 seabed:                    # AI seabed imaging (waterfall domain)
   rows: 256                # pings per image
@@ -56,7 +63,23 @@ interpolation:
   min_neighbors: 3
 
 map:
-  frame_yaw_offset_deg: 0.0
   use_satellite: true
+  require_gps_anchor: true # nothing drawn until the odom<->GPS anchor is valid
+
+geo:                       # odom<->GPS anchoring (ported from BlueBoat-MCS)
+  fit_window_s: 180.0
+  min_pairs: 5
+  refit_period_s: 5.0
+  max_residual_m: 6.0
+
+recording:                 # recording sessions (core/recording_session.py)
+  adopt_delay_s: 1.5       # Record OFF -> .svlog adoption delay (log_enable
+                           # is async; adopting instantly races the writer)
+
+acquisition:               # runtime sonar range control (right panel slider)
+  range_min_m: 5.0
+  range_max_m: 50.0
+  settle_delay_s: 0.5      # ping-off settle before setting range_length_mm
+  param_node: side_scan_sonar
 
 data_root: ../../../../data/SSS_data

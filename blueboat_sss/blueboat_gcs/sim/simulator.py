@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from typing import Optional
 
 import numpy as np
@@ -60,7 +61,7 @@ class Simulator(QObject):
         self._telemetry_timer.setInterval(int(1000.0 / _TELEMETRY_HZ))
         self._telemetry_timer.timeout.connect(self._telemetry_tick)
 
-    def start(self) -> None:
+    def start(self) -> bool:
         """Startup: 'pipeline up' — telemetry flows, sonar not firing."""
         if not self._telemetry_timer.isActive():
             self._telemetry_timer.start()
@@ -68,6 +69,7 @@ class Simulator(QObject):
         self._signals.status_message.emit(
             "Simulator pipeline up — press START for pings.")
         self._emit_planned_path()
+        return True
 
     @property
     def running(self) -> bool:
@@ -81,10 +83,22 @@ class Simulator(QObject):
     def disable_pinging(self) -> None:
         self._timer.stop()
 
-    def set_recording(self, on: bool) -> None:
+    def set_recording(self, on: bool) -> bool:
         """Interface parity with PipelineLauncher (no-op in simulation)."""
         self._signals.log_line.emit(
             "processor", f"[sim] log_enable <- {str(on).lower()}")
+        return True
+
+    def reset_stream_health(self) -> None:
+        """Interface parity with PipelineLauncher (no-op in simulation)."""
+
+    def set_range(self, range_m: float) -> bool:
+        """Interface parity with PipelineLauncher: the simulator's swath
+        is fixed, so the request is refused gracefully."""
+        self._signals.status_message.emit(
+            "Simulator: the sonar range is fixed — range changes apply "
+            "to the real sonar only.")
+        return False
 
     def _emit_planned_path(self) -> None:
         """Publish the lawnmower plan, like path_publisher.py would."""
@@ -158,13 +172,19 @@ class Simulator(QObject):
             t=self._t, x=x, y=y, yaw=yaw, lat=lat, lon=lon,
             heading_deg=yaw_to_compass_deg(yaw),
             speed_mps=self._cfg.speed_mps))
+        # Same auxiliary streams the real listeners emit, so the GPS
+        # anchor and the compass heading policy are exercised on every
+        # bench run (the anchor converges with t ≈ 0 within ~1 s).
+        now = time.monotonic()
+        self._signals.gps_fix.emit(now, lat, lon)
+        self._signals.compass_heading.emit(now, yaw_to_compass_deg(yaw))
         self._maybe_emit_detection(x, y)
         if int(self._t * _TELEMETRY_HZ) % int(2 * _TELEMETRY_HZ) == 0:
             self._signals.pinger_fix.emit(PingerFix(
                 t=self._t,
                 x=45.0 + 2.0 * math.sin(self._t * 0.05),
                 y=25.0 + 2.0 * math.cos(self._t * 0.04),
-                accuracy_m=1.5))
+                accuracy_m=1.5, frame="world"))
 
     def _tick(self) -> None:
         x, y, yaw = self._pose()

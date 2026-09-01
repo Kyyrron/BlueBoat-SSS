@@ -47,12 +47,17 @@ class MosaicService(QObject):
         super().__init__()
         self._config = config
         # Resolution is adaptive: `_cell_size` starts at the configured
-        # value and is refined from the first ping's actual across-track
-        # sample spacing when mosaic.auto_cell_size is set (see
-        # _auto_tune_cell_size). A fixed 25 cm grid was throwing away
+        # value and follows the data's actual across-track sample
+        # spacing when mosaic.auto_cell_size is set (see
+        # _maybe_autotune). A fixed 25 cm grid was throwing away
         # most of the sensor's resolution on short-range logs.
         self._cell_size = float(config.mosaic.cell_size_m)
-        self._cell_tuned = not config.mosaic.auto_cell_size
+        self._auto_mode = bool(config.mosaic.auto_cell_size)
+        self._cell_tuned = not self._auto_mode
+        # Auto mode re-checks the data-supported GSD periodically (a
+        # range change mid-mission changes the sample spacing); the
+        # first ping is checked immediately.
+        self._autotune_countdown = 0
         self._grid = self._new_grid()
         self._rasterizer = PingRasterizer(self._cell_size)
         self._renderer = MosaicRenderer(
@@ -75,7 +80,10 @@ class MosaicService(QObject):
             initial_half_extent_m=self._config.mosaic.initial_half_extent_m)
 
     # ---- resolution -----------------------------------------------------------
-    def _auto_tune_cell_size(self, ping: SonarPing) -> None:
+    #: Re-check the data-supported GSD every this many pings in auto mode.
+    AUTOTUNE_EVERY_PINGS = 20
+
+    def _derive_cell_size(self, ping: SonarPing) -> Optional[float]:
         """Derive the ground-sample distance from the data itself.
 
         The natural limit is the across-track sample spacing,
@@ -88,7 +96,7 @@ class MosaicService(QObject):
         y = np.abs(ping.y_local)
         y = np.sort(y[np.isfinite(y)])
         if y.size < 8:
-            return
+            return None
         # Ground-range spacing is not uniform: near nadir it stretches
         # (dg/di = slant/ground * ds/di), and it tightens to the slant
         # sample spacing at long range, where most of the swath area
@@ -97,28 +105,67 @@ class MosaicService(QObject):
         d = np.diff(y[y.size // 2:])
         d = d[d > 0]
         if d.size == 0:
-            return
+            return None
         spacing = float(np.median(d))
         if spacing <= 0.0:
-            return
-        cell = min(max(spacing, self._config.mosaic.min_cell_size_m),
+            return None
+        return min(max(spacing, self._config.mosaic.min_cell_size_m),
                    self._config.mosaic.max_cell_size_m)
-        self._cell_tuned = True
-        if abs(cell - self._cell_size) / max(self._cell_size, 1e-6) < 0.15:
-            return                                  # close enough, no rebuild
-        self.set_cell_size(cell)
+
+    def _maybe_autotune(self, ping: SonarPing) -> None:
+        """Keep the grid at the best cell size the data supports.
+
+        First successful derivation sets the working resolution (either
+        way); afterwards only *refinements* >15 % are applied — a
+        coarser acquisition mid-mission never degrades what is already
+        on screen, its data simply lands blockier in the finer grid.
+        Any change preserves accumulated data (see set_cell_size).
+        """
+        self._autotune_countdown -= 1
+        if self._autotune_countdown > 0:
+            return
+        self._autotune_countdown = self.AUTOTUNE_EVERY_PINGS
+        cell = self._derive_cell_size(ping)
+        if cell is None:
+            return
+        if not self._cell_tuned:
+            self._cell_tuned = True
+            if abs(cell - self._cell_size) / max(self._cell_size,
+                                                 1e-6) >= 0.15:
+                self.set_cell_size(cell)
+            return
+        if cell < self._cell_size * 0.85:
+            self.set_cell_size(cell)
+
+    def enable_auto_resolution(self) -> None:
+        """Auto mode: re-derive the cell size from the next ping."""
+        self._auto_mode = True
+        self._cell_tuned = False
+        self._autotune_countdown = 0
+
+    def set_fixed_cell_size(self, cell_m: float) -> None:
+        """Manual override: fix the GSD and stop auto-tuning."""
+        self._auto_mode = False
+        self.set_cell_size(cell_m)
 
     def set_cell_size(self, cell_m: float) -> None:
-        """Change mosaic resolution (rebuilds the empty grid)."""
+        """Change mosaic resolution, preserving accumulated data.
+
+        The old grid is resampled into the new one (see
+        MosaicGrid.resample_from): old data keeps its native resolution,
+        new pings accumulate at the new cell size. Nothing is cleared.
+        """
         cell_m = min(max(float(cell_m), self._config.mosaic.min_cell_size_m),
                      self._config.mosaic.max_cell_size_m)
         if abs(cell_m - self._cell_size) < 1e-9:
             return
         self._cell_size = cell_m
+        old_grid = self._grid
         self._grid = self._new_grid()
+        self._grid.resample_from(old_grid)
+        # A fresh rasterizer holds no previous pose: no along-track
+        # interpolation is drawn across the resolution change.
         self._rasterizer = PingRasterizer(cell_m)
-        self._dirty = True
-        self.cleared.emit()
         self.resolution_changed.emit(cell_m)
 
     @property
@@ -127,8 +174,8 @@ class MosaicService(QObject):
 
     # ---- ingestion ------------------------------------------------------------
     def on_sonar_ping(self, ping: SonarPing) -> None:
-        if not self._cell_tuned:
-            self._auto_tune_cell_size(ping)
+        if self._auto_mode:
+            self._maybe_autotune(ping)
         if self._config.mosaic.densify:
             xw, yw, v, rng = self._rasterizer.rasterize(ping)
         else:                                   # legacy point-scatter path

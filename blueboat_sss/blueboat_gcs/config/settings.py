@@ -82,10 +82,17 @@ class MosaicConfig:
     initial_half_extent_m: float = 30.0
     render_hz: float = 4.0             # GUI raster refresh rate
     contrast_percentiles: List[float] = field(default_factory=lambda: [2.0, 98.0])
-    # Waterfall view ring buffer: number of most recent pings kept and the
-    # across-track resampling width (columns spanning the full swath).
+    # DEPRECATED — the waterfall is no longer a fixed ring; kept so old
+    # YAML files load. Sizing now comes from waterfall_max_rows below.
     waterfall_rows: int = 1500
+    # Waterfall buffer: across-track resampling width (columns spanning
+    # the full swath) and the live memory cap in rows. The buffer grows
+    # with the mission (every ping stays scrollable); past the cap the
+    # oldest rows are dropped. 100k rows x 800 columns ~ 340 MB
+    # (float32 data + float64 metadata). Replay raises the cap to the
+    # log's own ping count so a whole file is always scrollable.
     waterfall_columns: int = 800
+    waterfall_max_rows: int = 100_000
     # Professional-quality rasterization (see mapping/rasterizer.py):
     # across/along-track ping densification + bilinear splatting. Set
     # both to false to recover the legacy point-scatter mosaic (A/B).
@@ -157,14 +164,33 @@ class AlignmentConfig:
       * "gcs"      — always re-stamp from GCS telemetry.
     gps_fallback: synthesize RobotState from NavSatFix + compass when
     /blueboat/odom is silent or zero-frozen (GPS dead reckoning).
-    pinger_frame: "robot" (USBL-native vehicle-relative [x fwd, y port],
-    rotated through the robot pose nearest the fix) or "world"."""
+
+    heading_source: yaw used for *live* ping/marker orientation:
+      * "compass"  — /mavros/global_position/compass_hdg (converted once
+        at ingestion), falling back to odom yaw when the compass has
+        been silent for compass_stale_s. The compass is the true-north
+        reference and is what fixed the field's misaligned live mosaic;
+      * "embedded" — the ping's own odom-quaternion yaw (legacy).
+    Replay from .svlog is unaffected (it derives yaw from mavlink
+    ATTITUDE and never passes through the live alignment path).
+
+    pinger_frame:
+      * "auto"  — trust the wire shape: a 3-vector is the USBL-native
+        vehicle-relative [x fwd, y port] (rotated through the robot
+        pose nearest the fix), a 2-vector is the corrected world
+        position (the producer's fixed_pinger path);
+      * "robot" / "world" — force one interpretation (legacy setups).
+    pinger_stale_after_s: hide the pinger marker when no fix arrived
+    for this long (0 disables)."""
 
     pose_source: str = "auto"          # auto | embedded | gcs
     frozen_epsilon_m: float = 0.05
     frozen_after_pings: int = 20
     gps_fallback: bool = True
-    pinger_frame: str = "robot"        # robot | world
+    heading_source: str = "compass"    # compass | embedded
+    compass_stale_s: float = 2.0
+    pinger_frame: str = "auto"         # auto | robot | world
+    pinger_stale_after_s: float = 10.0
 
 
 @dataclass
@@ -188,11 +214,32 @@ class InterpolationConfig:
 
 
 @dataclass
+class GeoConfig:
+    """odom <-> GPS anchoring (mapping/geo.py, ported from BlueBoat-MCS).
+
+    The map scene is local east/north metres about the first accepted
+    GPS fix; the odom frame is reconciled to it by a translation-only
+    fit estimated online (median of EN − world offsets over
+    ``fit_window_s``). A translation is observable while stationary, so
+    the anchor converges within ~1 s of fixes with no motion."""
+
+    fit_window_s: float = 180.0
+    min_pairs: int = 5
+    refit_period_s: float = 5.0
+    max_residual_m: float = 6.0
+
+
+@dataclass
 class MapConfig:
-    # Rotation between the local odom frame and ENU. mavros publishes local
-    # position in ENU, so 0.0 is the correct default; override if the odom
-    # frame is heading-aligned at boot.
+    # DEPRECATED — no longer applied. The odom frame is local ENU with
+    # absolute yaw (robot-side guarantee); a rotation here was only ever
+    # a workaround for the old hybrid frame. Kept so old YAMLs load.
     frame_yaw_offset_deg: float = 0.0
+    # Gate the whole map on the GPS anchor: nothing is drawn and clicks
+    # are refused until the odom<->GPS fit is valid. Set false to draw
+    # immediately with an identity anchor (bench runs with no GPS
+    # source; tiles stay off because there is nothing to georeference).
+    require_gps_anchor: bool = True
     # Background tile sources ({z}/{x}/{y} slippy scheme).
     osm_url: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
     satellite_url: str = ("https://server.arcgisonline.com/ArcGIS/rest/services/"
@@ -200,6 +247,39 @@ class MapConfig:
     use_satellite: bool = True
     tile_cache_dir: str = "~/.cache/blueboat_gcs/tiles"
     max_concurrent_tile_requests: int = 6
+
+
+@dataclass
+class AcquisitionConfig:
+    """Runtime sonar acquisition control (the range slider).
+
+    ``sss_node`` re-reads its parameters only on the ping/enable RISING
+    edge (its worker short-circuits an enable while already pinging), so
+    a live range change is the documented three-step dance the GCS now
+    performs itself: publish enable=false, wait ``settle_delay_s``, set
+    ``range_length_mm`` via the node's ``set_parameters`` service, and
+    re-enable on the result (always — acquisition is never left off).
+    """
+
+    range_min_m: float = 5.0
+    range_max_m: float = 50.0
+    settle_delay_s: float = 0.5
+    param_node: str = "side_scan_sonar"
+
+
+@dataclass
+class RecordingConfig:
+    """Recording sessions (core/recording_session.py).
+
+    adopt_delay_s: how long after Record OFF the .svlog adoption sweep
+    runs. The log_enable=False message travels asynchronously; adopting
+    the instant the session ends can move the file while the processor
+    still holds its old absolute path open, whose next append then
+    recreates a headerless stub in data_root. STOP and app-close adopt
+    synchronously instead (pinging is already off there, so the
+    processor writes nothing more)."""
+
+    adopt_delay_s: float = 1.5
 
 
 @dataclass
@@ -223,6 +303,9 @@ class AppConfig:
     depth: DepthConfig = field(default_factory=DepthConfig)
     sonar_stream: SonarStreamConfig = field(default_factory=SonarStreamConfig)
     map: MapConfig = field(default_factory=MapConfig)
+    geo: GeoConfig = field(default_factory=GeoConfig)
+    recording: RecordingConfig = field(default_factory=RecordingConfig)
+    acquisition: AcquisitionConfig = field(default_factory=AcquisitionConfig)
     sim: SimConfig = field(default_factory=SimConfig)
     data_root: str = "../../../../data/SSS_data"   # same root as the existing pipeline
 

@@ -64,6 +64,22 @@ from ..models.sonar import SonarPing
 SCHEMA_VERSION = 1
 
 
+def waterfall_pixel_to_world(x, y, yaw, r, col, width: int):
+    """Waterfall pixel -> world position (the documented formula).
+
+    ``y_local(i, j) = r · (1 − 2 j / (W − 1))``, then rotate/translate by
+    the row pose: ``wx = x − sin(yaw)·y_local``, ``wy = y + cos(yaw)·y_local``.
+    Column 0 is +range (port), the last column −range (starboard).
+
+    Accepts scalars (a waterfall click) or broadcasting numpy arrays
+    (the per-pixel world grids of a whole seabed image). This is the
+    single definition; the waterfall service's detection overlay applies
+    its exact inverse.
+    """
+    y_local = r * (1.0 - 2.0 * col / (width - 1))
+    return x - np.sin(yaw) * y_local, y + np.cos(yaw) * y_local
+
+
 # ---------------------------------------------------------------------------
 # Product
 # ---------------------------------------------------------------------------
@@ -327,9 +343,9 @@ class SeabedImager(QObject):
         speed = np.array([m[6] for m in meta], np.float32)
         # Per-pixel world grids (vectorized over the whole window).
         j = np.arange(W, dtype=np.float64)
-        y_local = rng[:, None] * (1.0 - 2.0 * j[None, :] / (W - 1))
-        wx = pose[:, 0:1] - np.sin(pose[:, 2:3]) * y_local
-        wy = pose[:, 1:2] + np.cos(pose[:, 2:3]) * y_local
+        wx, wy = waterfall_pixel_to_world(
+            pose[:, 0:1], pose[:, 1:2], pose[:, 2:3],
+            rng[:, None], j[None, :], W)
         return SeabedImage(
             image_id=image_id, intensity_db=arr,
             world_x=wx.astype(np.float32), world_y=wy.astype(np.float32),

@@ -46,7 +46,7 @@ from typing import List, Optional
 
 from PySide6.QtCore import QObject, QTimer
 
-from ..config.settings import PipelineConfig
+from ..config.settings import AcquisitionConfig, PipelineConfig
 from ..core.signals import AppSignals
 from .ros_manager import RosManager
 
@@ -63,15 +63,19 @@ class PipelineLauncher(QObject):
     """Owns the `ros2 launch` subprocess for the SSS processing pipeline."""
 
     def __init__(self, config: PipelineConfig, ros: RosManager,
-                 signals: AppSignals) -> None:
+                 signals: AppSignals,
+                 acquisition: Optional[AcquisitionConfig] = None) -> None:
         super().__init__()
         self._config = config
+        self._acq_config = acquisition or AcquisitionConfig()
         self._ros = ros
         self._signals = signals
         self._proc: Optional[subprocess.Popen] = None
         self._state = PipelineState.IDLE
         self._sigterm_at: Optional[float] = None
         self._sigkill_at: Optional[float] = None
+        self._range_pending = False
+        signals.sonar_params_result.connect(self._on_params_result)
 
         self._poll = QTimer(self)
         self._poll.setInterval(300)
@@ -90,13 +94,21 @@ class PipelineLauncher(QObject):
     def running(self) -> bool:
         return self._state is PipelineState.RUNNING
 
-    def start(self) -> None:
+    def start(self) -> bool:
+        """Launch the pipeline; False when the request was refused.
+
+        A refusal (still STOPPING, or the subprocess failed to spawn)
+        must not be silent to the caller: the START handler used to set
+        the viz gate anyway, leaving the toolbar stuck with START greyed
+        out and Record disabled until an app restart.
+        """
         if self._state in (PipelineState.STARTING, PipelineState.RUNNING):
-            return
+            return True
         if self._state is PipelineState.STOPPING:
             self._signals.status_message.emit(
-                "Pipeline is still stopping — wait for 'stopped'.")
-            return
+                "Pipeline is still stopping — wait for 'stopped', "
+                "then press START again.")
+            return False
         # Never start on top of leftovers from an earlier unclean stop.
         self._sweep_leftovers(announce=False)
         self._set_state(PipelineState.STARTING)
@@ -115,12 +127,13 @@ class PipelineLauncher(QObject):
             self._signals.status_message.emit(
                 f"Failed to launch pipeline ({' '.join(cmd)}): {exc}")
             self._set_state(PipelineState.IDLE)
-            return
+            return False
         threading.Thread(target=self._pump_output, args=(self._proc,),
                          daemon=True).start()
         self._poll.start()
         QTimer.singleShot(int(self._config.start_delay_s * 1000),
                           self._enable_acquisition)
+        return True
 
     def _pump_output(self, proc: subprocess.Popen) -> None:
         """Forward the launch tree's stdout/stderr to the console — this
@@ -153,14 +166,67 @@ class PipelineLauncher(QObject):
         if self._config.publish_ping_enable:
             self._ros.publish_ping_enable(False)
 
-    def set_recording(self, on: bool) -> None:
+    def reset_stream_health(self) -> None:
+        """START pressed: the sonar pair may have power-cycled, so the
+        stream-health expectations are re-established."""
+        self._ros.reset_stream_health()
+
+    # ---- runtime range change --------------------------------------------------
+    def set_range(self, range_m: float) -> bool:
+        """Change the sonar range while the pipeline runs.
+
+        sss_node applies parameters only on the ping/enable RISING edge
+        (its worker is idempotent while pinging), so the documented dance
+        is performed here: enable=false → settle → set range_length_mm →
+        enable=true on the service result. Pinging is ALWAYS resumed,
+        success or not — a failed parameter change must never leave
+        acquisition silently off."""
+        if not self.running:
+            self._signals.status_message.emit(
+                "Range change refused: pipeline is not running.")
+            return False
+        if self._range_pending:
+            self._signals.status_message.emit(
+                "Range change already in progress.")
+            return False
+        self._range_pending = True
+        self.disable_pinging()
+        QTimer.singleShot(int(self._acq_config.settle_delay_s * 1000),
+                          lambda: self._send_range(range_m))
+        return True
+
+    def _send_range(self, range_m: float) -> None:
+        if not self._range_pending:
+            return
+        if not self._ros.set_sonar_range(range_m):
+            # The request never left (result signal already emitted with
+            # the reason) — _on_params_result resumes pinging.
+            return
+
+    def _on_params_result(self, ok: bool, detail: str) -> None:
+        if not self._range_pending:
+            return
+        self._range_pending = False
+        self.enable_pinging()          # resume unconditionally
+        self._signals.status_message.emit(
+            f"Sonar range applied ({detail}) — pinging resumed." if ok
+            else f"Sonar range change FAILED: {detail} — pinging resumed "
+                 "with the previous range.")
+
+    def set_recording(self, on: bool) -> bool:
         """Record ON/OFF: publish log_enable on the processor's topic
-        (equivalent to `ros2 topic pub --once ... std_msgs/msg/Bool`)."""
+        (equivalent to `ros2 topic pub --once ... std_msgs/msg/Bool`).
+
+        Returns False when Record ON was refused because the pipeline is
+        not running — the caller must NOT open a recording session then,
+        or it produces a session folder with no .svlog ever adopted."""
         if not self.running and on:
             self._signals.status_message.emit(
-                "Recording: pipeline is not running.")
-            return
+                "Recording refused: pipeline is not running — "
+                "press START first.")
+            return False
         self._ros.publish_svlog_enable(on)
+        return True
 
     def stop(self) -> None:
         # Stop firing + close any .svlog immediately, in every state.

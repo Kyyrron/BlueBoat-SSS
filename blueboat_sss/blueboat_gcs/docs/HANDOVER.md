@@ -28,6 +28,26 @@ opencv-python` on the basestation.
 Published control topics: `std_msgs/Bool` on `/side_scan_sonar/ping/enable`
 (START → true, STOP → false) and `/sss_processor/log/enable`.
 
+**NavSatFix acceptance and MCS-simulated missions.** The listener gates fixes
+with the pure `utils/geodesy.navsat_fix_ok`: only an explicit
+`STATUS_NO_FIX` (-1), non-finite coordinates or the `(0, 0)` no-fix sentinel
+are rejected. `STATUS_UNKNOWN` (-2) is **accepted** — since ROS 2 Iron it is
+the message *default*, and it is exactly what the MCS bridge's simulated GPS
+sends (it fills only lat/lon). This matters because in a Gazebo run of a
+GPS-anchored mission launched from BlueBoat-MCS, **MCS is the only GPS
+publisher in the graph** (there is no MAVROS): its bridge node synthesises
+NavSatFix on `/mavros/global_position/global` (BEST_EFFORT, ~5 Hz) from the
+sim odom, but only while MCS runs and only for a mission whose trajectory
+file carries a Pattern-Designer `geo_anchor`. With that feed the GCS anchors
+and shows the robot, trajectory and planned path without pressing START (no
+SSS nodes needed). A non-anchored sim mission has no GPS anywhere by design —
+the GCS map then stays gated ("Waiting for GPS fix"); `map.require_gps_anchor:
+false` is the explicit identity-frame bypass, mirroring MCS's own
+"GPS n/a (simulation)" mode. The console logs the first accepted and first
+rejected fix, and `GeoService` logs when fixes arrive but cannot pair with a
+fresh odom position, so a filtered or unpaired GPS feed is diagnosable instead
+of looking like "no GPS at all".
+
 **Recording sessions (one experiment = one folder).** The toolbar's
 "Start recording" button (enabled only while the pipeline is running) opens a
 recording session: it publishes `true` once on the processor's log/enable topic
@@ -53,10 +73,25 @@ recording session: it publishes `true` once on the processor's log/enable topic
 Processing scripts can treat any `sessions/*/` directory as a complete, closed
 experiment. Note on the `.svlog`: it is written by `sss_processor_node` wherever that
 node decides; after the session ends, every `*.svlog` under `data_root` whose mtime
-falls inside the session window is *moved* to the session root. If your processor writes
-elsewhere, extend the sweep in `core/recording_session.py::_adopt_svlogs`. If no
-recording session was active, STOP and application close export **nothing** — data
-only leaves the application through recording sessions.
+falls inside the session window is *moved* to the session root. The move is **deferred
+by `recording.adopt_delay_s`** (default 1.5 s) after Record OFF, because the
+`log_enable=False` message is asynchronous and moving the file while the processor
+still holds it open recreates a headerless stub; STOP and app-close adopt
+synchronously (pinging is already off there). A session that recorded pings but
+adopted nothing raises a **visible warning** instead of silently writing
+`adopted_svlogs: []`. Anything under `sessions/` **or `merged_sessions/`** is never
+adopted. If your processor writes elsewhere, extend the sweep in
+`core/recording_session.py::_adopt_svlogs`. If no recording session was active,
+STOP and application close export **nothing** — data only leaves the application
+through recording sessions.
+
+**Merged sessions** (`merged_sessions/<name>/`, next to `sessions/`): the replay
+window's "Merge with another svlog…" button combines two recorded logs into one
+new multi-session `.svlog` (sources untouched — NC #6) and regenerates every
+session artifact from it offline with the same writers a live session uses
+(`core/svlog_merge.py` + `core/session_rebuild.py`). The folder has the exact
+layout above and opens in the replay window like any other log; the newer log's
+clocks and poses are shifted so its first ping follows the older log's last.
 
 **Acquisition lifecycle (current workflow).** The processing pipeline is launched
 automatically at application startup; all visualization layers start disabled and no

@@ -31,17 +31,32 @@ from typing import Optional, Tuple
 
 from .geodesy import gps_to_enu
 
-#: |x| and |y| below this count as "at the origin".
+#: Ping poses within this of the frozen reference count as "pinned".
 FROZEN_EPS_M = 0.05
-#: Consecutive frozen pings before the policy engages.
+#: Consecutive pinned pings before the policy engages.
 FROZEN_AFTER_PINGS = 20
-#: The boat must be at least this far from the origin (per GCS telemetry)
-#: for frozen ping poses to be considered pathological.
+#: The boat must have moved at least this far (per GCS telemetry) while
+#: the ping pose sat still for the freeze to count as pathological.
 MOVED_MIN_M = 1.0
+#: Consecutive genuinely-moving pings before an engaged detector lets
+#: go. Hysteresis: the old instant-disengage flapped whenever the pose
+#: froze anywhere but the exact origin.
+RELEASE_AFTER_PINGS = 5
 
 
 class FrozenPoseDetector:
-    """Detects ping poses pathologically frozen at the origin."""
+    """Detects ping poses pathologically pinned at a constant.
+
+    Field history: the first version only recognized a freeze at (0, 0).
+    The processor's tolerance-free nearest-stamp lookup can just as well
+    latch an arbitrary stale sample — the second-session-of-the-day
+    variant of the same bug — which the origin test not only missed but
+    actively *disengaged* on. The generalized rule is: the ping pose has
+    not moved (within ``eps_m``) for ``after`` consecutive pings while
+    the GCS's own telemetry says the boat travelled more than
+    ``moved_min_m`` in the same span. State survives nothing: call
+    :meth:`reset` on every acquisition START.
+    """
 
     def __init__(self, eps_m: float = FROZEN_EPS_M,
                  after: int = FROZEN_AFTER_PINGS,
@@ -49,25 +64,64 @@ class FrozenPoseDetector:
         self._eps = eps_m
         self._after = after
         self._moved_min = moved_min_m
+        self.reset()
+
+    def reset(self) -> None:
+        """Forget everything (new mission / acquisition START)."""
         self._streak = 0
+        self._release = 0
+        self._ref_ping: Optional[Tuple[float, float]] = None
+        self._ref_robot: Optional[Tuple[float, float]] = None
         self.engaged = False
 
     def update(self, ping_x: float, ping_y: float,
                robot_x: Optional[float], robot_y: Optional[float]) -> bool:
         """Feed one ping pose + the current GCS robot pose; returns True
         while re-stamping should be applied."""
-        frozen = abs(ping_x) < self._eps and abs(ping_y) < self._eps
-        moved = (robot_x is not None
-                 and math.hypot(robot_x, robot_y) > self._moved_min)
-        if frozen and moved:
+        if self._ref_ping is None:
+            self._latch(ping_x, ping_y, robot_x, robot_y)
+            return self.engaged
+        pinned = (abs(ping_x - self._ref_ping[0]) < self._eps
+                  and abs(ping_y - self._ref_ping[1]) < self._eps)
+        if not pinned:
+            # The source pose moved. Re-latch so a freeze at a *new*
+            # constant is caught, and only release an engaged detector
+            # after several consecutive moving pings (hysteresis).
+            self._latch(ping_x, ping_y, robot_x, robot_y)
+            self._streak = 0
+            if self.engaged:
+                self._release += 1
+                if self._release >= RELEASE_AFTER_PINGS:
+                    self.engaged = False
+                    self._release = 0
+            return self.engaged
+        self._release = 0
+        if self._ref_robot is None and robot_x is not None:
+            # Telemetry appeared after the candidate started: measure
+            # boat displacement from here on.
+            self._ref_robot = (robot_x, robot_y)
+        moved = (robot_x is not None and self._ref_robot is not None
+                 and math.hypot(robot_x - self._ref_robot[0],
+                                robot_y - self._ref_robot[1])
+                 > self._moved_min)
+        # The classic pathology — pinned at the origin with the boat far
+        # from it — engages on absolute distance too, so it is caught
+        # even when telemetry only appeared once the boat was already
+        # out on the survey line.
+        origin_case = (math.hypot(*self._ref_ping) < self._eps
+                       and robot_x is not None
+                       and math.hypot(robot_x, robot_y) > self._moved_min)
+        if moved or origin_case:
             self._streak += 1
             if self._streak >= self._after:
                 self.engaged = True
-        elif not frozen:
-            # Real poses are flowing again: disengage immediately.
-            self._streak = 0
-            self.engaged = False
         return self.engaged
+
+    def _latch(self, ping_x: float, ping_y: float,
+               robot_x: Optional[float], robot_y: Optional[float]) -> None:
+        self._ref_ping = (ping_x, ping_y)
+        self._ref_robot = (None if robot_x is None
+                           else (robot_x, robot_y))
 
 
 class GpsPoseSynthesizer:
@@ -104,6 +158,43 @@ class GpsPoseSynthesizer:
                 speed = math.hypot(x - self._last[1], y - self._last[2]) / dt
         self._last = (t, x, y)
         return x, y, yaw, speed
+
+
+class HeadingPolicy:
+    """Live heading source: compass first, odom yaw as fallback.
+
+    The MCS rule (``GPS_MAP_ARCHITECTURE.md`` §heading): the compass is
+    the true-north reference and is converted **once**, at ingestion —
+    ``θ = wrap(radians(90 − hdg_deg))`` — never corrected downstream;
+    odom yaw (absolute ENU since the 2026-08-31 robot-side fix) covers a
+    silent compass. This is what fixed the field's misaligned live SSS
+    pings; replay derives yaw from mavlink ATTITUDE and never comes
+    through here.
+
+    Timestamps are wall-clock (``time.monotonic()``) on both update
+    paths so staleness is immune to sim time and replayed stamps.
+    """
+
+    def __init__(self, compass_stale_s: float = 2.0) -> None:
+        self._stale_s = compass_stale_s
+        self._compass: Optional[Tuple[float, float]] = None   # t, θ ENU rad
+        self._odom: Optional[Tuple[float, float]] = None      # t, yaw
+
+    def update_compass(self, t_wall: float, heading_deg: float) -> None:
+        a = math.radians(90.0 - heading_deg)
+        self._compass = (t_wall, math.atan2(math.sin(a), math.cos(a)))
+
+    def update_odom(self, t_wall: float, yaw: float) -> None:
+        self._odom = (t_wall, yaw)
+
+    def heading(self, now: float) -> Optional[float]:
+        """ENU yaw [rad] to draw with, or None when nothing is fresh."""
+        if (self._compass is not None
+                and now - self._compass[0] <= self._stale_s):
+            return self._compass[1]
+        if self._odom is not None:
+            return self._odom[1]
+        return None
 
 
 def robot_to_world(px: float, py: float,

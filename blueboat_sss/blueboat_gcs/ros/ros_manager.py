@@ -18,6 +18,8 @@ from typing import Optional
 from ..config.settings import AppConfig
 from ..core.signals import AppSignals
 
+_PARAM_TIMEOUT_S = 5.0
+
 try:  # pragma: no cover - environment dependent
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
@@ -41,6 +43,10 @@ class RosManager:
         self._ping_pub = None
         self._svlog_pub = None
         self._analysis_pub = None
+        # Set by main.py once the listeners exist; used by
+        # reset_stream_health() at every acquisition START.
+        self.sonar_listener = None
+        self._param_client = None
 
     # ---- lifecycle -----------------------------------------------------------
     @property
@@ -131,3 +137,72 @@ class RosManager:
         never the pixels) on topics.seabed_analysis."""
         if self._analysis_pub is not None:
             self._analysis_pub.publish(String(data=payload_json))
+
+    def reset_stream_health(self) -> None:
+        """New acquisition START: re-establish the per-power-up stream
+        expectations (sonar counter offset etc.)."""
+        if self.sonar_listener is not None:
+            self.sonar_listener.reset_pairing()
+
+    # ---- runtime sonar parameters ---------------------------------------------
+    def set_sonar_range(self, range_m: float) -> bool:
+        """Set ``range_length_mm`` on the sonar node via its
+        ``set_parameters`` service.
+
+        Asynchronous: the outcome arrives on
+        ``AppSignals.sonar_params_result(ok, detail)`` (plain types, so
+        nothing ROS crosses the bus — NC #10). Returns False when the
+        request could not even be sent (no node, service absent), in
+        which case the result signal has already been emitted."""
+        if self._node is None:
+            self._signals.sonar_params_result.emit(
+                False, "ROS is not connected.")
+            return False
+        from rcl_interfaces.msg import (Parameter, ParameterType,
+                                        ParameterValue)
+        from rcl_interfaces.srv import SetParameters
+        if self._param_client is None:
+            self._param_client = self._node.create_client(
+                SetParameters,
+                f"/{self._config.acquisition.param_node}/set_parameters")
+        if not self._param_client.service_is_ready():
+            self._signals.sonar_params_result.emit(
+                False,
+                f"/{self._config.acquisition.param_node}/set_parameters is "
+                "not available — is the sonar node running "
+                "(with_acquisition)?")
+            return False
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name="range_length_mm",
+            value=ParameterValue(type=ParameterType.PARAMETER_INTEGER,
+                                 integer_value=int(round(range_m * 1000))))]
+        future = self._param_client.call_async(req)
+        fired = threading.Event()
+
+        def done(fut) -> None:
+            if fired.is_set():
+                return
+            fired.set()
+            try:
+                res = fut.result()
+                ok = bool(res.results) and all(r.successful
+                                               for r in res.results)
+                detail = "; ".join(r.reason for r in res.results
+                                   if r.reason) or f"range {range_m:.0f} m"
+            except Exception as exc:      # noqa: BLE001 — surfaced, not raised
+                ok, detail = False, str(exc)
+            self._signals.sonar_params_result.emit(ok, detail)
+
+        future.add_done_callback(done)
+
+        def timeout() -> None:
+            if not fired.is_set():
+                fired.set()
+                future.cancel()
+                self._signals.sonar_params_result.emit(
+                    False,
+                    f"set_parameters timed out after {_PARAM_TIMEOUT_S:.0f} s")
+
+        threading.Timer(_PARAM_TIMEOUT_S, timeout).start()
+        return True

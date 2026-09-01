@@ -27,7 +27,7 @@ from typing import Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QFont, QPainter, QPen
-from PySide6.QtWidgets import QGraphicsScene, QGraphicsView
+from PySide6.QtWidgets import QGraphicsScene, QGraphicsView, QLabel
 
 from . import theme
 from .map_layers import s2w, w2s
@@ -74,6 +74,36 @@ class MapView(QGraphicsView):
         self._mode = MapMode.NAVIGATE
         self._press_pos = None  # type: Optional[QPointF]
         self._measure_first: Optional[Tuple[float, float]] = None
+
+        # GPS-anchor gate (see gui/main_window.py): until the anchor is
+        # valid nothing is drawn and clicks are refused; a centred
+        # notice tells the operator why the map is empty.
+        self._interactive = True
+        self._waiting = QLabel(
+            "Waiting for GPS fix — the map anchors to the first fixes",
+            self)
+        self._waiting.setStyleSheet(
+            "QLabel{color:#ffd54f; background:rgba(16,21,27,190);"
+            " border:1px solid #ffd54f; border-radius:4px;"
+            " padding:10px 16px; font-size:13px;}")
+        self._waiting.adjustSize()
+        self._waiting.setVisible(False)
+
+    # ---- GPS-anchor gate --------------------------------------------------------
+    def set_waiting(self, waiting: bool) -> None:
+        """Show/hide the 'Waiting for GPS fix' notice."""
+        self._waiting.setVisible(waiting)
+        if waiting:
+            self._center_waiting()
+
+    def set_interactive(self, interactive: bool) -> None:
+        """While False, click/measure are refused (pan/zoom stay free)."""
+        self._interactive = interactive
+
+    def _center_waiting(self) -> None:
+        self._waiting.adjustSize()
+        self._waiting.move((self.width() - self._waiting.width()) // 2,
+                           (self.height() - self._waiting.height()) // 2)
 
     # ---- public API -----------------------------------------------------------
     @property
@@ -136,6 +166,8 @@ class MapView(QGraphicsView):
         if moved > _CLICK_SLOP_PX:
             self._emit_viewport()  # it was a pan
             return
+        if not self._interactive:
+            return                 # gated: no anchor, no click coordinates
         wx, wy = s2w(self.mapToScene(event.position().toPoint()))
         if self._mode is MapMode.MEASURE:
             self._handle_measure_click(wx, wy)
@@ -149,6 +181,8 @@ class MapView(QGraphicsView):
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
+        if self._waiting.isVisible():
+            self._center_waiting()
         self._emit_viewport()
 
     def _handle_measure_click(self, wx: float, wy: float) -> None:

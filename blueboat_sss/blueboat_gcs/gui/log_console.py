@@ -9,19 +9,28 @@ the dock splitter) expands it.
 Kept deliberately simple: a bounded QPlainTextEdit (fast appends, ring
 of ``MAX_LINES``), per-source colour tags, autoscroll-when-at-bottom
 (same pin philosophy as the waterfall), pause + clear + copy controls.
+Incoming lines are buffered and flushed in one edit block every
+``FLUSH_INTERVAL_MS`` so a log storm costs one repaint per flush, not
+one per line.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
-from typing import Optional
+from typing import Deque, Optional, Tuple
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel,
                                QPlainTextEdit, QPushButton, QVBoxLayout,
                                QWidget)
 
 MAX_LINES = 5000
+# Appends are batched: a /rosout storm (e.g. a node logging at 20 Hz) must
+# not turn into per-message document edits + repaints on the GUI thread.
+FLUSH_INTERVAL_MS = 200
+MAX_PENDING = 2000
 
 _SOURCE_COLORS = {
     "python": "#c7d0d9",       # print()
@@ -67,6 +76,11 @@ class LogConsole(QWidget):
 
         self._paused = False
         self._n = 0
+        self._pending: Deque[Tuple[str, str, str]] = deque()
+        self._dropped = 0
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setInterval(FLUSH_INTERVAL_MS)
+        self._flush_timer.timeout.connect(self._flush)
         pause.toggled.connect(self._set_paused)
         clear.clicked.connect(self._clear)
         copy_all.clicked.connect(
@@ -77,21 +91,46 @@ class LogConsole(QWidget):
     def append_line(self, source: str, text: str) -> None:
         if self._paused:
             return
-        self._n += 1
+        if len(self._pending) >= MAX_PENDING:
+            self._pending.popleft()
+            self._dropped += 1
+        self._pending.append(
+            (datetime.now().strftime("%H:%M:%S"), source, text))
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def _flush(self) -> None:
+        if not self._pending:
+            self._flush_timer.stop()
+            return
+        pending, self._pending = self._pending, deque()
+        dropped, self._dropped = self._dropped, 0
+        self._n += len(pending) + dropped
         self._counter.setText(f"{self._n} lines")
         bar = self._text.verticalScrollBar()
         at_bottom = bar.value() >= bar.maximum() - 4
 
         cursor = self._text.textCursor()
         cursor.movePosition(QTextCursor.End)
-        fmt_src = QTextCharFormat()
-        fmt_src.setForeground(QColor(_SOURCE_COLORS.get(source, "#c7d0d9")))
-        stamp = datetime.now().strftime("%H:%M:%S")
-        cursor.insertText(f"{stamp} [{source:9s}] ", fmt_src)
-        fmt_txt = QTextCharFormat()
-        fmt_txt.setForeground(QColor(
-            _SOURCE_COLORS["error"] if source == "error" else "#c7d0d9"))
-        cursor.insertText(text + "\n", fmt_txt)
+        cursor.beginEditBlock()
+        try:
+            if dropped:
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(_SOURCE_COLORS["error"]))
+                cursor.insertText(
+                    f"… {dropped} lines dropped (console flooded)\n", fmt)
+            for stamp, source, text in pending:
+                fmt_src = QTextCharFormat()
+                fmt_src.setForeground(
+                    QColor(_SOURCE_COLORS.get(source, "#c7d0d9")))
+                cursor.insertText(f"{stamp} [{source:9s}] ", fmt_src)
+                fmt_txt = QTextCharFormat()
+                fmt_txt.setForeground(QColor(
+                    _SOURCE_COLORS["error"] if source == "error"
+                    else "#c7d0d9"))
+                cursor.insertText(text + "\n", fmt_txt)
+        finally:
+            cursor.endEditBlock()
 
         if at_bottom:                          # follow only while pinned
             bar.setValue(bar.maximum())
@@ -99,8 +138,13 @@ class LogConsole(QWidget):
     # ---- controls -----------------------------------------------------------------
     def _set_paused(self, paused: bool) -> None:
         self._paused = paused
+        if paused:
+            self._pending.clear()
+            self._dropped = 0
 
     def _clear(self) -> None:
         self._text.clear()
+        self._pending.clear()
+        self._dropped = 0
         self._n = 0
         self._counter.setText("0 lines")

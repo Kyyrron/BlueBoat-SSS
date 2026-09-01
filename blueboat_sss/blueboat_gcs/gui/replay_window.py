@@ -40,19 +40,22 @@ from PySide6.QtWidgets import (QDockWidget, QHBoxLayout, QLabel, QMainWindow,
                                QToolBar, QWidget)
 
 from ..config.settings import AppConfig
+from ..core.geo_service import GeoService
 from ..core.mosaic_service import MosaicService
-from ..core.seabed_imager import generate_from_pings
+from ..core.seabed_imager import (generate_from_pings,
+                                  waterfall_pixel_to_world)
+from ..utils.geodesy import format_latlon
 from ..core.signals import AppSignals
 from ..core.svlog import SvlogMission, load_svlog
 from ..core.waterfall_service import WaterfallService
-from ..mapping.coordinate_converter import CoordinateConverter
 from ..mapping.tiles import TileFetcher
 from ..models.robot_state import RobotState
 from ..models.sonar import SonarPing
 from . import right_panel as rp
 from .main_window import PANEL_MIN_WIDTH
 from .map_layers import (DetectionLayer, MeasureLayer, MosaicLayer,
-                         TileLayer, TrajectoryLayer)
+                         SelectionLayer, TileLayer, TrajectoryLayer,
+                         WorldRoot)
 from .map_view import MapMode, MapView
 from .range_slider import RangeSlider
 from .right_panel import RightPanel
@@ -87,6 +90,19 @@ class ReplayWindow(QMainWindow):
         self.signals = AppSignals()
         self.mosaic_service = MosaicService(config)
         self.waterfall_service = WaterfallService(config)
+        # The whole file must stay scrollable in the waterfall: raise the
+        # live memory cap to the mission's own size (pings + gap seams).
+        # A pathological multi-hour log is bounded instead of exhausting
+        # RAM (~3.6 KB/row): past the hard cap the waterfall keeps only
+        # the newest rows and "Render range" is the way to inspect the
+        # rest.
+        n_rows = mission.ping_count + len(mission.gap_times) + 16
+        if n_rows > 300_000:
+            self.statusBar().showMessage(
+                f"{mission.ping_count} pings — the waterfall keeps the "
+                "newest 300 000 rows; use Render range for older parts.")
+            n_rows = 300_000
+        self.waterfall_service.reserve(n_rows)
         self.map_view = MapView()
         self.waterfall_view = WaterfallView()
         self._stack = QStackedWidget()
@@ -95,23 +111,30 @@ class ReplayWindow(QMainWindow):
         self.setCentralWidget(self._stack)
         scene = self.map_view.scene()
 
-        self.converter = CoordinateConverter(config.map.frame_yaw_offset_deg)
+        # Replay anchor: the log already records the geographic position
+        # of a known world point, so the fit is fixed (no online
+        # estimation, never gated) — same frame machinery as live.
+        self.geo = GeoService(config.geo, require_anchor=False)
+        if mission.origin is not None:
+            self.geo.set_fixed_fit(mission.origin[0], mission.origin[1],
+                                   mission.origin_xy[0],
+                                   mission.origin_xy[1])
         tile_url = (config.map.satellite_url if config.map.use_satellite
                     else config.map.osm_url)
         self._tile_fetcher = TileFetcher(
             tile_url, Path(config.map.tile_cache_dir).expanduser(),
             config.map.max_concurrent_tile_requests, parent=self)
-        self.tile_layer = TileLayer(scene, self._tile_fetcher, self.converter)
-        self.mosaic_layer = MosaicLayer(scene)
-        self.trajectory_layer = TrajectoryLayer(scene)
-        self.detection_layer = DetectionLayer(scene)
+        self.tile_layer = TileLayer(scene, self._tile_fetcher,
+                                    lambda: self.geo.origin)
+        self.world_root = WorldRoot(scene)
+        root = self.world_root.item
+        self.mosaic_layer = MosaicLayer(scene, root)
+        self.trajectory_layer = TrajectoryLayer(scene, root)
+        self.detection_layer = DetectionLayer(scene, root)
+        self.selection_layer = SelectionLayer(scene, root)
         self.measure_layer = MeasureLayer(scene)
-
-        # GPS origin from the log, if present -> tiles + GPS readouts work.
-        if mission.origin is not None:
-            self.converter.bind_origin(mission.origin[0], mission.origin[1],
-                                       mission.origin_xy[0],
-                                       mission.origin_xy[1])
+        self.world_root.set_translation(*self.geo.translation)
+        self.world_root.set_ready(True)     # replay is never gated
 
         # ---- reused right panel (identical map options to the main window) ---
         self.right_panel = RightPanel()
@@ -128,6 +151,7 @@ class ReplayWindow(QMainWindow):
         self._build_replay_bar()
 
         # ---- replay engine state ----------------------------------------------
+        self._child_windows: list = []      # merged-log windows kept alive
         self._cursor = 0                    # next event index during replay
         self._replay_t = 0.0                # mission time [s]
         self._last_wall: Optional[float] = None
@@ -193,6 +217,15 @@ class ReplayWindow(QMainWindow):
             "Convert this .svlog to a rosbag2 (mcap) folder next to the\n"
             "log, using the team's svlog_to_rosbag converter.\n"
             "Requires a sourced ROS 2 environment.")
+        self._merge_btn = QPushButton("Merge with another svlog…")
+        self._merge_btn.setToolTip(
+            "Pick a second .svlog and build ONE merged log + a full\n"
+            "session folder under data_root/merged_sessions/<name>/\n"
+            "(mosaic, waterfall, seabed images, metadata — regenerated\n"
+            "with the same code a live session uses). The older log goes\n"
+            "first; the newer one's clocks and poses are shifted so its\n"
+            "first ping follows the older one's last. A brand-new file is\n"
+            "written — neither source log is modified (NC #6).")
 
         lay.addWidget(QLabel("Window"))
         lay.addWidget(self._t_lo_lbl)
@@ -206,6 +239,7 @@ class ReplayWindow(QMainWindow):
         lay.addWidget(self._ai_btn)
         lay.addWidget(self._save_btn)
         lay.addWidget(self._rosbag_btn)
+        lay.addWidget(self._merge_btn)
         bar.addWidget(wrap)
         self.addToolBar(Qt.BottomToolBarArea, bar)
 
@@ -217,10 +251,13 @@ class ReplayWindow(QMainWindow):
         self.mosaic_service.raster_updated.connect(
             lambda img, ext, cell: self.mosaic_layer.update(img, ext, cell))
         self.mosaic_service.cleared.connect(self.mosaic_layer.clear)
-        self.waterfall_service.image_updated.connect(
-            self.waterfall_view.on_image)
+        self.waterfall_service.layout_changed.connect(
+            self.waterfall_view.on_layout)
+        self.waterfall_service.tile_updated.connect(
+            self.waterfall_view.on_tile)
         self.waterfall_service.detections_updated.connect(
             self.waterfall_view.on_detections)
+        self.waterfall_view.point_selected.connect(self._on_waterfall_point)
 
         p = self.right_panel
         p.zoom_in_clicked.connect(self.map_view.zoom_in)
@@ -247,6 +284,7 @@ class ReplayWindow(QMainWindow):
         self._ai_btn.clicked.connect(self._run_ai)
         self._save_btn.clicked.connect(self._save_pictures)
         self._rosbag_btn.clicked.connect(self._save_rosbag)
+        self._merge_btn.clicked.connect(self._merge_svlog)
 
     # ------------------------------------------------------- event feeding --
     def _on_ping(self, ping: SonarPing) -> None:
@@ -297,8 +335,35 @@ class ReplayWindow(QMainWindow):
         self.trajectory_layer.clear()
         self.detection_layer.clear()
         self.waterfall_service.clear_detections()
+        self.selection_layer.clear()
+        self.waterfall_view.set_selected(None)
         self.measure_layer.clear()
         self.right_panel.set_measure_active(False)
+
+    # ---- waterfall click -> map point -------------------------------------
+    def _on_waterfall_point(self, row: int, col: int) -> None:
+        """A click in the replay waterfall selects the same physical
+        point on the map, with its GPS coordinates."""
+        meta = self.waterfall_service.row_meta(row)
+        if meta is None:
+            self.statusBar().showMessage(
+                "No position for that waterfall point (session gap row).",
+                6000)
+            return
+        _t, rx, ry, yaw, r = meta
+        wx, wy = waterfall_pixel_to_world(
+            rx, ry, yaw, r, float(col),
+            self._config.mosaic.waterfall_columns)
+        wx, wy = float(wx), float(wy)
+        gps = self.geo.local_to_gps(wx, wy)
+        self.selection_layer.show_at(
+            wx, wy, format_latlon(*gps) if gps else "")
+        self.waterfall_view.set_selected(row, col)
+        self.map_view.center_on_world(*self.geo.world_to_en(wx, wy))
+        gps_txt = f"   |   {gps[0]:.7f}, {gps[1]:.7f}" if gps else ""
+        self.statusBar().showMessage(
+            f"Waterfall point:  x {wx:+.2f} m,  y {wy:+.2f} m{gps_txt}",
+            15000)
 
     def _render_range(self) -> None:
         """Batch mode: rasterize the whole [start, end] selection at once."""
@@ -440,6 +505,97 @@ class ReplayWindow(QMainWindow):
             f"(incl. truncated tail), {n_det} detections — shown on the "
             f"map and in the waterfall view.", 15000)
 
+    # ------------------------------------------------------- svlog merge --
+    def _merge_svlog(self) -> None:
+        """Merge the open log with a second one into a normal session
+        under data_root/merged_sessions/ (see core/svlog_merge.py)."""
+        from PySide6.QtWidgets import QFileDialog, QInputDialog
+        from ..core.session_rebuild import rebuild_session
+        from ..core.svlog_merge import default_merge_name, merge_svlogs
+
+        other, _f = QFileDialog.getOpenFileName(
+            self, "Merge with another svlog",
+            str(Path(self._config.data_root).expanduser()),
+            "SonarView logs (*.svlog);;All files (*)")
+        if not other:
+            return
+        other = Path(other)
+        if other.resolve() == self._mission.path.resolve():
+            QMessageBox.warning(self, "Merge svlogs",
+                                "That is the log already open — pick a "
+                                "different one.")
+            return
+        try:
+            default = default_merge_name(self._mission.path, other)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Merge svlogs",
+                                 f"Could not read {other.name}:\n{exc}")
+            return
+        name, ok = QInputDialog.getText(
+            self, "Merge svlogs",
+            "Merged session name (created under merged_sessions/):",
+            text=default)
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+        session_dir = (Path(self._config.data_root).expanduser()
+                       / "merged_sessions" / name)
+        if session_dir.exists():
+            QMessageBox.warning(
+                self, "Merge svlogs",
+                f"{session_dir} already exists — merged sessions are "
+                "never overwritten; pick another name.")
+            return
+
+        progress = QProgressDialog("Merging svlogs…", None, 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        out_log = session_dir / f"{name}.svlog"
+        try:
+            report = merge_svlogs(
+                self._mission.path, other, out_log,
+                progress=lambda f: progress.setValue(int(30 * f)))
+            progress.setLabelText("Rebuilding session artifacts…")
+            mission = rebuild_session(
+                out_log, session_dir, self._config,
+                progress=lambda f: progress.setValue(30 + int(65 * f)),
+                extra_metadata={
+                    "merged_from": [str(report.older), str(report.newer)],
+                    "merge_time_shift_ms": report.delta_ms,
+                    "merge_pose_offset_en": report.pose_offset_en,
+                    "merge_warnings": report.warnings,
+                })
+        except (OSError, ValueError) as exc:
+            progress.close()
+            QMessageBox.critical(self, "Merge svlogs",
+                                 f"Merge failed:\n{exc}")
+            return
+        progress.setValue(100)
+        progress.close()
+
+        # Validation: the merged file must read back as a normal
+        # multi-session log on the real clock.
+        problems = list(report.warnings)
+        if len(mission.segments) < 2:
+            problems.append("expected at least 2 sessions in the merged "
+                            f"log, found {len(mission.segments)}")
+        if mission.synthetic_clock:
+            problems.append("the merged log fell back to a synthetic clock")
+        note = ("\n\nNotes:\n- " + "\n- ".join(problems)) if problems else ""
+        open_now = QMessageBox.question(
+            self, "Merge svlogs",
+            f"Merged session written to\n{session_dir}\n\n"
+            f"{mission.ping_count} pings, {len(mission.segments)} sessions, "
+            f"{_fmt_t(mission.duration_s)}.\n{report.summary()}{note}\n\n"
+            "Open the merged log now?",
+            QMessageBox.Yes | QMessageBox.No)
+        self.statusBar().showMessage(
+            f"Merged session written to {session_dir}", 15000)
+        if open_now == QMessageBox.Yes:
+            win = ReplayWindow(mission, self._config, parent=self.parent())
+            win.show()
+            self._child_windows.append(win)
+
     # ------------------------------------------------------ rosbag export --
     def _save_rosbag(self) -> None:
         """Convert the loaded .svlog to a rosbag2 folder next to it,
@@ -523,9 +679,9 @@ class ReplayWindow(QMainWindow):
     # ------------------------------------------------------------- helpers --
     def _on_resolution_changed(self, cell_m: float) -> None:
         if cell_m <= 0.0:
-            self.mosaic_service._cell_tuned = False
+            self.mosaic_service.enable_auto_resolution()
         else:
-            self.mosaic_service.set_cell_size(cell_m)
+            self.mosaic_service.set_fixed_cell_size(cell_m)
 
     def _on_depth_mode_changed(self, mode: str, manual_m: float) -> None:
         """Reprocess the loaded log with a new depth-compensation source.
@@ -567,30 +723,34 @@ class ReplayWindow(QMainWindow):
     def _center_robot(self) -> None:
         pos = self.trajectory_layer.current_pos()
         if pos is not None:
-            self.map_view.center_on_world(*pos)
+            self.map_view.center_on_world(*self.geo.world_to_en(*pos))
 
     def _on_measure_toggled(self, on: bool) -> None:
         self.map_view.set_mode(MapMode.MEASURE if on else MapMode.NAVIGATE)
         if not on:
             self.measure_layer.clear()
 
-    def _on_point_clicked(self, x: float, y: float) -> None:
-        gps = self.converter.local_to_gps(x, y)
+    # Clicks arrive in EN scene coordinates; world = EN - t (exact).
+    def _on_point_clicked(self, ex: float, ey: float) -> None:
+        x, y = self.geo.en_to_world(ex, ey)
+        gps = self.geo.local_to_gps(x, y)
         gps_txt = f"   |   {gps[0]:.7f}, {gps[1]:.7f}" if gps else ""
         self.statusBar().showMessage(
             f"Point:  x {x:+.2f} m,  y {y:+.2f} m{gps_txt}", 15000)
 
-    def _on_measure_started(self, x: float, y: float) -> None:
-        self.measure_layer.show_first(x, y)
+    def _on_measure_started(self, ex: float, ey: float) -> None:
+        self.measure_layer.show_first(ex, ey)
         self.right_panel.on_first_point()
+        x, y = self.geo.en_to_world(ex, ey)
         self.right_panel.point_a.set_point(x, y,
-                                           self.converter.local_to_gps(x, y))
+                                           self.geo.local_to_gps(x, y))
         self.right_panel.point_b.clear()
 
-    def _on_measure_done(self, x1, y1, x2, y2, dist) -> None:
-        self.measure_layer.show_measurement((x1, y1), (x2, y2), dist)
+    def _on_measure_done(self, ex1, ey1, ex2, ey2, dist) -> None:
+        self.measure_layer.show_measurement((ex1, ey1), (ex2, ey2), dist)
+        x2, y2 = self.geo.en_to_world(ex2, ey2)
         self.right_panel.point_b.set_point(
-            x2, y2, self.converter.local_to_gps(x2, y2))
+            x2, y2, self.geo.local_to_gps(x2, y2))
         self.right_panel.show_distance(dist)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802

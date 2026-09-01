@@ -35,8 +35,13 @@ class RightPanel(QWidget):
     sss_opacity_changed = Signal(float)    # 0.0 .. 1.0
     resolution_changed = Signal(float)     # mosaic cell size [m], 0 = auto
     depth_mode_changed = Signal(str, float)  # (auto|manual|off, manual_m)
+    range_apply_requested = Signal(float)  # sonar range [m] (live only)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, *,
+                 acquisition_range: Optional[Tuple[float, float]] = None
+                 ) -> None:
+        """``acquisition_range=(min_m, max_m)`` adds the live sonar-range
+        group (main window only; the replay window has no sonar)."""
         super().__init__(parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -95,6 +100,11 @@ class RightPanel(QWidget):
         # ---- display controls (SonarView-like; visualization only) ------------
         root.addWidget(self._build_display_box())
 
+        # ---- live sonar acquisition (range slider) ----------------------------
+        self._acq_box = None
+        if acquisition_range is not None:
+            root.addWidget(self._build_acquisition_box(*acquisition_range))
+
         # ---- distance tool ---------------------------------------------------
         dist = QGroupBox("Distance tool")
         dl = QVBoxLayout(dist)
@@ -119,6 +129,43 @@ class RightPanel(QWidget):
         root.addWidget(dist)
 
         root.addStretch(1)
+
+    # ---- live sonar acquisition -------------------------------------------------
+    def _build_acquisition_box(self, min_m: float, max_m: float) -> QGroupBox:
+        """Sonar range slider + Apply. Enabled only while the pipeline is
+        RUNNING (main_window drives ``set_acquisition_enabled``); Apply
+        triggers the enable-off → set-param → enable-on dance in the
+        launcher, so pinging pauses for ~a second at the change."""
+        box = QGroupBox("Acquisition")
+        form = QFormLayout(box)
+        form.setLabelAlignment(Qt.AlignRight)
+        self._range_slider = QSlider(Qt.Horizontal)
+        self._range_slider.setRange(int(min_m), int(max_m))
+        self._range_slider.setValue(20)                 # the field default
+        self._range_lbl = QLabel("20 m")
+        self._range_slider.valueChanged.connect(
+            lambda v: self._range_lbl.setText(f"{v} m"))
+        form.addRow("Sonar range",
+                    self._wrap(self._range_slider, self._range_lbl))
+        self._range_apply = QPushButton("Apply range")
+        self._range_apply.setToolTip(
+            "Set range_length_mm on the sonar node while it runs.\n"
+            "Pinging pauses briefly (the node reads parameters on the\n"
+            "enable rising edge) and resumes automatically.\n"
+            "Rule of thumb (NC #5): ~4x the deepest expected water,\n"
+            "not the area to cover — an over-long range breaks bottom\n"
+            "detection.")
+        self._range_apply.clicked.connect(
+            lambda: self.range_apply_requested.emit(
+                float(self._range_slider.value())))
+        form.addRow(self._range_apply)
+        box.setEnabled(False)          # until the pipeline reports running
+        self._acq_box = box
+        return box
+
+    def set_acquisition_enabled(self, on: bool) -> None:
+        if self._acq_box is not None:
+            self._acq_box.setEnabled(on)
 
     # ---- display controls -------------------------------------------------------
     def _build_display_box(self) -> QGroupBox:
@@ -150,8 +197,10 @@ class RightPanel(QWidget):
             self._resolution.addItem(f"{cm} cm", cm / 100.0)
         self._resolution.setToolTip(
             "Mosaic ground-sample distance.\n"
-            "Auto uses the sonar's across-track sample spacing.\n"
-            "Changing it rebuilds the mosaic, so previous data is cleared.")
+            "Auto keeps the best cell size the sonar's across-track\n"
+            "sample spacing supports, refining as data allows.\n"
+            "Changing it resamples the existing mosaic — nothing is\n"
+            "cleared; older data keeps its native resolution.")
         self._resolution.currentIndexChanged.connect(
             lambda i: self.resolution_changed.emit(
                 float(self._resolution.itemData(i))))

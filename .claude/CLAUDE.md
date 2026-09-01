@@ -189,9 +189,14 @@ pings of a mission are keyed correctly. What signals a torn row is the gap
 
 **Pose is a hard gate.** `_emit_group` drops the ping outright if the odom buffer
 is empty, and again if the nearest-stamp lookup returns nothing; both increment
-`_dropped_no_odom`. There is no fallback pose on the robot side — the GCS mitigations
-(see Key GCS design decisions) exist because of this. This is the **only** drop on the
-robot side. **VERIFIED.**
+`_dropped_no_odom`. The lookup refuses a sample farther than
+`ODOM_NEAREST_TOLERANCE_S` (1 s) from the profile stamp and prunes stale entries at
+lookup time too — previously a dead or clock-mismatched `/blueboat/odom` left the
+buffer's last sample latched and every ping was stamped with that one stale pose
+(the "pings pile on one point" field bug); now such pings take the sanctioned drop
+with a warning naming the measured skew. There is no fallback pose on the robot
+side — the GCS mitigations (see Key GCS design decisions) exist because of this.
+This is the **only** drop on the robot side. **VERIFIED.**
 
 **Altitude never gates emission.** `FBRTracker.update` returns the best value
 available — locked, else provisional from this ping's own detections, else last known
@@ -221,10 +226,10 @@ rclpy node name `blueboat_gcs`. Subscribes (**VERIFIED**; topic names configurab
 |---|---|---|
 | `/sss_processor/processed` | `ProcessedSSSPing` | `BEST_EFFORT`, depth **200** |
 | `/blueboat/odom` | `nav_msgs/Odometry` | `BEST_EFFORT`, depth 10 |
-| `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | `BEST_EFFORT`, depth 10 |
+| `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | `BEST_EFFORT`, depth 10. Gated by the pure `utils/geodesy.navsat_fix_ok`: **only** an explicit `STATUS_NO_FIX` (-1), non-finite coordinates, or the `(0, 0)` no-fix sentinel are rejected; `STATUS_UNKNOWN` (-2) is **accepted** — it is the ROS 2 Iron+ message *default*, and exactly what the MCS bridge's simulated GPS sends for Gazebo runs of GPS-anchored missions (MCS is the only GPS publisher in a sim graph; it fills lat/lon only). Rejecting all negative statuses silently discarded that whole feed — the "GCS says no GPS while MCS anchors" field bug. First accepted and first rejected fix are logged to the console |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | depth 10 |
 | `/mavros/vfr_hud` | `mavros_msgs/VfrHud` | optional; without `mavros_msgs`, speed comes from the odom twist |
-| `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | the listener reads `data[0:2]` and requires `len(data) >= 2`; the producer publishes `[x, y, z]`. **Vehicle frame** by default (`alignment.pinger_frame: robot`); `config/default.yaml`'s inline comment on this key still says world and is wrong |
+| `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | gated by the pure `utils/pinger.parse_pinger`: **all-zero vectors are dropped** (the producer streams `zeros(3)` at ~20 Hz before any USBL detection — the field "marker rides the boat" bug), NaN/short arrays are dropped, and the frame is taken from the wire shape — `[x, y, z]` = vehicle frame (normal path), `[x, y]` = world frame (`fixed_pinger`). `alignment.pinger_frame: auto` (default) honours that; `robot`/`world` force one reading. The marker hides after `alignment.pinger_stale_after_s` (10 s) without a fix |
 | `/set_path` | `nav_msgs/Path` | from `path_publisher.py` |
 | `/sss_ai/detections` | `vision_msgs/Detection2DArray` | placeholder, not wired to a model |
 | `/rosout` | `rcl_interfaces/Log` | depth 50; the GCS filters out its own node |
@@ -311,12 +316,14 @@ Violating any of these breaks another module, the hardware integration, or the t
 
 10. **No `localStorage`/`sessionStorage`-style browser storage in artifacts**, and no
     ROS types past the signal bus — everything downstream of `ros/` consumes plain
-    dataclasses so the GUI runs without ROS. **VERIFIED**: `ros/` is the only place
-    `rclpy` is imported, and 49 of the 53 swept GCS modules import cleanly with no
-    ROS at all (the four that do not are exactly the `ros/` listeners, which
-    `main.py` imports lazily and only outside `--sim`). The sweep count excludes
-    `tools/`, whose three files are checked by hash instead (NC #7); the package
-    holds 56 `.py` files in total.
+    dataclasses so the GUI runs without ROS (rcl_interfaces for the runtime range
+    change is imported inside `ros/ros_manager.py` only, and its result crosses the
+    bus as `(bool, str)`). **VERIFIED**: `ros/` is the only place `rclpy` is
+    imported, and 54 of the 58 swept GCS modules import cleanly with no ROS at all
+    (the four that do not are exactly the `ros/` listeners, which `main.py` imports
+    lazily and only outside `--sim`). The sweep count excludes `tools/`, whose
+    three files are checked by hash instead (NC #7); the package holds 61 `.py`
+    files in total.
 
 ### Scientific validity (from the thesis plan)
 
@@ -376,7 +383,39 @@ changing it rebuilds the grid and clears accumulated data.
 **Waterfall column scale** uses `SonarPing.slant_range_m` (the *configured* range),
 not `max|y_local|`, which moves with the altitude estimate. Live, the configured range
 is recovered exactly as `hypot(ground_max, water_depth)`; on replay it comes straight
-from `length_mm`. The ring buffer is 1500 rows x 800 columns.
+from `length_mm`.
+
+**The waterfall buffer is growable and tiled, not a ring.** The old 1500-row ring
+silently discarded the head of any longer mission and re-colormapped the whole image
+per render. Rows now live in 512-row tiles (float32 data + per-row `(t, x, y, yaw, r)`
+metadata); a row's index is its chronological ping index forever, renders touch dirty
+tiles only (`layout_changed` + `tile_updated(first_row, QImage)` replaced the old
+whole-image signal), and auto contrast is one **global** histogram window so tiles
+cannot band at their seams. Memory is capped at `mosaic.waterfall_max_rows`
+(default 100 000; oldest whole tile evicted past it, absolute indices preserved);
+the replay window calls `reserve(ping_count)` so an entire file is always
+scrollable. The view keeps one pixmap item per tile — scene coords are absolute
+buffer pixels — with a dynamic zoom floor and a "Fit file" button so the whole
+mission fits the viewport. `waterfall_raw.npz` stays full-fidelity float32; only
+the `waterfall.png` quick-look is decimated above 20 000 rows (stride recorded in
+the npz as `png_row_stride`).
+
+**Waterfall click → map point.** A click (not a drag — 5 px slop, same rule as the
+map) emits `point_selected(row, col)`; both windows resolve it through the row's
+stored pose with `seabed_imager.waterfall_pixel_to_world` (the single definition of
+the documented pixel→world formula; the detection overlay applies its exact
+inverse), mark it with `SelectionLayer` under the WorldRoot, center the map, and
+show world + GPS coordinates (coordinate card in the main window, status bar in
+replay). Gap rows and evicted history refuse with a status message.
+
+**Runtime sonar range.** The right panel's Acquisition group (main window only,
+enabled while the pipeline is RUNNING) changes `range_length_mm` live:
+`PipelineLauncher.set_range` performs the documented dance — ping/enable off,
+`acquisition.settle_delay_s`, `set_parameters` on `/side_scan_sonar`, ping/enable
+on — resuming pinging **unconditionally** on success or failure (result crosses
+the bus as `sonar_params_result(bool, str)`). A successful change inserts a
+waterfall `break_row()`: the column scale adapts per ping, so the seam marks where
+the horizontal scale changed. The simulator refuses gracefully (fixed swath).
 
 **Replay timeline is the log's own clock.** `load_svlog` stamps profiles from their
 `timestamp_ms` and re-bases mavlink onto that clock through a measured constant: the
@@ -409,14 +448,48 @@ flush (`seabed_imager.feed_pings(breaks=…)`, so no 256-row training tile spans
 sessions). Replay skips the gap and reports it; the slider keeps true mission time.
 
 **Pose alignment** (`alignment.pose_source`, default `auto`): if embedded ping poses
-sit frozen at the origin (`frozen_epsilon_m` 0.05 for `frozen_after_pings` 20 pings)
-while GCS telemetry shows motion, pings are re-stamped from `RobotState`. A
-GPS+compass dead-reckoning fallback (`alignment.gps_fallback`) covers a dead or
-zero-frozen `/blueboat/odom`. Both are mitigations for a robot-side defect, not a fix
-for it.
+sit frozen at **any constant** (within `frozen_epsilon_m` 0.05 for
+`frozen_after_pings` 20 pings) while GCS telemetry moved > 1 m, pings are re-stamped
+from `RobotState` — the original origin-only test missed the second-session variant
+where the processor latched an arbitrary stale pose, and actively disengaged on it.
+Release now takes 5 consecutive moving pings (hysteresis), the detector is `reset()`
+on every START along with the sonar listener's counter-offset expectations and the
+seabed imager's buffers, and re-stamping is refused while GCS telemetry is itself
+stale (re-stamping a frozen ping from a frozen `RobotState` recreates the pile-up).
+A GPS+compass dead-reckoning fallback (`alignment.gps_fallback`) covers a dead or
+zero-frozen `/blueboat/odom`. All are mitigations for a robot-side defect, not a fix
+for it — the robot-side half is the odom buffer's nearest-stamp tolerance above.
 
-**Pinger frame** (`alignment.pinger_frame`, default `robot`): USBL fixes are treated
-as vehicle-relative (x forward, y port) and rotated through the nearest robot pose.
+**Pinger gating** (`alignment.pinger_frame`, default `auto`): all-zero vectors are
+rejected (the robot publishes `zeros(3)` before any USBL detection), the frame comes
+from the wire shape (3-vector = body, 2-vector = world; `robot`/`world` force one),
+body fixes rotate through the nearest robot pose using the heading policy, and the
+marker hides after `alignment.pinger_stale_after_s` (10 s) without a fix.
+
+**GPS-anchored map** (ported from BlueBoat-MCS `GPS_MAP_ARCHITECTURE.md`): the map
+scene is local east/north metres about the first accepted GPS fix, north-up, never
+rotated. `mapping/geo.py` (verbatim MCS port) estimates the **translation-only** fit
+`EN = world + t` online (`core/geo_service.py` pairs fixes at GPS rate with a < 0.5 s
+wall-clock odom-freshness guard); every world-anchored layer lives under one
+`WorldRoot` group whose position is the fit, so a refit moves everything in O(1) and
+tiles — pinned to `(lat0, lon0)`, never to `t` — cannot slide. Until the fit is valid
+the map is gated: `WorldRoot` hidden, "Waiting for GPS fix" notice, clicks refused
+(`map.require_gps_anchor: false` bypasses with an identity anchor, no tiles). Replay
+anchors instantly via `GeoService.set_fixed_fit` from the log's recorded origin.
+
+**Heading policy** (`alignment.heading_source`, default `compass`): live ping/marker
+yaw comes from `/mavros/global_position/compass_hdg`, converted **once** at ingestion
+(`θ = wrap(radians(90 − hdg))`, `utils/pose_alignment.HeadingPolicy`), falling back to
+odom yaw after `compass_stale_s` (2 s). This fixed the field's misaligned live SSS
+pings; replay derives yaw from mavlink ATTITUDE and is untouched. `embedded` restores
+the old odom-quaternion behaviour.
+
+**Mosaic resolution is preserved across changes.** `MosaicService.set_cell_size`
+resamples the old grid into the new one (`MosaicGrid.resample_from`) instead of
+wiping: old data keeps its native resolution (SonarView-style non-constant effective
+resolution), the mean plane transfers its weighted sums exactly, and `cleared` is not
+emitted. Auto mode re-derives the data-supported GSD every ~20 pings and applies
+**refinements only** — a coarser acquisition mid-mission never degrades the display.
 
 **Stream health.** `SonarListener` counts three things and reports them in the
 embedded console, so acquisition loss is never mistaken for a display bug:
@@ -431,6 +504,20 @@ SIGINT, then SIGTERM, then SIGKILL ladder on the launch session group, plus an
 unconditional leftover sweep after the launch process exits *and* at application
 start. A `ros2 launch` that is SIGKILLed before forwarding shutdown orphans its
 children; the sweep is the invariant that makes N start/stop cycles safe.
+
+**Recording lifecycle guards** (the "only the first session gets a .svlog" field
+bug): `PipelineLauncher.start()` and `set_recording()` return bool, and the GUI
+honours the refusals — a Record ON the processor never saw opens **no** session
+(the button unchecks), and a refused START (launcher still in its stop ladder)
+leaves the viz gate closed instead of greying the toolbar out with nothing
+running. A pipeline drop while recording closes the session properly (the toolbar
+uncheck alone left `RecordingManager` active, silently reusing the folder).
+Adoption is **deferred** by `recording.adopt_delay_s` (1.5 s) after Record OFF —
+moving the file while the processor's async `log_enable=False` was still in
+flight made its next append recreate a headerless stub — and runs synchronously
+on STOP/app-close (pinging already off); `merged_sessions/` is excluded from the
+sweep, sub-frame stubs are skipped (never deleted), and an empty adoption on a
+session with pings warns loudly.
 
 ---
 
@@ -494,7 +581,29 @@ streaming artifacts land inside it:
 
 Adopted `.svlog` files land at the **session root**, not in a `svlog/` subdirectory;
 `core/recording_session.py` and `docs/HANDOVER.md` state the same layout. Anything
-already filed under `sessions/` is never adopted again. **VERIFIED.**
+already filed under `sessions/` or `merged_sessions/` is never adopted again.
+**VERIFIED.**
+
+**Merged sessions** — `data_root/merged_sessions/<name>/`, next to `sessions/`.
+The replay window's "Merge with another svlog…" button (`core/svlog_merge.py` +
+`core/session_rebuild.py`) combines two recorded logs into ONE new multi-session
+`.svlog` and regenerates every session artifact from it offline with the same
+writers the live path uses, so the folder is a normal session in every way and
+opens in the replay window unchanged. Mechanics: the older log (first id-10 wall
+clock, else mtime) goes first byte-identical; the newer log keeps its own id-10
+header (one is synthesized if absent) so it stays a separate segment — which is
+what makes ping numbers collision-free and keeps `usable_stamps` per-clock — and
+gets three constant shifts: sonar `timestamp_ms` += Δ so its first ping lands one
+median PRI after the older log's last (the resulting one-PRI `MissionGap` still
+breaks every accumulator), mavlink `time_boot_ms` += Δ + skew_B − skew_A so the
+file-wide boot-skew median stays coherent, and `LOCAL_POSITION_NED` x/y shifted
+onto the older log's frame via the two GPS origins when both exist (pass-through
++ warning otherwise; `GLOBAL_POSITION_INT` is absolute and untouched — the loader
+takes the FIRST origin, the older log's). **NC #6: both sources are opened
+read-only and never modified** (pinned by a SHA-256 regression test); the id-10
+headers gain ignored provenance keys (`merged_from`, `merge_time_shift_ms`).
+NC #9 posture: this is an offline transformation of data that already left
+through sessions, not a new live-export path.
 
 **Seabed images** (AI, waterfall domain) — `seabed_XXXXX.png` plus
 `metadata/seabed_XXXXX.json` (per-row pose/time/speed/altitude and the pixel-to-world
@@ -508,6 +617,9 @@ instead.
 
 Windowing: 256 rows, stride 128 (50 % overlap), 800 columns — the standard tiling
 guarantee that an object smaller than the stride appears whole in at least one image.
+**The overlap is deliberate**: consecutive images sharing their middle 128 rows
+("half of one picture appears in the next") is the tiling guarantee working, not a
+registration bug — do not "fix" it without weakening the detector dataset.
 A final truncated image flushes the remaining pings so no data is lost.
 
 Row 0 = oldest ping, column 0 = +range (port). Pixel to world:
@@ -564,40 +676,77 @@ superproject checked out under `~/ros2_ws/src/BlueBoat-SideScanSonar/`.
 
 **Headless GUI testing** — the regression suite, run from `blueboat_sss/`:
 ```bash
-QT_QPA_PLATFORM=offscreen python3 -m pytest -q     # 110 tests: 85 GCS + 25 robot-side
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q     # 214 tests: 186 GCS + 28 robot-side
 pip install --user --break-system-packages -r ../requirements-dev.txt
 ```
 Runtime depends entirely on what is available. With neither a sourced
-`blueboat_interfaces` nor the field corpus, 50 pass and 60 skip in ~8 s; the ~160 s
-figure is the full run with the corpus mounted. **The corpus path is hard-coded** in
+`blueboat_interfaces` nor the field corpus, 151 pass and 63 skip in ~13 s on this
+machine (ROS 2 Jazzy is sourced globally, so the rclpy-only
+`test_mcs_sim_gps_compat.py` still runs; a truly ROS-free laptop gets 150 / 64), and
+164 pass / 50 skip with a sourced workspace but no corpus; the full-corpus run is
+longer. **The corpus path is hard-coded** in
 `tests/test_processor_assembly.py` as
 `/media/kyyrron/OS/Users/killi/Desktop/Research Kyutech/BlueBoat/allSvlogData`, an
 external mount; every corpus test skips when it is absent, so a green suite is not
 by itself evidence that the *Measured acquisition settings* numbers still hold.
 The **GCS half** (`test_sweeps.py`, `test_sim_session.py`, `test_svlog_writer.py`,
-`test_svlog_forensics.py`, `test_svlog_replay.py`, 85 tests) needs no ROS, no boat and
-no display, and covers:
-the compile sweep (**53 files, 0 failures**); the ROS-free import sweep (**49 of 53**,
+`test_svlog_forensics.py`, `test_svlog_replay.py`, the field-fix suites
+`test_mosaic_resolution.py`, `test_log_console_batching.py`,
+`test_planned_path_dedupe.py`, `test_pinger_gating.py`, `test_heading_policy.py`,
+`test_geo_anchor.py` and `test_navsat_gating.py`, plus the update suites
+`test_recording_guards.py`, `test_pose_freeze.py`, `test_waterfall_buffer.py`,
+`test_waterfall_pick.py`, `test_svlog_merge.py` and `test_range_control.py` —
+185 tests) needs no ROS, no boat and no display; `test_mcs_sim_gps_compat.py`
+(1 test) needs only `rclpy` + message packages — it reproduces the MCS bridge's
+simulated-GPS publisher on the wire (NavSatFix with the default `status = -2`,
+BEST_EFFORT) and asserts the live listener/GeoService chain anchors from it —
+and skips cleanly without them. The no-ROS half covers:
+the compile sweep (**58 files, 0 failures**); the ROS-free import sweep (**54 of 58**,
 the four failures being exactly `ros/{detections,pinger,sonar,telemetry}_listener`,
 which take `rclpy` at module level — asserting their *identity* is what enforces
 NC #10); NC #7 verbatim-copy hashes; NC #8 processor-name consistency; two `--sim`
 START/STOP runs, one of them a full recording session that plants a `.svlog` in
-`data_root` and asserts it is adopted to the session root; `SvlogWriter` itself —
+`data_root` and asserts it is adopted to the session root (the START/STOP run also
+asserts the GPS anchor opened and the gated world root is showing); the GPS-anchor
+regression pattern ported from MCS (round trips under a non-trivial `|t| ≈ 44 m`,
+stationary convergence, glitch robustness, pairing freshness, the window-level gate,
+the replay fixed fit and the bypass); the heading policy (compass conversion,
+staleness fallback, live ping re-stamping vs `embedded`); resolution preservation
+(grid resampling in both directions, refine-only auto, manual/auto interplay);
+console batching, planned-path dedupe, pinger gating and NavSatFix gating
+(`STATUS_UNKNOWN` accepted, NO_FIX/non-finite/(0,0) rejected — the MCS sim-GPS
+regression); `SvlogWriter` itself —
 directory creation, a reported failure on an unusable path or an unwritable file, and
-NC #6 collision handling on both the start and the 500 MB roll; and the `.svlog`
+NC #6 collision handling on both the start and the 500 MB roll; the `.svlog`
 forensics suite — 15 synthetic-file tests that run anywhere, plus 14 that pin the
 *Measured acquisition settings* numbers against the field corpus and skip cleanly when
-it is not mounted; and the replay-fidelity suite (`test_svlog_replay.py`, 38 tests —
+it is not mounted; the replay-fidelity suite (`test_svlog_replay.py`, 38 tests —
 17 synthetic, 21 corpus-gated) covering the real clock and both its fallbacks, session
-segmentation and the gap breaks in every accumulator, and the id-2194 layout. Its field
+segmentation and the gap breaks in every accumulator, and the id-2194 layout (its field
 assertions are cross-checked against `svlog_forensics.analyse` on the same bytes, so
-each number has two independent derivations rather than one.
+each number has two independent derivations rather than one); the recording-lifecycle
+guards (refused Record ON opens no session, refused START keeps the viz gate closed,
+a pipeline drop closes the session once, deferred adoption catches a late file,
+empty adoption warns, stubs and `merged_sessions/` are never swept); the generalized
+frozen-pose detector (origin and non-origin freezes, release hysteresis, reset, the
+no-telemetry case); the growable tiled waterfall (growth past the old ring, tile
+boundaries, cap eviction with stable absolute indices, `reserve`, gap seams, dirty-
+tile rendering, full-fidelity npz + decimated PNG export); waterfall click→world
+(formula extremes/rotation, the overlay as its exact inverse, the window handler
+against SelectionLayer); the svlog merge (two-segment load, ping-count conservation,
+untouched sources by SHA-256, order auto-detection, status/mavlink rewrites, GPS
+pose alignment and its no-GPS fallback, headerless-log header synthesis, the rebuilt
+session layout, and the GUI merge button end-to-end); and the runtime range dance
+(refusals, full dance, failure-resumes-pinging, reentrancy, sim refusal, GUI gating
++ the waterfall seam).
 
-The **robot-side half** (`test_processor_assembly.py`, 25 tests) drives the real
+The **robot-side half** (`test_processor_assembly.py`, 28 tests) drives the real
 `sss_processor_node` for NC #2 — row assembly, one-sided emission, the bounded flush,
-the pre-roll, and the counter-offset estimator against the field `.svlog` corpus. It
-needs a sourced ROS 2 workspace and skips cleanly without one, so the suite stays
-laptop-runnable. It never enables logging and opens the corpus read-only (NC #6).
+the pre-roll, the counter-offset estimator against the field `.svlog` corpus, and the
+odom buffer's nearest-stamp tolerance (fresh sample served, far sample refused with
+the measured skew recorded, stale samples pruned at lookup). It needs a sourced ROS 2
+workspace and skips cleanly without one, so the suite stays laptop-runnable. It never
+enables logging and opens the corpus read-only (NC #6).
 
 Availability is probed with `importlib.util.find_spec`, **not**
 `pytest.importorskip`: a module-level `importorskip` raises `Skipped` during

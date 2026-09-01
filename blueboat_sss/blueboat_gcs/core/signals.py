@@ -32,10 +32,19 @@ class AppSignals(QObject):
     planned_path = Signal(object)      # models.path.PlannedPath (replaces previous)
 
     # --- geo referencing ----------------------------------------------------
-    origin_bound = Signal(float, float)  # (lat0, lon0) once local<->GPS is known
+    #: One accepted GPS fix: (t_wall_monotonic, lat, lon), at GPS rate,
+    #: unthrottled — this is the GeoService's pairing stream.
+    gps_fix = Signal(float, float, float)
+    #: Compass heading: (t_wall_monotonic, degrees clockwise from north).
+    compass_heading = Signal(float, float)
+    #: The map's GPS anchor became valid: (lat0, lon0).
+    geo_anchored = Signal(float, float)
 
     # --- pipeline / lifecycle ----------------------------------------------
     pipeline_state = Signal(str)       # "stopped" | "starting" | "running" | "error"
+    #: Result of a runtime sonar-parameter change: (ok, detail). Emitted
+    #: from the ROS thread (queued); plain types only past this bus.
+    sonar_params_result = Signal(bool, str)
     ros_connected = Signal(bool)       # rclpy context up / down
     status_message = Signal(str)       # transient message for the status bar
     #: Console line: (source, text). Sources: "python", "app", "rosout",
