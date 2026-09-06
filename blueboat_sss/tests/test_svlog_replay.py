@@ -87,7 +87,7 @@ def status_packet(channel: int, timestamp_ms: int,
 
 
 def build_log(path, pings, *, skew_ms=1000, sessions=(0,), channels=(0, 1),
-              stamp=lambda ch, n: n * 50):
+              stamp=lambda ch, n: n * 50, start_mm=0):
     """A loadable synthetic log: poses, then ``pings`` ping-pairs per session.
 
     ``sessions`` gives the first ping index of each session. The sonar clock is
@@ -104,7 +104,8 @@ def build_log(path, pings, *, skew_ms=1000, sessions=(0,), channels=(0, 1),
             if n == 0:
                 packets.extend(pose_burst(stamp(0, 0) - skew_ms, 0.0, 0.0))
         for ch in channels:
-            packets.append(profile_packet(ch, n, stamp(ch, n)))
+            packets.append(profile_packet(ch, n, stamp(ch, n),
+                                          start_mm=start_mm))
         # After the profiles, so each skew vote anchors to its own ping: the
         # estimator votes against the most recent profile, and interleaving the
         # other way biases it by the ping interval.
@@ -410,9 +411,13 @@ def test_feed_pings_breaks_the_window_at_a_session_boundary(tmp_path, qapp, tmp_
 
     without = run(())
     with_breaks = run(m.gap_times)
-    assert any(np.diff(i.row_t).max() > gap / 2 for i in without), (
+    # A window that straddles the dead time spans it in ping time (row_t
+    # is newest-first and, with square rows, interpolated along-track, so
+    # the span — not the row-to-row step — is the honest detector).
+    span = lambda i: float(i.row_t.max() - i.row_t.min())
+    assert any(span(i) > gap / 2 for i in without), (
         "the fixture must actually produce a straddling window")
-    assert all(np.diff(i.row_t).max() < gap / 2 for i in with_breaks)
+    assert all(span(i) < gap / 2 for i in with_breaks)
     # Image ids stay unique and ordered across the boundary.
     ids = [i.image_id for i in with_breaks]
     assert ids == sorted(set(ids))

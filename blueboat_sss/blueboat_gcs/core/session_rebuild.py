@@ -60,10 +60,17 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
 
     mission = load_svlog(svlog_path, progress=_p(0.0, 0.4),
                          depth_mode=config.depth.mode,
-                         manual_depth_m=config.depth.manual_m)
+                         manual_depth_m=config.depth.manual_m,
+                         blank_nadir=config.depth.blank_nadir,
+                         nadir_blank_m=config.depth.nadir_blank_m,
+                         nadir_max_fraction=config.depth.nadir_max_fraction)
 
-    mosaic = MosaicService(config)
-    waterfall = WaterfallService(config)
+    # One display model for the three artifacts (the same rule as a
+    # window): fitted over the whole log before anything is rendered.
+    from .display_model import DisplayModel
+    model = DisplayModel.fit(config, mission.pings)
+    mosaic = MosaicService(config, model)
+    waterfall = WaterfallService(config, model)
     waterfall.reserve(mission.ping_count + len(mission.gap_times) + 16)
     waterfall.set_enabled(True)
     events = mission.events
@@ -84,7 +91,7 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
     waterfall.export_into(session_dir / "waterfall")
     n_images = generate_from_pings(
         mission.pings, session_dir / "seabed_images", config,
-        progress=_p(0.7, 0.98), breaks=mission.gap_times)
+        progress=_p(0.7, 0.98), breaks=mission.gap_times, model=model)
 
     started = datetime.utcnow()
     meta = {
@@ -99,9 +106,10 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
             "cell_size_m": mosaic.cell_size_m,
             "densify": config.mosaic.densify,
             "bilinear_splat": config.mosaic.bilinear_splat,
-            "priority_mode_displayed": "average",
+            "priority_mode_displayed": config.mosaic.priority_mode,
         },
         "display_settings_at_end": None,
+        "display_model": model.snapshot().to_json(),
         "topics": asdict(config.topics),
         "note": ("rebuilt offline from the .svlog at the session root; "
                  "mosaic/*.npz and waterfall/waterfall_raw.npz contain "

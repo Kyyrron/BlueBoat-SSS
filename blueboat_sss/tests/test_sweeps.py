@@ -18,8 +18,8 @@ from conftest import GCS_ROOT, PKG_PARENT, gcs_files, gcs_modules
 # Recorded counts. If either moves, update CLAUDE.md in the same commit
 # rather than loosening the assertion — the number *is* the regression
 # signal.
-EXPECTED_FILE_COUNT = 58        # +core/svlog_merge.py, +core/session_rebuild.py
-EXPECTED_ROS_FREE_IMPORTABLE = 54
+EXPECTED_FILE_COUNT = 62        # 2026-09-05: +core/display_model.py, +core/live_native.py, +analysis/check_dois.py, -core/contrast.py
+EXPECTED_ROS_FREE_IMPORTABLE = 58
 
 # The modules that legitimately cannot import without ROS: exactly the
 # four ros/ listeners that take `from rclpy.node import Node` at module

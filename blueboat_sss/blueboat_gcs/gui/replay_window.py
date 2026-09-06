@@ -88,8 +88,13 @@ class ReplayWindow(QMainWindow):
 
         # ---- second instance of the live stack -------------------------------
         self.signals = AppSignals()
-        self.mosaic_service = MosaicService(config)
-        self.waterfall_service = WaterfallService(config)
+        # One display model for the whole log, fitted in a single pass
+        # before anything renders (core/display_model.py): the waterfall,
+        # the mosaic, Run AI and Save pictures all map through it.
+        from ..core.display_model import DisplayModel
+        self.display_model = DisplayModel.fit(config, mission.pings)
+        self.mosaic_service = MosaicService(config, self.display_model)
+        self.waterfall_service = WaterfallService(config, self.display_model)
         # The whole file must stay scrollable in the waterfall: raise the
         # live memory cap to the mission's own size (pings + gap seams).
         # A pathological multi-hour log is bounded instead of exhausting
@@ -137,7 +142,7 @@ class ReplayWindow(QMainWindow):
         self.world_root.set_ready(True)     # replay is never gated
 
         # ---- reused right panel (identical map options to the main window) ---
-        self.right_panel = RightPanel()
+        self.right_panel = RightPanel(config=config)
         dock = QDockWidget("Tools")
         dock.setFeatures(QDockWidget.DockWidgetMovable)
         scroll = QScrollArea()
@@ -255,6 +260,10 @@ class ReplayWindow(QMainWindow):
             self.waterfall_view.on_layout)
         self.waterfall_service.tile_updated.connect(
             self.waterfall_view.on_tile)
+        # Scrolling back onto tiles whose pixmaps were evicted re-renders
+        # them (the main window had this wiring; replay lacked it).
+        self.waterfall_view.tiles_requested.connect(
+            self.waterfall_service.request_rows)
         self.waterfall_service.detections_updated.connect(
             self.waterfall_view.on_detections)
         self.waterfall_view.point_selected.connect(self._on_waterfall_point)
@@ -350,10 +359,10 @@ class ReplayWindow(QMainWindow):
                 "No position for that waterfall point (session gap row).",
                 6000)
             return
-        _t, rx, ry, yaw, r = meta
+        _t, rx, ry, yaw, depth = meta
         wx, wy = waterfall_pixel_to_world(
-            rx, ry, yaw, r, float(col),
-            self._config.mosaic.waterfall_columns)
+            rx, ry, yaw, depth, self.waterfall_service.pitch_m,
+            float(col), self.waterfall_service.columns)
         wx, wy = float(wx), float(wy)
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(
@@ -444,7 +453,7 @@ class ReplayWindow(QMainWindow):
         n = generate_from_pings(
             pings, out, self._config,
             progress=lambda f: progress.setValue(int(f * 100)),
-            breaks=self._mission.gap_times)
+            breaks=self._mission.gap_times, model=self.display_model)
         progress.setValue(100)
         QMessageBox.information(
             self, "Seabed images",
@@ -459,7 +468,7 @@ class ReplayWindow(QMainWindow):
         from ..core.seabed_imager import SeabedImager, feed_pings
         from ..models.detection import Detection
 
-        imager = SeabedImager(self._config)      # dummy analyzer for now
+        imager = SeabedImager(self._config, model=self.display_model)  # dummy analyzer
         results: list = []
         imager.image_ready.connect(results.append)
 
@@ -701,9 +710,16 @@ class ReplayWindow(QMainWindow):
             self._mission = load_svlog(
                 self._mission.path,
                 progress=lambda f: progress.setValue(int(f * 100)),
-                depth_mode=mode, manual_depth_m=manual_m)
+                depth_mode=mode, manual_depth_m=manual_m,
+                blank_nadir=self._config.depth.blank_nadir,
+                nadir_blank_m=self._config.depth.nadir_blank_m,
+                nadir_max_fraction=self._config.depth.nadir_max_fraction)
         finally:
             progress.close()
+        # The native rows and the tracked bottom do not depend on the depth
+        # mode, but the mosaic's ground samples do: re-fit in place so every
+        # service (they hold this instance) re-renders on the version bump.
+        self.display_model.refit(self._mission.pings)
         self._clear_outputs()
         self.trajectory_layer.clear()
         self.statusBar().showMessage(
@@ -775,7 +791,10 @@ def open_svlog_dialog(parent, config: AppConfig) -> Optional[ReplayWindow]:
         mission = load_svlog(
             Path(path), progress=lambda f: progress.setValue(int(f * 100)),
             depth_mode=config.depth.mode,
-            manual_depth_m=config.depth.manual_m)
+            manual_depth_m=config.depth.manual_m,
+            blank_nadir=config.depth.blank_nadir,
+            nadir_blank_m=config.depth.nadir_blank_m,
+            nadir_max_fraction=config.depth.nadir_max_fraction)
     except (OSError, ValueError) as exc:
         progress.close()
         QMessageBox.critical(parent, "Open SVLOG",

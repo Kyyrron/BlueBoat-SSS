@@ -80,15 +80,22 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._stack)
         scene = self.map_view.scene()
 
-        self.waterfall_service = WaterfallService(config)
+        # ONE display model for the waterfall, the AI pictures and the
+        # mosaic of this window (core/display_model.py): fed by the
+        # waterfall service, frozen after the warm-up, shared by all three
+        # so every picture maps dB to grey identically.
+        from ..core.display_model import DisplayModel
+        self.display_model = DisplayModel(config)
+        self.waterfall_service = WaterfallService(config, self.display_model)
+        mosaic_service.set_model(self.display_model)
         self.recording = RecordingManager(config, signals,
                                           mosaic_service,
                                           self.waterfall_service)
         # Live AI seabed imaging (waterfall domain, core/seabed_imager.py):
-        # every stride pings -> image + metadata + dummy analysis; written
+        # every stride rows -> image + metadata + dummy analysis; written
         # to <session>/seabed_images while a recording session is active.
         from ..core.seabed_imager import SeabedImager
-        self.seabed_imager = SeabedImager(config)
+        self.seabed_imager = SeabedImager(config, model=self.display_model)
         self._frozen_detector = FrozenPoseDetector(
             eps_m=config.alignment.frozen_epsilon_m,
             after=config.alignment.frozen_after_pings)
@@ -143,7 +150,8 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.LeftDockWidgetArea,
                            self._dock("Mission", self.left_panel))
         self.right_panel = RightPanel(acquisition_range=(
-            config.acquisition.range_min_m, config.acquisition.range_max_m))
+            config.acquisition.range_min_m, config.acquisition.range_max_m),
+            config=config)
         self.addDockWidget(Qt.RightDockWidgetArea,
                            self._dock("Tools", self.right_panel))
 
@@ -229,6 +237,8 @@ class MainWindow(QMainWindow):
             self.waterfall_view.on_layout)
         self.waterfall_service.tile_updated.connect(
             self.waterfall_view.on_tile)
+        self.waterfall_view.tiles_requested.connect(
+            self.waterfall_service.request_rows)
         self.waterfall_service.detections_updated.connect(
             self.waterfall_view.on_detections)
         self.waterfall_view.point_selected.connect(self._on_waterfall_point)
@@ -292,6 +302,7 @@ class MainWindow(QMainWindow):
         """
         if not self._viz_enabled:
             return
+        self._apply_backpressure(ping)
         ping = self._align_ping_pose(ping)
         self._mosaic_service.on_sonar_ping(ping)
         self.waterfall_service.on_sonar_ping(ping)
@@ -346,6 +357,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Map anchored at {lat0:.6f}, {lon0:.6f}"
             + (f" (rms {rms:.1f} m)" if rms else ""), 8000)
+
+    def _apply_backpressure(self, ping: SonarPing) -> None:
+        """The sonar_ping queue has no backpressure: when the GUI thread
+        falls behind, pings pile up in Qt's event queue and latency
+        grows without bound ("slower and slower, then dies"). Rows always
+        enter the buffers; only *rendering* pauses until the queue has
+        drained, and the operator is told once per episode."""
+        limit = int(getattr(self._config.mosaic, "ping_lag_throttle", 0))
+        latest = int(getattr(self._signals, "sonar_latest_seq", 0))
+        if limit <= 0 or not ping.seq or not latest:
+            return
+        lag = latest - ping.seq
+        behind = lag > limit
+        if behind != getattr(self, "_ping_lag_throttled", False):
+            self._ping_lag_throttled = behind
+            self._mosaic_service.throttle(behind)
+            self.waterfall_service.throttle(behind)
+            if behind:
+                self._signals.status_message.emit(
+                    f"SONAR: display {lag} pings behind the stream -- "
+                    "rendering paused until it catches up (no data lost)")
 
     def _on_detection(self, det: Detection) -> None:
         self.left_panel.on_detection(det)
@@ -522,6 +554,7 @@ class MainWindow(QMainWindow):
         the view transform). New pings keep accumulating immediately."""
         self._mosaic_service.clear()          # emits cleared -> layer wipes
         self.waterfall_service.clear()        # emits null image -> view wipes
+        self.display_model.reset()            # a fresh mission: re-warm
         self.statusBar().showMessage(
             "SSS data cleared — overlays, map position and zoom preserved.",
             8000)
@@ -570,10 +603,10 @@ class MainWindow(QMainWindow):
                 "No position for that waterfall point (gap row, or the "
                 "history was discarded).", 6000)
             return
-        _t, rx, ry, yaw, r = meta
+        _t, rx, ry, yaw, depth = meta
         wx, wy = waterfall_pixel_to_world(
-            rx, ry, yaw, r, float(col),
-            self._config.mosaic.waterfall_columns)
+            rx, ry, yaw, depth, self.waterfall_service.pitch_m,
+            float(col), self.waterfall_service.columns)
         wx, wy = float(wx), float(wy)
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(

@@ -269,6 +269,15 @@ class RecordingManager(QObject):
                 continue
         return adopted
 
+    def _display_model_json(self):
+        model = getattr(self._waterfall, "model", None)
+        if model is None:
+            return None
+        try:
+            return model.snapshot().to_json()
+        except Exception:                      # pragma: no cover - metadata only
+            return None
+
     def _write_metadata(self, session: Path, start_wall: float,
                         svlogs: List[str]) -> None:
         meta = {
@@ -289,9 +298,12 @@ class RecordingManager(QObject):
             "display_settings_at_end": (
                 asdict(self._display_settings)
                 if self._display_settings is not None else None),
+            "display_model": self._display_model_json(),
             "topics": asdict(self._config.topics),
-            "note": ("mosaic/*.npz and waterfall/waterfall_raw.npz contain "
-                     "raw, unrendered data; PNGs go through the display "
-                     "pipeline and are quick-looks only."),
+            "note": ("waterfall/waterfall_raw.npz holds raw dB; mosaic/*.npz "
+                     "holds the display-model-normalised level (its "
+                     "value_domain key says which); PNGs go through the "
+                     "display pipeline and are quick-looks only; the AI "
+                     "feed is seabed_images/ + metadata/."),
         }
         write_session_metadata(session, meta)

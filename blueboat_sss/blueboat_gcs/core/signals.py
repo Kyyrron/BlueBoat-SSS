@@ -22,6 +22,9 @@ from PySide6.QtCore import QObject, Signal
 
 
 class AppSignals(QObject):
+    #: Newest live-ping arrival number (set by the ROS-side sonar listener,
+    #: read by the GUI to measure how far behind its queue is).
+    sonar_latest_seq: int = 0
     """Typed signal hub. One instance per application, injected everywhere."""
 
     # --- data streams -----------------------------------------------------

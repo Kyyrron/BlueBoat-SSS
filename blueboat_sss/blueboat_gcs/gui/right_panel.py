@@ -38,10 +38,17 @@ class RightPanel(QWidget):
     range_apply_requested = Signal(float)  # sonar range [m] (live only)
 
     def __init__(self, parent: Optional[QWidget] = None, *,
-                 acquisition_range: Optional[Tuple[float, float]] = None
-                 ) -> None:
+                 acquisition_range: Optional[Tuple[float, float]] = None,
+                 config=None) -> None:
         """``acquisition_range=(min_m, max_m)`` adds the live sonar-range
-        group (main window only; the replay window has no sonar)."""
+        group (main window only; the replay window has no sonar).
+
+        ``config`` (an AppConfig) seeds the display combos to the field
+        defaults — ``Depth comp.`` = ``depth.mode`` and ``Priority`` =
+        ``mosaic.priority_mode`` — so the widgets agree with the config
+        the services were built from (the combos otherwise start on their
+        first item regardless of config)."""
+        self._cfg = config
         super().__init__(parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -230,14 +237,17 @@ class RightPanel(QWidget):
         form.addRow("Manual depth",
                     self._wrap(self._depth_manual, self._depth_manual_lbl, ""))
 
-        # Dynamic range is ALWAYS derived from the data (percentiles).
-        # The former manual min/max dB sliders were removed: real
-        # Omniscan data (uint16 pwr_results, per-gain min/max_pwr_db
-        # spanning e.g. +7..+64 dB) makes any fixed dB window meaningless
-        # across gain settings; the percentile scheme adapts by design,
-        # and Contrast/Brightness below give the operator the same
-        # practical control without unit assumptions.
-        self._gamma = self._slider(30, 300, 100)     # /100 -> 0.3 … 3.0
+        # Dynamic range is ALWAYS derived from the data: the display
+        # model's window (core/display_model.py) — no manual dB sliders
+        # (real Omniscan data spans per-gain min/max_pwr_db, so a fixed
+        # window is meaningless). Contrast is the model's transfer
+        # exponent gamma (1 = linear power, SonarView; 0.5 = amplitude),
+        # seeded from config display.gamma so the on-screen waterfall and
+        # the AI pictures start on the same transfer; Brightness is an
+        # offset on the unit brightness. Visualization only.
+        gamma0 = (self._cfg.display.gamma if self._cfg is not None
+                  else DisplaySettings().gamma)
+        self._gamma = self._slider(30, 300, int(round(gamma0 * 100)))  # 0.3 … 3.0
         self._gamma_lbl = QLabel()
         form.addRow("Contrast", self._wrap(self._gamma, self._gamma_lbl))
 
@@ -263,7 +273,19 @@ class RightPanel(QWidget):
         for s in (self._gamma, self._bright):
             s.valueChanged.connect(self._emit_display)
         reset.clicked.connect(self._reset_display)
+        # Seed the combos to the field defaults from config (they start on
+        # their first item otherwise). Done after wiring so the services —
+        # connected by the window later — pick these up on first change,
+        # while the services themselves already default from the same config.
+        if self._cfg is not None:
+            i = self._depth_mode.findData(self._cfg.depth.mode)
+            if i >= 0:
+                self._depth_mode.setCurrentIndex(i)
+            i = self._priority.findData(self._cfg.mosaic.priority_mode)
+            if i >= 0:
+                self._priority.setCurrentIndex(i)
         self._emit_display()
+        self._emit_depth()
         self._emit_opacity(self._opacity.value())
         return box
 
@@ -288,8 +310,10 @@ class RightPanel(QWidget):
 
     def _reset_display(self) -> None:
         d = DisplaySettings()
+        gamma0 = (self._cfg.display.gamma if self._cfg is not None
+                  else d.gamma)
         self._cmap.setCurrentText(d.colormap)
-        self._gamma.setValue(int(d.gamma * 100))
+        self._gamma.setValue(int(round(gamma0 * 100)))
         self._bright.setValue(int(d.brightness * 100))
         self._opacity.setValue(100)
         self._emit_display()

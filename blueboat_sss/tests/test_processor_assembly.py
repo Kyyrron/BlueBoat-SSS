@@ -229,8 +229,9 @@ def test_incomplete_group_is_flushed_not_held(node):
     assert node.published == [], "a fresh group should wait briefly for its partner"
     assert 5000 in node._groups
 
-    # The wall-clock bound elapses; the timer path emits it one-sided.
-    node._groups[5000]["first_ns"] -= 2 * proc.ASSEMBLY_MAX_LAG_NS
+    # The stream stops (no arrival for the lag, on the wall clock); the
+    # timer path emits it one-sided. Message stamps play no part.
+    node._last_arrival_wall_ns -= 2 * proc.ASSEMBLY_MAX_LAG_NS
     node._flush_pending()
     assert len(node.published) == 1
     assert node.published[0].port_ping_number == 5000
@@ -243,12 +244,87 @@ def test_preroll_is_bounded_and_never_strands_a_ping(node):
     node._on_port(make_profile(0, 42, 0))
     assert node.published == [], "held while the counter offset is unknown"
 
-    # Stream stops. The timer path must still deliver it once it goes stale.
-    node._preroll[0] = (node._preroll[0][0], node._preroll[0][1],
-                        -2 * proc.ASSEMBLY_MAX_LAG_NS)
+    # Stream stops. The timer path must still deliver it once the stream
+    # has been silent for the lag.
+    node._last_arrival_wall_ns -= 2 * proc.ASSEMBLY_MAX_LAG_NS
     node._flush_pending()
     assert len(node.published) == 1
     assert node.published[0].port_ping_number == 42
+
+
+def _run_pairs(node, first_pn, count, t0_ns, period_ns=PING_PERIOD_NS,
+               stamp_offset_ns=0):
+    """Feed ``count`` port/starboard pairs numbered from ``first_pn``."""
+    for i in range(count):
+        t = t0_ns + i * period_ns
+        node._on_port(make_profile(0, first_pn + i, t))
+        node._on_starboard(make_profile(1, first_pn + i, t + stamp_offset_ns))
+
+
+def test_counter_restart_under_a_live_processor_rebases(node):
+    """Measured 2026-09-03: the simulator was relaunched under a running
+    processor, its counter restarted at 1 while ``_max_key_seen`` stayed
+    near 10 000, and every ping was published as two one-sided rows for
+    the rest of the run. A restart must re-base the assembly instead."""
+    node._odom_buf = proc._OdomBuffer(int(600e9), tolerance_ns=int(600e9))
+    for i in range(400):
+        node._odom_buf.push(make_odom(i * PING_PERIOD_NS))
+    _run_pairs(node, 10_000, 150, 0)
+    assert all(m.port_ping_number and m.starboard_ping_number
+               for m in node.published), "healthy stream pairs every row"
+    node.published.clear()
+
+    # The sonar node is relaunched: counter back to 1, stamps continue.
+    _run_pairs(node, 1, 120, 150 * PING_PERIOD_NS)
+    node._flush_pending(drain_all=True)
+    rows = node.published
+    two_sided = [m for m in rows if m.port_ping_number and m.starboard_ping_number]
+    torn = [m for m in rows if not (m.port_ping_number and m.starboard_ping_number)]
+    assert node._counter_restarts == 1
+    # Every post-restart ping leaves exactly once, and after the offset is
+    # re-learned through the pre-roll the rows are two-sided again.
+    assert len(two_sided) * 2 + len(torn) == 240
+    assert len(two_sided) >= 120 - proc.OFFSET_PREROLL_MAX
+    assert two_sided[-1].port_ping_number == 120
+    assert two_sided[-1].starboard_ping_number == 120
+
+
+def test_flush_timer_never_compares_wall_time_with_stamps(node):
+    """Under Gazebo the stamps are sim time (~1e11 ns) while the node runs
+    on the wall clock (~1.8e18 ns). The 5 Hz flush timer used to judge
+    every group stale on that arithmetic and tear any pair in flight."""
+    node._odom_buf = proc._OdomBuffer(int(600e9), tolerance_ns=int(600e9))
+    sim_t0 = 123_600_000_000            # 123.6 s of sim time, like a real run
+    for i in range(200):
+        node._odom_buf.push(make_odom(sim_t0 + i * PING_PERIOD_NS))
+    _run_pairs(node, 2461, proc.OFFSET_PREROLL_MAX + 4, sim_t0)
+    node.published.clear()
+    base = proc.OFFSET_PREROLL_MAX + 4
+    for i in range(40):
+        t = sim_t0 + (base + i) * PING_PERIOD_NS
+        node._on_port(make_profile(0, 2461 + base + i, t))
+        node._flush_pending()            # the timer fires between the halves
+        node._on_starboard(make_profile(1, 2461 + base + i, t))
+    assert len(node.published) == 40
+    assert all(m.port_ping_number and m.starboard_ping_number
+               for m in node.published)
+
+
+def test_torn_stream_is_warned_about_once(node):
+    """A stream that is mostly one-sided is a defect somewhere upstream and
+    must not stay silent (the 2026-09-03 tearing went unnoticed for a whole
+    session). The node warns once per episode and re-arms when it heals."""
+    node._odom_buf = proc._OdomBuffer(int(600e9), tolerance_ns=int(600e9))
+    for i in range(proc.TORN_WINDOW_ROWS + 10):
+        node._odom_buf.push(make_odom(i * PING_PERIOD_NS))
+    warned = []
+    node.get_logger().warn = lambda msg, *a, **k: warned.append(str(msg))
+    for i in range(proc.TORN_WINDOW_ROWS + 5):
+        node._emit_group({"first_ns": i * PING_PERIOD_NS,
+                          0: make_profile(0, 300 + i, i * PING_PERIOD_NS)})
+    torn_msgs = [m for m in warned if "one-sided" in m]
+    assert len(torn_msgs) == 1, warned
+    assert node._torn_warned
 
 
 def test_group_buffer_is_bounded(node):

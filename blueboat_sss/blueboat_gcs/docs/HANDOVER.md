@@ -66,7 +66,9 @@ recording session: it publishes `true` once on the processor's log/enable topic
         boat_trajectory.csv  # t_since_first_s, x_m, y_m, depth_m
     waterfall/
         waterfall.png        # quick-look
-        waterfall_raw.npz    # untouched ping buffer -> AI dataset source
+        waterfall_raw.npz    # untouched native-bin buffer (archival raw
+                             # record; the AI feed is seabed_images/ PNGs
+                             # + their metadata/ JSON — decided 2026-09-01)
     detections/detections.csv
 ```
 
@@ -110,9 +112,10 @@ Python prints and app logging (via `core/logging_bus.py`), ROS 2 log messages fr
 every node via `/rosout`, and the raw stdout/stderr of the launch subprocess — the
 operator never needs an external terminal. Removed control: the manual Min/Max dB
 dynamic-range sliders are gone; real Omniscan data (uint16 `pwr_results`, per-gain
-`min/max_pwr_db` e.g. +7…+64 dB) makes a fixed dB window meaningless, so the range is
-always derived from data percentiles, with Contrast/Brightness/Colormap/Opacity as
-the operator controls. Panel base width is `PANEL_MIN_WIDTH` in
+`min/max_pwr_db` e.g. +7…+64 dB) makes a fixed dB window meaningless, so the mapping
+is the display model's (`core/display_model.py`, below), with Contrast (the model's
+transfer exponent, seeded from `display.gamma`) / Brightness / Colormap / Opacity as
+the operator controls. The `Range EQ (waterfall)` toggle is gone (2026-09-05). Panel base width is `PANEL_MIN_WIDTH` in
 `gui/main_window.py`.
 
 ## 3. Integration points
@@ -257,15 +260,54 @@ swapped rows entirely (11.4 % and 15.0 % of rows before).
 
 **`~/raw` must stay published.** `sss_processor_node` subscribes to it and those
 framed packets are what it writes into the `.svlog`. The GCS does not subscribe to it.
+**Since 2026-09-05 the GCS subscribes to the two raw `~/profile` topics** (BEST_EFFORT,
+depth 200): the profiles are cached per side by device `ping_number` and attached
+verbatim to the matching processed row (`core/live_native.py`), so the live waterfall
+and the AI pictures draw exactly the native bins the replay path decodes from the
+`.svlog` — water column and ringing included. A profile that does not arrive within
+`sonar_stream.profile_wait_ms` falls back to the re-projection for that side, and the
+console warns once when more than 5 % of recent rows had to.
+
+**Defaults (2026-09-03):** the shipped view is `Depth comp. = off`, mosaic overlap
+`Priority = closest` — SonarView's conventions. The combos are seeded
+from `config/default.yaml` (`depth.mode: "off"`, `mosaic.priority_mode: closest`) so
+the widgets match the services. Every picture's look comes from the display model
+(`mosaic.nadir_contrast: true`, below).
 
 **Depth compensation** (`Depth comp.` in the right panel, `depth.mode` in config) is
 the altitude used for slant-range correction - the same control SonarView exposes:
 `auto` (bottom detect), `manual`, `off` (no correction, equal to SonarView's
-"Manual / 0 m"). The waterfall changes with it because the waterfall is displayed in
-corrected ground range, not raw slant range; only intensity-vs-sample-index is truly
-raw. On shallow data a wrong altitude is worse than none, so `off` is the safe choice
-when bottom detection is unreliable. In the replay window, changing it re-processes
-the log.
+"Manual / 0 m", the default). It governs the **mosaic** (ground range). The
+**waterfall and the AI pictures are the raw slant-bin domain** and do not warp with
+it: they carry the full raw dB, water column included. On shallow data a wrong
+altitude is worse than none, so `off` is the safe choice when bottom detection is
+unreliable. In the replay window, changing it re-processes the log.
+
+**Waterfall orientation, true scale, range falloff & nadir (2026-09-05).** The
+waterfall shows the **newest ping on top** (SonarView convention; the live view pins to
+the top, the exported PNG and the seabed pictures are newest-first) and is drawn at
+**true scale** (rows stretched by along-track metres per ping over the bin pitch,
+"True scale" checkbox in the view). Every picture — live waterfall, replay waterfall,
+AI seabed pictures, mosaic — maps dB to grey through the window's ONE **display model**
+(`core/display_model.py`; the science and the measurements behind it are in
+`docs/SCIENTIFIC_BACKGROUND.md`): the two-way transmission loss `k·log10 r + 2αr` is
+removed (the stream is pre-TVG: the seabed falls 60–70 dB per decade of slant range on
+the field logs), then an empirical per-side seabed curve in normalised slant range
+`r/h` (the **mode** of each bin's level histogram tied to a consensus physical line —
+immune to shadows, walls and targets, even a wall shadowing the whole far range;
+altitude- and range-invariant) is divided out, then a power-law transfer
+`u = 10^(γ(e−hi)/10)` with a robust window top, a soft highlight knee and **no low
+handle**. Near and far
+seabed read alike, shadows go black, and the water column and ringing core darken by
+the extrapolated transmission loss — **nothing is erased**, everything is **losslessly
+invertible** from the model stored in every JSON/npz (`display_model`, `db = e − TL(r) +
+A(r/h)`). This replaced the 2026-09-03 seabed-referenced EGN (`core/contrast.py`,
+deleted): its per-column *mean* reference and 5th-percentile low handle were both
+contaminated by shadows, which is what produced the bright "nadir", the vertical bands
+and the grey noise inside shadows. The narrow ringing blank still applies to the
+**mosaic ground projection only**, so the track line stays clean in `off` mode; the
+mosaic's planes are the normalised level (`value_domain: normalised_db` in its npz),
+comparable across passes.
 
 **Mosaic resolution** is no longer a fixed 0.25 m. `MosaicService` derives the
 ground-sample distance from the median across-track sample spacing over the outer half
@@ -342,18 +384,19 @@ detector, `fill_small_gaps` returns the fill mask — log it alongside so interp
 detections can be excluded from any accuracy statistic.
 
 **Waterfall domain and AI datasets.** The Waterfall view (`View` selector, right
-panel) displays raw pings stacked in acquisition order — the domain from which future
-AI datasets will primarily be generated — and is now fully interactive (wheel zoom,
-drag pan, vertical scrolling through the whole ring buffer; it follows the newest
-ping while at the bottom and releases the moment you scroll into history). A small
-in-view control strip adds manual zoom −/+ buttons and an "AI detections" checkbox
-that toggles the detection markers (which are drawn on the exact ping line each object
+panel) displays raw pings stacked in acquisition order — the domain the AI datasets
+are generated from — and is fully interactive (wheel zoom, drag pan, vertical
+scrolling through the whole buffer; it follows the newest ping while at the top and
+releases the moment you scroll into history). A small in-view control strip adds
+manual zoom −/+ buttons, "Fit file", the "True scale" toggle and an "AI detections"
+checkbox that toggles the detection markers (drawn on the exact ping line each object
 was seen on); the strip is part of the widget, so it is present in both the main and
-the SVLOG replay windows. Its pixel
-values go through the display pipeline for *viewing only*; for dataset generation use
-the data upstream of any rendering: the per-ping `intensity_db`/`y_local` arrays from
-`/sss_processor/processed`, or `waterfall/waterfall_raw.npz` in a recording session
-(the untouched ring buffer). Interpolation never applies in the waterfall domain, and
+the SVLOG replay windows. **The AI seabed pictures use the very same mapping as this
+view** (one display model per window), and since 2026-09-05 their rows are
+speed-corrected to square pixels (`seabed.row_geometry: square`, provisional — revert
+with `ping`; see CLAUDE.md). For raw radiometry use the data upstream of any rendering:
+`waterfall/waterfall_raw.npz` in a recording session (raw dB + the model), or each
+picture's `_world.npz`. Interpolation never applies in the waterfall domain, and
 the mosaic-side densification (`mapping/rasterizer.py`) only resamples between
 adjacent real measurements — set `mosaic.densify: false` / `bilinear_splat: false`
 for strictly legacy accumulation in A/B studies. The mosaic `.npz` keeps the legacy

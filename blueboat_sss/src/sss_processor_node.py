@@ -180,6 +180,20 @@ OFFSET_VOTE_DEFER:        int   = 4            # below this the estimator goes b
 # for a single-transducer run, where no vote is ever cast.
 OFFSET_MIN_VOTES:         int   = 8
 OFFSET_PREROLL_MAX:       int   = 24
+# A key that falls this far *behind* the newest one seen is not a late
+# arrival (the worst measured in-flight lag is 63): a device restarted its
+# counter (power cycle, or the simulator relaunched under a running
+# processor). The stale high-water mark would otherwise evict every new
+# group on its next arrival and tear every row in two -- measured on
+# 2026-09-03: 7464 one-sided rows, every device ping published twice as a
+# half-row -- so the assembly re-bases: pending groups are drained, the
+# counter offset is re-learned through the pre-roll, and the mark restarts.
+COUNTER_RESTART_PINGS:    int   = ASSEMBLY_MAX_LAG_PINGS
+# Torn-row alarm: share of one-sided rows over this many recent emissions
+# above which the node warns once (a healthy two-sided stream sits near 0;
+# a single lost half here and there never reaches it).
+TORN_WINDOW_ROWS:         int   = 100
+TORN_WARN_SHARE:          float = 0.25
 
 # ---------------------------------------------------------------------------
 # Odom buffer
@@ -261,6 +275,15 @@ class SSSProcessorNode(Node):
         self._preroll: Optional[list] = []
         self._max_key_seen: Optional[int] = None
         self._buf_lock = threading.Lock()
+        # Wall-clock instant of the last profile arrival. The flush timer
+        # compares wall time only with this, never with a message stamp:
+        # stamps are sim time under Gazebo (and device time on a rosbag),
+        # and wall-vs-stamp arithmetic made every group look 1.8e9 s stale.
+        self._last_arrival_wall_ns: Optional[int] = None
+        self._counter_restarts = 0
+        self._max_key_before: Optional[int] = None
+        self._torn_recent: Deque[bool] = deque(maxlen=TORN_WINDOW_ROWS)
+        self._torn_warned = False
 
         self._odom_buf = _OdomBuffer(int(ODOM_BUFFER_SECONDS * 1e9))
         self._fbr = FBRTracker(
@@ -396,7 +419,8 @@ class SSSProcessorNode(Node):
             f"{self._unlocked_pings} with a provisional altitude, "
             f"{self._dropped_no_odom} dropped for missing odom; "
             f"ping-counter offset {self._offset.offset:+d} "
-            f"({self._offset.confidence * 100:.0f}% of {self._offset.votes} votes)"
+            f"({self._offset.confidence * 100:.0f}% of {self._offset.votes} votes), "
+            f"{self._counter_restarts} counter restart(s) re-based"
         )
         self._svlog.stop()
 
@@ -727,6 +751,23 @@ class SSSProcessorNode(Node):
         stamp_ns = stamp_to_ns(msg.header.stamp)
         ready = []
         with self._buf_lock:
+            self._last_arrival_wall_ns = time.monotonic_ns()
+            if self._preroll is None and self._counter_restarted(
+                    channel, int(msg.ping_number)):
+                # Re-base: everything pending belongs to the old numbering
+                # and can never complete; the offset is re-learned from a
+                # fresh pre-roll, exactly as at startup.
+                ready.extend(self._groups.values())
+                self._groups.clear()
+                self._offset = PingCounterOffset(window=OFFSET_VOTE_WINDOW,
+                                                 defer=OFFSET_VOTE_DEFER)
+                self._preroll = []
+                self._max_key_seen = None
+                self._counter_restarts += 1
+                self.get_logger().info(
+                    f"ping counter restarted on channel {channel} "
+                    f"(#{int(msg.ping_number)} after #{self._max_key_before}): "
+                    "re-basing row assembly and re-learning the device offset")
             self._offset.observe(channel, int(msg.ping_number), stamp_ns)
 
             if self._preroll is not None:
@@ -765,12 +806,27 @@ class SSSProcessorNode(Node):
             return [group]
         return []
 
+    def _counter_restarted(self, channel: int, ping_number: int) -> bool:
+        """True when this arrival's key sits far behind the newest key seen.
+
+        A late arrival lags by tens of pings at most (63 measured); a key
+        ``COUNTER_RESTART_PINGS`` or more behind means the device (or the
+        simulator) restarted its counter. Called under self._buf_lock.
+        """
+        if self._max_key_seen is None:
+            return False
+        key = self._offset.key(channel, ping_number)
+        self._max_key_before = self._max_key_seen
+        return key < self._max_key_seen - COUNTER_RESTART_PINGS
+
     def _collect_stale(self, now_ns: int) -> list:
         """Remove groups that have waited long enough to be emitted one-sided.
 
-        Called under self._buf_lock. Bounded three ways, so no group is ever
-        held indefinitely: by how far its ping number has fallen behind the
-        newest one seen, by wall clock, and by a hard cap on live groups.
+        Called under self._buf_lock. ``now_ns`` is a *message stamp* (the
+        newest arrival), so the age test lives on the stream's own clock.
+        Bounded three ways, so no group is ever held indefinitely: by how
+        far its ping number has fallen behind the newest one seen, by
+        stream time, and by a hard cap on live groups.
         """
         out = []
         while self._groups:
@@ -790,25 +846,30 @@ class SSSProcessorNode(Node):
 
         Without this the last group of a run would sit in the buffer until
         the next ping, which may never come -- the stream stopping is exactly
-        when it must not be lost.
+        when it must not be lost. "Stopped" is judged on the wall clock
+        against the last *arrival* (``_last_arrival_wall_ns``), never
+        against a message stamp: stamps run on the stream's clock (Gazebo
+        sim time, a device clock on replay), and comparing them with wall
+        time tore pairs in flight on every timer tick. While the stream is
+        alive the arrival path ages groups in stream time (`_collect_stale`).
         """
-        now_ns = self.get_clock().now().nanoseconds
         with self._buf_lock:
             ready = []
+            idle = (self._last_arrival_wall_ns is not None
+                    and time.monotonic_ns() - self._last_arrival_wall_ns
+                    > ASSEMBLY_MAX_LAG_NS)
+            if not (drain_all or idle):
+                return
             # A run shorter than the pre-roll would otherwise strand every
-            # ping it produced. Only force it once it has gone stale, though:
-            # draining a pre-roll that is still filling would key it at a
-            # half-learned offset, which is what it exists to avoid.
-            if self._preroll and (drain_all or
-                                  now_ns - self._preroll[0][2] > ASSEMBLY_MAX_LAG_NS):
+            # ping it produced. Only force it once the stream has stopped,
+            # though: draining a pre-roll that is still filling would key it
+            # at a half-learned offset, which is what it exists to avoid.
+            if self._preroll:
                 held, self._preroll = self._preroll, None
                 for ch, msg, ns in held:
                     ready.extend(self._insert(ch, msg, ns))
-            if drain_all:
-                ready.extend(self._groups.values())
-                self._groups.clear()
-            else:
-                ready.extend(self._collect_stale(now_ns))
+            ready.extend(self._groups.values())
+            self._groups.clear()
         for group in ready:
             self._emit_group(group)
 
@@ -971,8 +1032,23 @@ class SSSProcessorNode(Node):
         self._pub.publish(out)
 
         self._emitted += 1
-        if port is None or stbd is None:
+        torn = port is None or stbd is None
+        if torn:
             self._one_sided += 1
+        self._torn_recent.append(torn)
+        if len(self._torn_recent) == TORN_WINDOW_ROWS:
+            share = sum(self._torn_recent) / TORN_WINDOW_ROWS
+            if share > TORN_WARN_SHARE and not self._torn_warned:
+                self._torn_warned = True
+                log.warn(
+                    f"{share * 100:.0f}% of the last {TORN_WINDOW_ROWS} rows are "
+                    "one-sided: port and starboard are not being paired. "
+                    "One transducer may be silent, or the two streams are on "
+                    "different clocks; if this started after relaunching the "
+                    "sonar node, the counter re-base should clear it within "
+                    f"{OFFSET_PREROLL_MAX} pings.")
+            elif share < TORN_WARN_SHARE / 2:
+                self._torn_warned = False
 
 
 # ---------------------------------------------------------------------------

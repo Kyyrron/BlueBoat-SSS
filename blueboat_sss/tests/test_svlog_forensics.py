@@ -53,7 +53,7 @@ MIN_DB, MAX_DB = -100.0, 0.0
 def profile_packet(channel: int, ping_number: int, timestamp_ms: int, *,
                    src: int | None = None, length_mm: int = LENGTH_MM,
                    gain_index: int = 4, bottom_sample: int = 200,
-                   heading: float | None = None) -> bytes:
+                   heading: float | None = None, start_mm: int = 0) -> bytes:
     """One framed OS_MONO_PROFILE with a synthetic bottom return.
 
     ``src`` defaults to the value the packet's own side implies, so a test that
@@ -68,7 +68,7 @@ def profile_packet(channel: int, ping_number: int, timestamp_ms: int, *,
     pwr = [1200] * NUM_RESULTS
     for i in range(bottom_sample, min(bottom_sample + 12, NUM_RESULTS)):
         pwr[i] = 61000
-    head = struct.pack(HEAD_FMT, ping_number, 0, length_mm, timestamp_ms, 0,
+    head = struct.pack(HEAD_FMT, ping_number, start_mm, length_mm, timestamp_ms, 0,
                        gain_index, NUM_RESULTS, 15000, channel, 0,
                        66.5e-6, 1.0, MAX_DB, MIN_DB, heading, 0.0)
     payload = head + struct.pack(f"<{NUM_RESULTS}H", *pwr)

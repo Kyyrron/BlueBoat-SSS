@@ -10,6 +10,8 @@ topics:
   vfr_hud: /mavros/vfr_hud
   ping_enable: /side_scan_sonar/ping/enable
   svlog_enable: /sss_processor/log/enable
+  port_profile: /side_scan_sonar/port/profile        # raw OmniscanProfile, native bins
+  starboard_profile: /side_scan_sonar/starboard/profile
   # ---- placeholders: set these once the other repositories are connected ----
   detections: /sss_ai/detections
   pinger: /blueboat/pinger_coordinates  # Float32MultiArray: [x,y,z] body frame, or [x,y] world (fixed_pinger)
@@ -36,14 +38,58 @@ mosaic:
                               # grows with the mission up to this, then the
                               # oldest rows are dropped (replay reserves the
                               # whole log regardless)
+  max_grid_cells: 8000000     # mosaic cell budget: past it the grid coarsens
+                              # (data preserved) so GUI cost/memory stay
+                              # bounded — an overloaded GUI thread starves the
+                              # ROS executor and BEST_EFFORT drops real pings
+  max_render_pixels: 2000000  # cells colormapped per render pass; larger
+                              # grids render decimated (display only)
+  max_extent_m: 5000.0        # a ping that would grow the grid past this
+                              # extent is refused (pose glitch), never allocated
+  mosaic_render_hz: 2.0       # mosaic colormap cadence (sliver-only between
+                              # full renders); the waterfall keeps render_hz
+  waterfall_max_samples: 120000000  # live waterfall cap in rows x columns
+                              # (100 k rows x 1200 native columns)
+  ping_lag_throttle: 40       # pings queued behind the GUI before rendering
+                              # pauses until it catches up (buffers never drop)
+  priority_mode: closest      # overlap policy: average | closest | oldest | newest
+                              # (closest = smallest slant range = SonarView default)
+  nadir_contrast: true        # SonarView-parity display model (see display:
+                              # below): TL + empirical seabed curve, dark nadir
+                              # by colour, no erasing. false = raw dB window.
+  seabed_high_pct: 99.5       # DEPRECATED (no longer read; see display.hi_pct)
+  seabed_low_pct: 5.0         # DEPRECATED (there is no low handle any more)
+  water_column_pct: 90.0      # DEPRECATED
 
 sonar_stream:              # live ProcessedSSSPing reception
   queue_depth: 200         # BEST_EFFORT cannot retransmit -> buffer instead
   warn_on_ping_gap: true
+  profile_queue_depth: 200 # raw OmniscanProfile queue (same reasoning)
+  profile_cache_per_side: 512
+  profile_wait_ms: 60      # a processed row waits this long for its profiles
+
+display:                   # the ONE dB->pixel model (core/display_model.py)
+  tl_k: 40.0               # two-way spreading, dB per decade of slant range
+  tl_alpha_db_per_m: 0.10  # absorption at 450 kHz
+  x_bins: 40               # empirical seabed curve A(r/h): bins in log10(r/h)
+  x_max: 30.0
+  min_bin_count: 100       # sparser bins blend toward the Lambert prior
+  warmup_rows: 300         # live: rows observed before the model freezes
+  hi_pct: 95.0             # window top = this percentile of the seabed level
+  gamma: 0.7               # transfer exponent (1 = linear power, 0.5 = amplitude)
+  knee: 0.7                # soft knee above this brightness (1.0 = hard clip)
+  curve_tolerance_db: 6.0  # seabed curve may leave its physical line by this much
 
 depth:                     # slant-range correction source
-  mode: auto               # auto | manual | off  (off == SonarView "Manual 0 m")
+  mode: "off"              # auto | manual | off  (off == SonarView "Manual 0 m", default)
+                           # quoted: bare off is YAML boolean false
   manual_m: 0.0
+  blank_nadir: true        # blank the transmit ringing on the GROUND projection
+                           # (mosaic) only, so it never splats the track line in
+                           # `off` mode. The raw-slant waterfall + AI pictures keep
+                           # every sample and darken the nadir by the colour window.
+  nadir_blank_m: 0.75      # ringing blank radius for the mosaic ground projection
+  nadir_max_fraction: 0.5  # cap on the blank, as a share of the slant extent
 
 alignment:                 # sea-trial pose alignment (see settings.py)
   pose_source: auto        # auto | embedded | gcs
@@ -54,9 +100,10 @@ alignment:                 # sea-trial pose alignment (see settings.py)
   pinger_stale_after_s: 10.0  # hide the marker after this without a fix
 
 seabed:                    # AI seabed imaging (waterfall domain)
-  rows: 256                # pings per image
-  stride: 128              # new image every N pings (50 % overlap)
+  rows: 256                # picture rows per image
+  stride: 128              # new image every N rows (50 % overlap)
   columns: 800
+  row_geometry: square     # square (speed-corrected, PROVISIONAL) | ping (1 row = 1 ping)
 
 interpolation:
   max_gap_m: 0.75

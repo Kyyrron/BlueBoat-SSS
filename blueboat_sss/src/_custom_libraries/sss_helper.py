@@ -147,6 +147,7 @@ def project_side(
     altitude_m: float,
     transducer_y_offset_m: float,
     side_sign: float,
+    blank_slant_m: Optional[float] = None,
 ) -> Tuple[List[float], List[float]]:
     """Slant-range-correct one side, drop water-column samples.
 
@@ -155,17 +156,44 @@ def project_side(
 
     Assumes the seabed is locally flat under each ping (standard SSS
     practice with single-beam data).
+
+    Two distinct jobs, deliberately separate arguments (the GCS twin
+    `blueboat_gcs.core.svlog.project_side` carries the identical split,
+    and the two are compared sample-for-sample by the test suite):
+
+    * `altitude_m` is the **correction** altitude — it sets where a
+      sample lands, `ground = sqrt(slant^2 - h^2)`. `0.0` is an identity
+      transform: ground range = slant range, nothing corrected.
+    * `blank_slant_m` is the **nadir blank** radius — a small fixed
+      distance removing the transmit ringing right under the transducer.
+      It is deliberately narrow and is *not* the water column: measured
+      on the field corpus the profile leaves the transducer at ~55 dB,
+      brighter than any seabed return, and decays to 33 dB by 1 m, after
+      which the water column is darker than the seabed and is honest
+      data. `None` (the default) means no blank, i.e. the historical
+      behaviour where `altitude_m` alone decided the cut.
+
+    This node passes no blank: it has no depth-mode selector and always
+    corrects with the tracked altitude, which already cuts everything
+    inside the water column, ringing included. The argument exists for
+    the GCS's replay path, where the selector can set the correction to
+    0 — and where the water column must stay on screen, because the
+    waterfall, the mosaic and the AI tiles all have to be continuous.
     """
     y_out: List[float] = []
     db_out: List[float] = []
     start_m = start_mm / 1000.0
     length_m = length_mm / 1000.0
     denom = max(num_results - 1, 1)
+    # max() with the correction altitude is load-bearing: it keeps the
+    # sqrt below out of the negative domain.
+    cut = (altitude_m if blank_slant_m is None
+           else max(altitude_m, float(blank_slant_m)))
     for i in range(len(pwr_db)):
         slant = start_m + (i / denom) * length_m
-        if slant <= altitude_m:
+        if slant <= cut:
             continue  # water column
-        ground = math.sqrt(slant * slant - altitude_m * altitude_m)
+        ground = math.sqrt(max(slant * slant - altitude_m * altitude_m, 0.0))
         y_out.append(float(side_sign * (transducer_y_offset_m + ground)))
         db_out.append(float(pwr_db[i]))
     return y_out, db_out

@@ -73,7 +73,11 @@ class DisplaySettings:
     * ``gamma``           — contrast curve (1 = linear, <1 brightens
       mid-tones, >1 darkens them);
     * ``brightness``      — post-gamma offset in [-0.5, +0.5];
-    * ``colormap``        — one of :func:`lut_names`.
+    * ``colormap``        — one of :func:`lut_names`;
+    * ``range_equalize``  — DEPRECATED, unused (kept so recorded
+      ``display_settings_at_end`` metadata and old callers still load).
+      Range normalisation is the display model's job
+      (``core/display_model``), always on with ``mosaic.nadir_contrast``.
 
     Raw grids/buffers are never modified; this maps values to pixels.
     """
@@ -84,6 +88,7 @@ class DisplaySettings:
     gamma: float = 1.0
     brightness: float = 0.0
     colormap: str = "Copper"
+    range_equalize: bool = False
 
     def with_(self, **kw) -> "DisplaySettings":
         return replace(self, **kw)
@@ -114,6 +119,10 @@ class MosaicRenderer:
             vmax = vmin + 1e-6
         return float(vmin), float(vmax)
 
+    def auto_limits(self, values: np.ndarray) -> Tuple[float, float]:
+        """The percentile window this renderer would pick for ``values``."""
+        return self._auto_limits(values)
+
     def to_rgba(self, values: np.ndarray,
                 limits: Optional[Tuple[float, float]] = None) -> np.ndarray:
         """(H, W) float raster (NaN = empty) -> (H, W, 4) uint8 RGBA.
@@ -130,20 +139,38 @@ class MosaicRenderer:
             vmin, vmax = self._auto_limits(values)
         else:
             vmin, vmax = s.vmin_db, max(s.vmax_db, s.vmin_db + 1e-6)
+        # One float32 working copy, every step in place: this function
+        # is the live GUI's single hottest call (a 512 x 1200 waterfall
+        # tile or a 2 M-pixel mosaic raster, several times a second), and
+        # the previous boolean-mask round trips cost 3x this. Empty cells
+        # map to vmin -> index 0 and alpha 0, exactly as before.
         finite = np.isfinite(values)
-        norm = np.zeros_like(values, dtype=np.float32)
-        norm[finite] = np.clip((values[finite] - vmin) / (vmax - vmin),
-                               0.0, 1.0)
+        norm = np.array(values, dtype=np.float32, copy=True)
+        np.nan_to_num(norm, copy=False, nan=vmin, posinf=vmax, neginf=vmin)
+        norm -= np.float32(vmin)
+        norm *= np.float32(1.0 / (vmax - vmin))
+        np.clip(norm, 0.0, 1.0, out=norm)
         if s.gamma != 1.0:
-            norm[finite] = norm[finite] ** np.float32(s.gamma)
+            np.power(norm, np.float32(s.gamma), out=norm)
         if s.brightness != 0.0:
-            norm[finite] = np.clip(norm[finite] + np.float32(s.brightness),
-                                   0.0, 1.0)
-        idx = (norm * 255).astype(np.uint8)
-        rgba = np.zeros((*values.shape, 4), dtype=np.uint8)
+            norm += np.float32(s.brightness)
+            np.clip(norm, 0.0, 1.0, out=norm)
+        norm *= np.float32(255.0)
+        idx = norm.astype(np.uint8)
+        rgba = np.empty((*values.shape, 4), dtype=np.uint8)
         rgba[..., :3] = lut(s.colormap)[idx]
-        rgba[..., 3] = np.where(finite, 255, 0)
+        np.multiply(finite, np.uint8(255), out=rgba[..., 3], casting="unsafe")
         return rgba
+
+    @staticmethod
+    def rgba_to_qimage(rgba: np.ndarray, flip: bool = True) -> QImage:
+        """RGBA (row 0 = ymin) -> QImage (row 0 drawn at the top)."""
+        if flip:
+            rgba = np.flipud(rgba)
+        rgba = np.ascontiguousarray(rgba)
+        h, w = rgba.shape[:2]
+        img = QImage(rgba.data, w, h, 4 * w, QImage.Format_RGBA8888)
+        return img.copy()  # detach from the numpy buffer lifetime
 
     def to_qimage(self, values: np.ndarray, flip: bool = True,
                   limits: Optional[Tuple[float, float]] = None) -> QImage:

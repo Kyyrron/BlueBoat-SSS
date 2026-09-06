@@ -17,15 +17,21 @@ from blueboat_gcs.core.waterfall_service import _TILE_ROWS, WaterfallService
 from blueboat_gcs.models.sonar import SonarPing
 
 RANGE_M = 18.0
-N_SAMPLES = 64
+N_BINS = 64
+DEPTH = 2.0
 
 
 def make_ping(i: int) -> SonarPing:
-    y = np.linspace(RANGE_M, -RANGE_M, N_SAMPLES)
+    """Uniform slant-bin ping (water column cut), like the processor's."""
+    pitch = RANGE_M / N_BINS
+    slant = np.arange(N_BINS) * pitch
+    keep = slant > DEPTH
+    ground = np.sqrt(slant[keep] ** 2 - DEPTH ** 2)
+    y = np.concatenate([ground, -ground])
     return SonarPing(
         t=float(i), robot_x=float(i), robot_y=2.0 * i, yaw=0.1,
-        water_depth=2.0, y_local=y,
-        intensity_db=np.full(N_SAMPLES, -20.0 - (i % 50) * 0.5, np.float32),
+        water_depth=DEPTH, y_local=y,
+        intensity_db=np.full(y.size, -20.0 - (i % 50) * 0.5, np.float32),
         slant_range_m=RANGE_M)
 
 
@@ -47,7 +53,7 @@ def test_buffer_grows_past_the_old_ring_size(service):
         service.on_sonar_ping(make_ping(i))
     assert service.total_rows == n
     chrono = service.chronological()
-    assert chrono.shape == (n, service._cols)
+    assert chrono.shape == (n, service.columns)
     # The head of the mission is still there — the whole point.
     assert _row_value(chrono, 0) == pytest.approx(-20.0)
     assert _row_value(chrono, n - 1) == pytest.approx(-20.0 - ((n - 1) % 50) * 0.5)
@@ -112,7 +118,7 @@ def test_render_emits_tiles_and_layout(service):
         service.on_sonar_ping(make_ping(i))
     service.set_enabled(True)                       # forces a full render
     assert layouts and layouts[-1][:3] == (0, 2 * _TILE_ROWS + 10,
-                                           service._cols)
+                                           service.columns)
     assert sorted(tiles) == [0, _TILE_ROWS, 2 * _TILE_ROWS]
 
     # A new ping dirties only the tail tile (the global contrast window
@@ -144,8 +150,9 @@ def test_export_full_npz_and_decimated_png(qapp, tmp_config, tmp_path,
         svc.on_sonar_ping(make_ping(i))
     assert svc.export_into(tmp_path / "waterfall")
     with np.load(tmp_path / "waterfall" / "waterfall_raw.npz") as npz:
-        assert npz["intensity_db"].shape == (n, svc._cols), (
-            "the npz must stay full fidelity — it is the dataset source")
+        assert npz["intensity_db"].shape == (n, svc.columns), (
+            "the npz must stay full fidelity — the archival raw record")
+        assert float(npz["slant_pitch_m"]) == pytest.approx(RANGE_M / N_BINS)
         assert int(npz["png_row_stride"]) == 3
     png = cv2.imread(str(tmp_path / "waterfall" / "waterfall.png"),
                      cv2.IMREAD_UNCHANGED)

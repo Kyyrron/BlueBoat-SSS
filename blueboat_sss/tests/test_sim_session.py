@@ -155,7 +155,12 @@ def test_sim_start_stop_cycle(sim_app):
     shape = observed["waterfall_shape"]
     assert shape is not None, "waterfall buffer never received a row"
     rows, cols = shape
-    assert cols == 800, f"waterfall column count {cols}, expected 800"
+    # Native slant-bin layout: one column per device bin per side —
+    # nothing is forced onto a fixed 800-column grid any more.
+    from blueboat_gcs.sim import simulator as sim_mod
+    assert cols == 2 * sim_mod._SAMPLES_PER_SIDE, (
+        f"waterfall column count {cols}, expected "
+        f"{2 * sim_mod._SAMPLES_PER_SIDE} (native bins)")
     assert rows == len(h.pings), (
         f"{rows} waterfall rows for {len(h.pings)} pings — the viz gate "
         "dropped rows that reached the bus")

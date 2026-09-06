@@ -67,8 +67,10 @@ WATERFALL_COLUMNS = 800
 #: for the full record.
 MAX_WATERFALL_ROWS = 3000
 
-#: Display stretch, identical to ``core.seabed_imager.SeabedImage.to_png8`` —
-#: the documented convention for every PNG this project writes.
+#: Plain percentile stretch for the raw forensic before/after waterfalls.
+#: This is the legacy 2-98 % fallback only — the app's PNGs now go through
+#: the display model (``core.display_model``: TL + seabed curve + transfer);
+#: forensics stays raw on purpose (see ``_to_png8``).
 CONTRAST_PERCENTILES = (2.0, 98.0)
 
 #: Known packet ids, for annotation only. An id absent from this table is
@@ -638,7 +640,13 @@ def _track_altitudes(groups: Sequence[Tuple[int, Dict[int, _Head]]],
 # Waterfall rendering
 # ---------------------------------------------------------------------------
 def _to_png8(img: np.ndarray) -> np.ndarray:
-    """2-98 % display stretch, identical to ``SeabedImage.to_png8``."""
+    """Plain 2-98 % display stretch for the forensic before/after pair.
+
+    Deliberately *raw*: this diagnostic shows the untouched slant vs
+    corrected-ground geometry (and the pre-TVG range falloff) as-is, so it
+    does NOT apply the app's seabed-referenced EGN + nadir-aware window
+    (``core.display_model`` / ``SeabedImage.to_png8``). Do not "fix" it to match
+    the app — the raw stretch is the point of a forensics view."""
     finite = np.isfinite(img)
     if not finite.any():
         return np.zeros(img.shape, np.uint8)
@@ -911,9 +919,15 @@ def render_report(r: Forensics, *, generated: Optional[str] = None) -> str:
         L.append(f"![slant]({r.images['waterfall_slant'].name}) "
                  f"![ground]({r.images['waterfall_ground'].name})")
         L.append("")
-        L.append(f"`waterfall_slant.png` applies no correction (ground = slant); "
+        L.append(f"`waterfall_slant.png` applies no correction and **keeps the "
+                 f"water column** — deliberately the truly raw geometry, which is "
+                 f"what makes the nadir noise visible here rather than masked; "
                  f"`waterfall_ground.png` uses the tracked altitude and drops the "
-                 f"water column. {WATERFALL_COLUMNS} columns, port (+y) on the "
+                 f"water column. (The GCS display also blanks the first 0.75 m of "
+                 f"slant range in every mode — the transmit ringing — which this "
+                 f"pair does not, so the two images stay a before/after of the "
+                 f"correction alone.) "
+                 f"{WATERFALL_COLUMNS} columns, port (+y) on the "
                  f"left, row stride {r.waterfall_stride}, 2–98 % display "
                  f"stretch.")
         L.append("")

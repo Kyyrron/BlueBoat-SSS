@@ -13,6 +13,16 @@ confirmed. Items that cannot be checked from a Windows laptop are marked with wh
 Every item below is in `blueboat_sss` and is required before live/recorded data is
 correct at the source. All were re-confirmed present in the current code.
 
+- [ ] **Live re-check of the 2026-09-03 row-tearing fix.** Offline replay through
+  `_accept` and the 31 assembly tests pass; still to confirm on a live run: relaunch
+  the sonar node (sim or real) under a running `sss_processor` and check
+  `ros2 topic hz /sss_processor/processed` stays at the ping rate (not 2×) and
+  `starboard_ping_number` is non-zero on every message after ≤ 24 pings.
+- [ ] **Live 10-minute run after the 2026-09-03 GCS throughput fix.** The
+  benchmark is offline; confirm on a real 20 Hz two-sided stream that the app's
+  CPU and RSS stay flat (`top`), the waterfall follows without lag, the mosaic
+  cell size reads ~0.026 m at 15 m / 600 bins, no "display N pings behind" status
+  appears at rest, and Contrast-slider drags do not freeze the window.
 - [ ] **Investigate the ~8 % ping loss.** Root cause unconfirmed. Candidates, in order:
       (a) `BEST_EFFORT` depth 10 on both hops — try `RELIABLE` depth 50 on *both* ends
       together; (b) confirmed still present — `msg.data = list(raw)` at
@@ -61,11 +71,31 @@ correct at the source. All were re-confirmed present in the current code.
 
 ## Unresolved technical questions
 
-- [ ] **SonarView still renders better than us at identical range settings.** Not
-      solved. Working hypothesis is that the residual gap was mostly the old fixed
-      0.25 m mosaic grid (now adaptive) plus the 19.8 % mis-tagging — but this is an
-      assumption. Needs a clean paired comparison after the retag patch, on one log,
-      same range, same colormap. **Blocked on field data (see below).**
+- [x] **SonarView still renders better than us at identical range settings.**
+      Resolved 2026-09-05 for the waterfall, the AI pictures and the mosaic by the one
+      display model (`core/display_model.py`; `docs/SCIENTIFIC_BACKGROUND.md`): TL
+      removed, per-side seabed curve in `r/h` (histogram mode), power-law transfer, no
+      low handle; live path fed the raw profiles (`core/live_native.py`); true-scale
+      view; square-pixel pictures. Rendered against SonarView's picture of the same
+      2026-09-04 simulation log: black nadir with the thin bottom line, uniform seabed
+      near-to-far, black shadows behind the walls, no vertical bands
+      (`gamma 0.7`, `hi_pct 95` matched SonarView's median seabed brightness).
+- [ ] **Live re-check of the 2026-09-05 raw-profile attach.** On a real 20 Hz two-sided
+      stream (processor + GCS on the sim graph or the boat) confirm the console never
+      prints the "rows had no raw profile in time" line at rest, `profile_misses`
+      stays near 0 on the listener, the live waterfall shows the water column and the
+      thin bottom line exactly like the replay of the recorded `.svlog`, and the
+      model freezes after `display.warmup_rows` (every tile re-renders once). Needs a
+      running processor — unverifiable from this repository.
+- [ ] **Square-pixel seabed pictures are PROVISIONAL (`seabed.row_geometry: square`,
+      2026-09-05).** Evaluate on the first real labelled set whether the detector does
+      better than with one-row-per-ping tiles; if not, revert with the one config line
+      `seabed.row_geometry: ping` (the old contract, kept in code and tests).
+- [ ] **Display model on the field corpus.** `gamma` / `hi_pct` / `warmup_rows` were
+      calibrated on the simulation log and two local field logs; check the per-side
+      curves on the external corpus (80 m logs, low altitudes) and the mosaic's
+      normalised planes against SonarView's mosaic at the same range/colormap.
+      **Blocked on field data (see below).**
 - [ ] **`RINGING_SEARCH_MAX` is a sample count, so its physical meaning moves with
       the range setting.** `src/sss_processor_node.py:114` fixes the ringing search
       horizon at 60 samples and `find_noise_window_start`'s fallback at 30

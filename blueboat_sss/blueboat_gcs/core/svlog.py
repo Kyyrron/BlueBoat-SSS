@@ -43,7 +43,7 @@ from typing import (Callable, Deque, Iterator, List, Optional, Sequence,
 import numpy as np
 
 from ..models.robot_state import RobotState
-from ..models.sonar import SonarPing
+from ..models.sonar import SonarPing, native_from_profile
 from ..utils.geodesy import yaw_to_compass_deg
 
 # ---------------------------------------------------------------------------
@@ -363,12 +363,46 @@ def detect_fbr_slant_m(db: np.ndarray, start_mm: int, length_mm: int,
 
 def project_side(db: np.ndarray, start_mm: int, length_mm: int,
                  num_results: int, altitude_m: float,
-                 y_offset_m: float, side_sign: float
+                 y_offset_m: float, side_sign: float,
+                 blank_slant_m: Optional[float] = None
                  ) -> Tuple[np.ndarray, np.ndarray]:
-    """Slant-range correction dropping the water column (vectorized)."""
+    """Slant-range correction dropping the water column (vectorized).
+
+    ``altitude_m`` and ``blank_slant_m`` are two different jobs that used
+    to be one number:
+
+    * ``altitude_m`` is the **correction** altitude — it sets where a
+      sample lands, ``ground = sqrt(slant^2 - h^2)``. It is what the
+      ``Depth comp.`` selector chooses, and ``0.0`` means "no correction,
+      ground range = slant range".
+    * ``blank_slant_m`` is the **nadir blank** radius — a small fixed
+      distance, removing the transmit ringing right under the transducer.
+      It is deliberately independent of the selector, and deliberately
+      *narrow*: it is not the water column. ``None`` disables it, which is
+      what ``svlog_forensics``'s raw-slant render wants ("the truly raw
+      geometry").
+
+    The blank is small on purpose. Measured on
+    ``diffDepthCompensation.svlog``, the profile leaves the transducer at
+    **55 dB**, brighter than any seabed return in the file, and decays
+    through 43 dB at 0.27 m to 33 dB at 1 m; past that the water column
+    settles to 16–28 dB, which is *darker* than the seabed and is honest
+    data that belongs on screen. Blanking out to the altitude instead —
+    9.4 m on that log — punches a hole through every image and breaks the
+    continuity the AI tiles and the mosaic depend on. Only the bright core
+    is an artefact.
+
+    Samples inside the mask are **removed from the arrays**, never set to
+    NaN: ``MosaicGrid.add_samples`` accumulates intensities with no
+    finiteness filter, so one NaN would poison its cells permanently.
+    """
     i = np.arange(len(db), dtype=np.float64)
     slant = start_mm / 1000.0 + (i / max(num_results - 1, 1)) * (length_mm / 1000.0)
-    keep = slant > altitude_m
+    # max() with the correction altitude is load-bearing: it keeps
+    # sqrt(slant^2 - h^2) out of the negative domain.
+    cut = altitude_m if blank_slant_m is None else max(altitude_m,
+                                                       float(blank_slant_m))
+    keep = slant > cut
     ground = np.sqrt(np.maximum(slant[keep] ** 2 - altitude_m ** 2, 0.0))
     y = side_sign * (y_offset_m + ground)
     return y.astype(np.float64), db[keep].astype(np.float32)
@@ -429,6 +463,17 @@ class FBRTracker:
         self._last_known: Optional[float] = None
         self.locked = False
 
+    @property
+    def bottom(self) -> float:
+        """Best bottom slant estimate regardless of lock/mode (0 if none).
+
+        Used to split each ping into its water-column band and its seabed
+        return for the display contrast window, so the nadir darkens even
+        when the correction mode is ``off``/``manual`` (where the applied
+        ``water_depth`` is 0)."""
+        v = self._altitude if self._altitude is not None else self._last_known
+        return float(v) if v is not None else 0.0
+
     def update(self, port_alt, stbd_alt) -> Optional[float]:
         p, s = self._port.update(port_alt), self._stbd.update(stbd_alt)
         if p is not None and s is not None:
@@ -457,26 +502,58 @@ def resolve_altitude(tracker: "FBRTracker", port_alt, stbd_alt,
                      manual_m: float = 0.0) -> Tuple[float, bool]:
     """Depth-compensation policy -> (altitude_m, locked).
 
-    Mirrors SonarView's "Depth Compensation" source selector:
+    Mirrors SonarView's "Depth Compensation" source selector, which governs
+    the **slant-range correction** and nothing else:
 
     * ``auto``   — bottom detection (our FBR tracker), provisional value
       accepted so no ping is ever discarded; falls back to 0.0 (no
       correction) while nothing has ever been detected;
     * ``manual`` — a fixed operator-supplied altitude;
-    * ``off``    — altitude 0: ground range = slant range, no water
-      column removed. This is SonarView's "Manual / 0 m" mode, which on
-      shallow data (h << R) is very close to the corrected geometry and
-      is far more robust than a wrong altitude, because an over-estimated
-      altitude both deletes real samples and warps the near range.
+    * ``off``    — altitude 0: ground range = slant range. This is
+      SonarView's "Manual / 0 m" mode, which on shallow data (h << R) is
+      very close to the corrected geometry and is far more robust than a
+      wrong altitude, because an over-estimated altitude both deletes real
+      samples and warps the near range.
+
+    In ``auto`` this altitude is also what cuts the water column, since
+    ``sqrt(slant² − h²)`` has nothing to place below it. In ``off`` nothing
+    is cut and the water column stays on screen — which is correct, and is
+    what keeps the picture continuous. The separate, much narrower
+    **nadir blank** (see ``nadir_blank_m``) is what removes the transmit
+    ringing; the two are not the same thing and must not be fused.
+
+    The tracker is advanced on **every** ping in every mode. It used to be
+    skipped for ``off`` and ``manual``, so it never bootstrapped there and
+    ``water_depth`` / the bottom-fraction warning were dead in those modes.
     """
+    tracked = tracker.update(port_alt, stbd_alt)
     if mode == "off":
         return 0.0, True
     if mode == "manual":
         return float(manual_m), True
-    alt = tracker.update(port_alt, stbd_alt)
-    if alt is None:
+    if tracked is None:
         return 0.0, False
-    return float(alt), tracker.locked
+    return float(tracked), tracker.locked
+
+
+def clamp_nadir_mask(mask_m: Optional[float], start_mm: int, length_mm: int,
+                     max_fraction: float) -> Optional[float]:
+    """Cap the nadir blank so it can never swallow a meaningful swath.
+
+    The blank is a small fixed distance, so on any sane range setting this
+    is inert. It exists because a hand-edited ``nadir_blank_m`` larger than
+    the range would otherwise empty the ping, and an all-NaN row means
+    "session gap" to every downstream accumulator
+    (``WaterfallService.break_row`` and the replay tests that count exactly
+    one blank row across the Cerulean demo).
+
+    The cap applies to the blank only: ``project_side`` takes
+    ``max(correction, blank)``, so ``auto``'s water-column cut is untouched.
+    """
+    if mask_m is None:
+        return None
+    extent = (start_mm + length_mm) / 1000.0
+    return min(float(mask_m), max(max_fraction, 0.0) * extent)
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +655,10 @@ class SvlogMission:
 def load_svlog(path: Path,
                progress: Optional[Callable[[float], None]] = None,
                depth_mode: str = "auto",
-               manual_depth_m: float = 0.0) -> SvlogMission:
+               manual_depth_m: float = 0.0,
+               blank_nadir: bool = True,
+               nadir_blank_m: float = 0.75,
+               nadir_max_fraction: float = 0.5) -> SvlogMission:
     """Read + process an entire .svlog into a SvlogMission.
 
     Five behaviours differ deliberately from the original implementation,
@@ -613,6 +693,16 @@ def load_svlog(path: Path,
        recordings; packet id 10 marks each. Segments are surfaced and the
        dead time between them is emitted as a ``MissionGap`` event, so no
        consumer joins across it.
+    6. **The transmit ringing is blanked in every mode.** ``depth_mode``
+       chooses the *correction* altitude only. Independently of it, the
+       first ``nadir_blank_m`` of slant range is removed: the profile
+       leaves the transducer at 55 dB — brighter than any seabed return —
+       and that spike used to sit right under the boat in every ``off``
+       image and splat onto the track line in the mosaic. The rest of the
+       water column stays, because it is darker than the seabed and
+       because the pictures have to be continuous.
+       ``blank_nadir=False`` disables it; ``nadir_max_fraction`` caps it
+       so a mis-set value can never empty a row.
 
     ``progress`` (0..1) is called periodically for GUI progress dialogs.
     """
@@ -838,10 +928,20 @@ def load_svlog(path: Path,
     # ---- assemble: one row per ping_number, one-sided rows included ----
     fbr = FBRTracker()
     order.sort()                       # restores acquisition order exactly
+    prev_key = None
     for i, key in enumerate(order):
         if progress is not None and i % 500 == 0:
             progress(0.5 + 0.5 * i / max(len(order), 1))
         g = groups[key]
+        # Device pings lost right before this one (a jump in the
+        # normalised counter within one segment): rendered downstream as
+        # blank waterfall lines, so real acquisition loss stays visible.
+        gap_before = 0
+        if prev_key is not None and prev_key[0] == key[0]:
+            missing = key[1] - prev_key[1] - 1
+            if 0 < missing < 1000:
+                gap_before = int(missing)
+        prev_key = key
         pose = g["pose"]
         if pose is None:
             mission.dropped_no_pose += 1
@@ -856,21 +956,52 @@ def load_svlog(path: Path,
             db_s = scale_to_db(s["pwr"], s["min_pwr_db"], s["max_pwr_db"])
             alt_s = detect_fbr_slant_m(db_s, s["start_mm"], s["length_mm"],
                                        s["num_results"])
-        altitude, locked = resolve_altitude(fbr, alt_p, alt_s,
-                                            depth_mode, manual_depth_m)
+        altitude, locked = resolve_altitude(fbr, alt_p, alt_s, depth_mode,
+                                            manual_depth_m)
+        mask = float(nadir_blank_m) if blank_nadir else None
         if not locked:
             mission.unlocked_pings += 1
         ys, ins = [], []
+        # Native slant-bin payload for the raw-domain waterfall / seabed
+        # pictures: project_side keeps a contiguous tail of the device's
+        # uniform bin grid, so per side the native record is (first kept
+        # bin index, the kept dB values verbatim, the bin size).
+        # Native slant-bin payload carries the **full raw dB** of every
+        # bin (bin0 = 0), water column and transmit ringing included, so
+        # the raw-slant waterfall and the AI pictures erase nothing — the
+        # nadir is darkened by the display colour window instead. The
+        # ground projection below keeps the water-column/ringing cut
+        # (mask) so it never splatters the boat track in the mosaic.
+        nat = {"bin_size_m": 0.0, "port_bin0": 0, "port_db": None,
+               "stbd_bin0": 0, "stbd_db": None, "stbd_bin_size_m": 0.0}
         if p is not None:
             y, iv = project_side(db_p, p["start_mm"], p["length_mm"],
                                  p["num_results"], altitude,
-                                 TRANSDUCER_Y_OFFSET_PORT_M, +1.0)
+                                 TRANSDUCER_Y_OFFSET_PORT_M, +1.0,
+                                 clamp_nadir_mask(mask, p["start_mm"],
+                                                  p["length_mm"],
+                                                  nadir_max_fraction))
             ys.append(y); ins.append(iv)
+            nat["port_bin0"], nat["bin_size_m"] = native_from_profile(
+                p["start_mm"], p["length_mm"], p["num_results"])
+            nat["port_db"] = db_p
         if s is not None:
             y, iv = project_side(db_s, s["start_mm"], s["length_mm"],
                                  s["num_results"], altitude,
-                                 TRANSDUCER_Y_OFFSET_STBD_M, -1.0)
+                                 TRANSDUCER_Y_OFFSET_STBD_M, -1.0,
+                                 clamp_nadir_mask(mask, s["start_mm"],
+                                                  s["length_mm"],
+                                                  nadir_max_fraction))
             ys.append(y); ins.append(iv)
+            # Both sides always ride along, each at its own pitch: two
+            # units configured at different ranges used to drop the
+            # starboard payload silently (a one-sided row tagged "both").
+            nat["stbd_bin0"], delta_s = native_from_profile(
+                s["start_mm"], s["length_mm"], s["num_results"])
+            nat["stbd_db"] = db_s
+            nat["stbd_bin_size_m"] = delta_s
+            if nat["bin_size_m"] == 0.0:
+                nat["bin_size_m"] = delta_s
         if not ys:
             continue
         ref = p if p is not None else s
@@ -882,7 +1013,11 @@ def load_svlog(path: Path,
             intensity_db=np.concatenate(ins),
             slant_range_m=ref["length_mm"] / 1000.0,
             sides=("both" if (p is not None and s is not None)
-                   else ("port" if p is not None else "starboard")))))
+                   else ("port" if p is not None else "starboard")),
+            gap_before=gap_before,
+            bottom_slant_m=fbr.bottom,
+            gain_index=int(ref.get("gain_index", -1)),
+            **nat)))
         mission.ping_count += 1
         if p is not None and s is not None:
             mission.both_sides += 1

@@ -198,23 +198,94 @@ the same quantity our FBR tracker estimates.
 
 Two questions answered:
 
-* **"Why does the waterfall change when I change it?"** Because the waterfall is *not*
-  raw data — in SonarView, as in our app, it is displayed in **corrected ground
-  range**. Changing the altitude changes `ground = sqrt(slant² − h²)` and therefore
-  every column position. Only `intensity_db` vs slant sample index is truly raw.
-* **"Why does Manual / 0 m look better?"** Because with `h = 0` no samples are
-  discarded and no warping is applied. For shallow water (`h << R`) ground range ≈
-  slant range anyway, so a *wrong* altitude is far more damaging than *no* correction:
-  an over-estimated altitude both deletes real samples and compresses the near range.
-  With our 80 m logs the altitude estimate wandered between 4.7 m and 45 m
-  (p10 4.67, p90 15.23), so "off" genuinely was the better choice on that data.
+* **"Why does the waterfall change when I change it?"** In our app it **no longer
+  does** (2026-09-02): the waterfall and the AI pictures draw the **raw slant-bin
+  domain** (one column per device bin, verbatim dB), so the `Depth comp.` selector
+  governs only the **mosaic** (ground range = `sqrt(slant² − h²)`). Only the mosaic
+  warps with altitude now.
+* **"Why does Manual / 0 m look better?"** Because with `h = 0` no warping is
+  applied. For shallow water (`h << R`) ground range ≈ slant range anyway, so a
+  *wrong* altitude is far more damaging than *no* correction: an over-estimated
+  altitude both deletes real samples and compresses the near range. With our 80 m logs
+  the altitude estimate wandered between 4.7 m and 45 m (p10 4.67, p90 15.23), so
+  "off" genuinely was the better choice on that data.
 
 **Fix (implemented).** A `Depth comp.` selector in the right panel with the same three
 options — `Auto (bottom detect)`, `Manual`, `Off (no correction)` — wired to both the
 live view and the replay window. Changing it in the replay window re-processes the log,
 mirroring SonarView's behaviour.
 
----
+### 5.1 The transmit ringing is blanked; the water column is not
+
+Right under the transducer the profile leaves at **55 dB**, and the *brightest*
+seabed return anywhere in the file is 54.8 dB (p99). That near-field spike is
+transmit ringing, not seabed, and it sat as a bright core down the middle of every
+`off` image and splatted onto the track line in the mosaic.
+
+Everything past it is real. Measured on `diffDepthCompensation.svlog`:
+
+| slant range | median dB | |
+|---|---|---|
+| 0.00 m | 55.2 | ringing, brighter than any seabed return |
+| 0.30 m | 43.3 | still above the median seabed |
+| **0.73 m** | **36.5** | **crosses the median seabed level (36.5 dB)** |
+| 1.00 m | 33.2 | now darker than the seabed |
+| 2.00 m | 27.6 | water column proper |
+| 6.00 m | 16.5 | water-column floor |
+| ~9.4 m | 27.9 → 42.6 | the bottom return |
+| 13.4 / 20 m | 39.5 / 25.6 | seabed |
+
+Note the crossing at 20 m: the seabed's own far return is **25.6 dB**, *darker* than
+the water column at 2 m. So the water column cannot be separated from the seabed by
+level, and no contrast window can black it out without blacking out the outer swath
+too — its mid-tone appearance is honest, and it is what SonarView shows as well.
+
+**Fix — one display model (2026-09-05; supersedes the 2026-09-03 seabed-referenced
+EGN and the interim 2026-09-02 raw single-window).** The table above is the whole
+story: the seabed's far return (25.6 dB at 20 m) is *darker* than the water column at
+2 m (27.6 dB), so **no single window over raw dB can separate them** — whatever blacks
+out the water column also blacks out the far seabed. SonarView's answer, and now ours,
+is to **flatten the range falloff first**, then window. The 2026-09-03 attempt did that
+with a per-column *mean* seabed reference and a 5th-percentile low handle; measured on
+the 2026-09-04 simulation log both were contaminated by the 5–14 % of samples that are
+acoustic shadows (15–40 dB below the seabed), which put the low handle ~30 dB under the
+seabed — the water column (only 15–35 dB under) rendered at 70–90 % brightness with the
+ringing gradient on top (the "weird nadir"), shadows rendered as grey noise, and any
+wall or shadow at a fixed range biased its column's mean into a vertical band.
+`core/display_model.py` replaces it (background, references and measurements in
+`SCIENTIFIC_BACKGROUND.md`):
+
+1. **Normalisation** `e = db + TL(r) − A_side(r/h)`: the deterministic two-way
+   transmission loss `TL(r) = 40·log10 r + 0.2·r` removed, then an empirical seabed
+   curve `A` in normalised slant range `x = r/h` (`h` the tracked bottom) divided out —
+   per side, the **mode** of each log-spaced `x` bin's level histogram over seabed
+   samples, median-filtered across bins. The mode is immune to shadows, walls and
+   targets as long as plain seabed holds the plurality of a bin; the `x` axis makes the
+   curve altitude- and range-invariant. For `x < 1` `A` holds `A(1)`, so the
+   extrapolated `TL` sends the water column and the ringing toward black by physics.
+2. **Transfer** `u = clip(10^(γ(e − hi)/10), 0, 1)`: `hi` a robust high percentile of the
+   normalised seabed level, `γ` the Contrast slider (0.7 default; 1 = linear power).
+   **No low handle.**
+
+One model per window, stored in every seabed picture's JSON (`display_model`) and
+`_world.npz`, in `waterfall_raw.npz` and in the session `metadata.json`, so a picture is
+losslessly invertible: `e = hi + (10/γ)·log10(u)`, `db = e − TL(r) + A(r/h)`. The live
+path draws the same raw bins as replay since the GCS subscribes to the raw profiles
+(`core/live_native.py`), so this analysis applies to both.
+
+The earlier sample-removal **nadir blank still exists, but only on the ground/mosaic
+projection**: `project_side` (unchanged) cuts the transmit ringing
+(`depth.nadir_blank_m = 0.75`, the measured 0.73 m crossing, `max(correction, blank)`)
+from the ground samples that feed the mosaic, so the ringing never splatters the boat
+track in `off` mode. Those samples are removed rather than NaN'd because
+`MosaicGrid.add_samples` has no finiteness filter (one NaN poisons a cell forever) —
+this constraint is unchanged. The *native* slant-bin payload the waterfall/pictures
+use no longer applies that cut.
+
+The FBR tracker is advanced on **every** ping in every mode (`resolve_altitude` used
+to early-return for `off`/`manual`), which is what makes the bottom estimate available
+to the contrast split — carried on each ping as `SonarPing.bottom_slant_m` — even when
+the applied `water_depth` is 0.
 
 ## 6. FBR bootstrap was throwing data away
 

@@ -68,7 +68,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             ros_manager.sonar_listener = SonarListener(
                 node, signals, config.topics.processed_ping,
                 queue_depth=config.sonar_stream.queue_depth,
-                warn_on_ping_gap=config.sonar_stream.warn_on_ping_gap)
+                warn_on_ping_gap=config.sonar_stream.warn_on_ping_gap,
+                profile_topics=(config.topics.port_profile,
+                                config.topics.starboard_profile),
+                profile_queue_depth=config.sonar_stream.profile_queue_depth,
+                profile_cache_per_side=config.sonar_stream.profile_cache_per_side,
+                profile_wait_ms=config.sonar_stream.profile_wait_ms)
             TelemetryListener(node, signals, config.topics,
                               gps_fallback=config.alignment.gps_fallback)
             DetectionsListener(node, signals, config.topics.detections)

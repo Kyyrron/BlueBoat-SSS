@@ -225,6 +225,7 @@ rclpy node name `blueboat_gcs`. Subscribes (**VERIFIED**; topic names configurab
 | Topic | Type | Notes |
 |---|---|---|
 | `/sss_processor/processed` | `ProcessedSSSPing` | `BEST_EFFORT`, depth **200** |
+| `/side_scan_sonar/{port,starboard}/profile` | `OmniscanProfile` | `BEST_EFFORT`, depth **200** (`sonar_stream.profile_queue_depth`). **Since 2026-09-05**: the raw per-side profiles, cached by device `ping_number` and attached verbatim to the matching processed row (`core/live_native.py`), so the live waterfall and the AI pictures draw the same native bins the replay path decodes from the `.svlog` — water column, ringing and all. A profile missing after `profile_wait_ms` (60 ms) falls back to the re-projection for that side; the console warns once when more than 5 % of recent rows had to. |
 | `/blueboat/odom` | `nav_msgs/Odometry` | `BEST_EFFORT`, depth 10 |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | `BEST_EFFORT`, depth 10. Gated by the pure `utils/geodesy.navsat_fix_ok`: **only** an explicit `STATUS_NO_FIX` (-1), non-finite coordinates, or the `(0, 0)` no-fix sentinel are rejected; `STATUS_UNKNOWN` (-2) is **accepted** — it is the ROS 2 Iron+ message *default*, and exactly what the MCS bridge's simulated GPS sends for Gazebo runs of GPS-anchored missions (MCS is the only GPS publisher in a sim graph; it fills lat/lon only). Rejecting all negative statuses silently discarded that whole feed — the "GCS says no GPS while MCS anchors" field bug. First accepted and first rejected fix are logged to the console |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | depth 10 |
@@ -238,7 +239,8 @@ Publishes: `/side_scan_sonar/ping/enable` (Bool), `/sss_processor/log/enable` (B
 and `/sss_ai/seabed_analysis` (`std_msgs/String`, JSON, schema 1) — image metadata +
 detections, **never pixels**.
 
-The GCS **does not subscribe to `~/raw`.** **VERIFIED.**
+The GCS **does not subscribe to `~/raw`.** **VERIFIED.** It subscribes to the two
+`~/profile` topics (above) since 2026-09-05.
 
 Every listener guards its optional imports: a missing `blueboat_interfaces` disables the
 sonar stream, a missing `vision_msgs` disables detections, a missing `mavros_msgs` falls
@@ -270,6 +272,18 @@ Violating any of these breaks another module, the hardware integration, or the t
    ~10 % of rows and the start of every mission. Obeyed by both paths — the GCS replay
    path and `sss_processor_node`. A missing `/blueboat/odom` pose is the one remaining
    drop, and it is BlueBoat-Control's (see `TODO.md`).
+   **Two assembly rules added 2026-09-03**, after a whole simulated session ran at
+   100 % one-sided rows (every ping published as two half-rows — the GCS waterfall's
+   "one black row in two per side"): (a) a key falling `COUNTER_RESTART_PINGS` (128)
+   behind the newest key seen is a **device counter restart** (power cycle, or the
+   simulator relaunched under a running processor), never a late arrival — the node
+   drains what is pending, resets the high-water mark and re-learns the offset through
+   the pre-roll, instead of evicting every new group on its next arrival for the rest
+   of the run; (b) the flush timer judges "the stream stopped" on the **wall clock
+   against the last arrival only** — never wall time against a message stamp, which is
+   sim time under Gazebo (and device time on replay) and made every group look 1.8e9 s
+   stale on every tick. Both the node and the GCS `SonarListener` now warn once when
+   more than 25 % of the last 100 rows are one-sided.
 
    **The key is the offset-normalised counter, not the raw one.** The two units number
    their pings independently; grouping on the raw counter merges halves acquired up to
@@ -319,11 +333,12 @@ Violating any of these breaks another module, the hardware integration, or the t
     dataclasses so the GUI runs without ROS (rcl_interfaces for the runtime range
     change is imported inside `ros/ros_manager.py` only, and its result crosses the
     bus as `(bool, str)`). **VERIFIED**: `ros/` is the only place `rclpy` is
-    imported, and 54 of the 58 swept GCS modules import cleanly with no ROS at all
+    imported, and 58 of the 62 swept GCS modules import cleanly with no ROS at all
     (the four that do not are exactly the `ros/` listeners, which `main.py` imports
-    lazily and only outside `--sim`). The sweep count excludes `tools/`, whose
-    three files are checked by hash instead (NC #7); the package holds 61 `.py`
-    files in total.
+    lazily and only outside `--sim`). The live listener's logic that can be tested
+    without ROS lives in `core/live_native.py` for exactly that reason. The sweep
+    count excludes `tools/`, whose three files are checked by hash instead
+    (NC #7); the package holds 65 `.py` files in total.
 
 ### Scientific validity (from the thesis plan)
 
@@ -362,16 +377,100 @@ tees `stdout`/`stderr` and the `logging` root handler; `ros_manager` subscribes
 `/rosout` (depth 50) for every *other* node ROS logger output; `pipeline_launcher`
 pumps the launch subprocess stdout. The operator never needs an external terminal.
 
+**Default view (2026-09-02):** `Depth comp. = off` and mosaic overlap
+`Priority = closest` (SonarView's defaults) — set in
+`config/default.yaml` (`depth.mode: "off"` — quoted, since bare `off` is YAML
+boolean false; `mosaic.priority_mode: closest`); the right-panel combos are seeded
+from that config so the widgets agree (`RightPanel(config=...)`). The look of every
+picture comes from the **display model** below (`mosaic.nadir_contrast: true`); the
+Contrast slider is seeded from `display.gamma` so the on-screen waterfall and the AI
+pictures start on the same transfer.
+
 **Depth compensation** (`depth.mode`, and the `Depth comp.` selector) is the altitude
 used for slant-range correction — the same concept SonarView exposes:
 - `auto` — bottom detection (FBR tracker), returning locked, then provisional, then last-known
 - `manual` — fixed altitude
-- `off` — no correction, ground range = slant range
+- `off` — no correction, ground range = slant range **(default)**
 
-The waterfall changes when this changes because the waterfall is displayed in
-**corrected ground range**, not raw slant range. Only intensity-vs-sample-index is
-truly raw. On shallow data a wrong altitude is worse than none, so `off` is the robust
-choice when bottom detection is unreliable.
+The **mosaic** changes when this changes; the **waterfall** does not: it draws the
+native slant-bin domain — one column per device range bin, verbatim dB, SonarView's
+raw convention — and on **both** paths (live since 2026-09-05, replay since
+2026-09-02) carries the **full raw dB of every bin** (`port_bin0 = 0`, water column
+and ringing included), so nothing is erased and the centre is a continuous water
+column darkened by the model, never a NaN hole.
+
+**One display model for every picture (2026-09-05, `core/display_model.py`;
+background and measurements in `docs/SCIENTIFIC_BACKGROUND.md`).** The device
+stream is pre-TVG: the seabed falls **60–70 dB per decade of slant range** on the field
+logs, so no single raw window shows near and far seabed at once. Each window (main,
+replay, session rebuild) owns ONE `DisplayModel`, fed by its waterfall service, and the
+waterfall, the AI seabed pictures and the mosaic all map through it:
+
+1. **Normalisation** `e = db + TL(r) − A_side(r/h)`: the two-way transmission loss
+   `TL(r) = k·log10 r + 2αr` (`display.tl_k` 40, `display.tl_alpha_db_per_m` 0.1) removed,
+   then an empirical seabed curve `A` in normalised slant range `x = r/h` (`h` = the row's
+   tracked bottom, `bottom_slant_m`; the processor's altitude live) divided out. `A` is
+   estimated **per side** as the **mode** of each log-spaced `x` bin's level histogram over
+   seabed samples (`r ≥ max(h, mosaic.water_column_min_m)`), tied to physics by a
+   **consensus straight line in `log10 x`** (each bin proposes a Lambert-slope line
+   through itself, the proposal with most bins within `display.curve_tolerance_db` (6)
+   wins, the slope is refined on the inliers and clamped to `[−40, 0]` dB/decade; only
+   inlier bins refine the shape, every other bin takes the line), median-filtered across
+   bins. The mode is what makes it immune to shadows, walls and targets (a per-column
+   *mean* and a 5th-percentile low handle were the measured cause of the 2026-09-03
+   defects: the bright "nadir", the vertical bands, grey noise inside shadows); the
+   line is what survives an enclosed basin where the whole far range is a wall's shadow
+   on every ping (the noise floor's TL-compensated level rises with range and cannot
+   share one line with the seabed, so the seabed ridge wins the vote); the `x` axis
+   makes it invariant to altitude and to the range setting, so a range change needs no
+   rebuild and a remap never touches it. For `x < 1` `A` holds `A(1)`, so the
+   extrapolated `TL` sends the water column and the ringing core toward black **by
+   physics** — no mask, nothing erased.
+2. **Transfer** `p = 10^(γ·(e − hi)/10)` with a soft knee above `display.knee` (0.7;
+   highlights compress instead of clipping), `hi` = `display.hi_pct` (95) of the
+   normalised seabed level, `γ` = `display.gamma` (0.7; 1 = SonarView's linear power,
+   0.5 = amplitude — the Contrast slider). **No low handle**: a shadow 15–40 dB below the
+   seabed lands at `u < 0.03` on its own. Calibrated on the 2026-09-04 simulation log and
+   checked against SonarView's screenshot of the 2026-09-03 log rendered from the same
+   `.svlog` (median seabed brightness matched; black nadir, black wall shadows, textured
+   debris, no bands).
+3. **Life cycle**: live, the model accumulates `display.warmup_rows` (300) rows then
+   freezes and every tile re-renders once (`version` bump); the mosaic holds pings back
+   until the freeze so its grid is on one mapping; replay, `Run AI`, `Save pictures` and
+   the session rebuild fit it in one pass (`DisplayModel.fit`). `Clear SSS data` resets it.
+4. **Invertibility**: every picture's JSON carries the model (`display_model`: TL
+   parameters, `x_centers`, `a_port_db`/`a_stbd_db`, `hi_db`, `gamma`) and per row
+   `bottom_m`; the `_world.npz` and `waterfall_raw.npz` carry the curves and the raw
+   float dB; `db = e − TL(r) + A(r/h)`, `e = hi + (10/γ)·log10(u)`. `sonar_mosaic.npz`
+   is tagged `value_domain: normalised_db` (its planes are `e`, comparable across passes).
+5. **Nothing else is done to the pictures**: no despeckling, no histogram equalisation,
+   no bottom-tracked mask (`docs/SCIENTIFIC_BACKGROUND.md` §9 records why).
+
+`core/contrast.py` (the 2026-09-03 seabed-referenced EGN) is deleted;
+`mosaic.seabed_high_pct` / `seabed_low_pct` / `water_column_pct` are inert.
+
+**The on-screen waterfall is drawn at true scale (2026-09-05).** The service reports
+the along-track metres per row (running median of consecutive row displacements,
+5th argument of `layout_changed`); the view stretches rows by that over the bin pitch
+(`WaterfallView.aspect`, "True scale" checkbox, default on), so a picture is not
+squashed at 20 Hz. Clicks go through the same transform.
+
+**The ringing blank now applies to the ground/mosaic projection only.** `project_side`
+(and its robot twin `sss_helper.project_side`) is **unchanged** — it still cuts the
+transmit ringing (`depth.nadir_blank_m: 0.75`, `depth.blank_nadir`,
+`depth.nadir_max_fraction`) from the ground samples that feed the mosaic, so the
+ringing never splatters the boat track in `off` mode. Only the *native* slant-bin
+payload the waterfall/pictures use changed (it no longer subtracts the cut). Full
+rationale and the dB-vs-range table in
+`blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md` §5.1.
+
+**Waterfall orientation is newest-on-top (2026-09-02, SonarView convention).** The
+service still stores rows oldest-first (all absolute-index contracts intact); the
+live view maps `scene y = -(row)` (tiles mirrored vertically, follow pins to the
+**top**), the exported `waterfall.png` is flipped (npz stays oldest-first, tagged
+`row_order`/`png_row_order`), and the seabed pictures are built newest-first (row 0 =
+newest; `pixel_convention` and the world grids flipped together so bbox→world stays
+one lookup).
 
 **Mosaic resolution is adaptive.** `MosaicService._auto_tune_cell_size` derives the
 ground-sample distance from the median across-track sample spacing over the outer half
@@ -385,13 +484,25 @@ not `max|y_local|`, which moves with the altitude estimate. Live, the configured
 is recovered exactly as `hypot(ground_max, water_depth)`; on replay it comes straight
 from `length_mm`.
 
-**The waterfall buffer is growable and tiled, not a ring.** The old 1500-row ring
-silently discarded the head of any longer mission and re-colormapped the whole image
-per render. Rows now live in 512-row tiles (float32 data + per-row `(t, x, y, yaw, r)`
-metadata); a row's index is its chronological ping index forever, renders touch dirty
-tiles only (`layout_changed` + `tile_updated(first_row, QImage)` replaced the old
-whole-image signal), and auto contrast is one **global** histogram window so tiles
-cannot band at their seams. Memory is capped at `mosaic.waterfall_max_rows`
+**The waterfall buffer is growable and tiled, not a ring — and native slant-bin
+(2026-09-01).** Rows are the device's own range bins, verbatim (no fixed 800-column
+grid, no resampling, hole-free by construction; the old ground-range scatter left up
+to ~25 % of every short-range row as NaN pepper, vertical dead columns and a fake
+nadir band). Width adapts to the acquisition — a recording holding two range
+settings re-lays the buffer to the biggest extent at the finest pitch, existing rows
+remapped by pure pixel stretch. Genuine acquisition loss (`SonarPing.gap_before`, a
+jump in the merged device counter = an instant where BOTH halves vanished) inserts
+blank rows, capped at 5 per gap; single-side loss stays a half-dark one-sided row.
+Rows live in 512-row tiles (float32 data + per-row
+`(t, x, y, yaw, water_depth, h)` metadata — `h` is the row's altitude for the
+display model, so a remap needs no re-estimation); a row's
+index is its chronological ping index forever, renders touch dirty tiles only
+(`layout_changed` + `tile_updated(first_row, QImage)` replaced the old whole-image
+signal), and auto contrast is one **global** window applied over the rendered tiles
+so they cannot band at their seams. By default (`mosaic.nadir_contrast`) the tiles
+render through the window's display model (unit brightness, see above); with
+`nadir_contrast` off it is the plain global raw-value histogram window. Memory is capped at
+`mosaic.waterfall_max_rows`
 (default 100 000; oldest whole tile evicted past it, absolute indices preserved);
 the replay window calls `reserve(ping_count)` so an entire file is always
 scrollable. The view keeps one pixmap item per tile — scene coords are absolute
@@ -574,7 +685,8 @@ streaming artifacts land inside it:
     metadata.json          times, config snapshot, counters, topic table
     *.svlog                adopted from data_root by mtime window (+/- 10 s)
     mosaic/                sonar_mosaic.npz, sonar_mosaic.png, boat_trajectory.csv
-    waterfall/             waterfall.png, waterfall_raw.npz  <- the dataset source
+    waterfall/             waterfall.png, waterfall_raw.npz  <- archival raw record
+                           (the AI feed is the seabed PICTURES + metadata)
     detections/            detections.csv
     seabed_images/         written live, only while the session is active
 ```
@@ -606,24 +718,49 @@ NC #9 posture: this is an offline transformation of data that already left
 through sessions, not a new live-export path.
 
 **Seabed images** (AI, waterfall domain) — `seabed_XXXXX.png` plus
-`metadata/seabed_XXXXX.json` (per-row pose/time/speed/altitude and the pixel-to-world
-formula) and `metadata/seabed_XXXXX_world.npz` (per-pixel `world_x`/`world_y` grids
-and the **raw float `intensity_db`**). The replay window "Save pictures from the log"
-writes the identical artifacts to `seabed_images_<logname>/` next to the `.svlog`
-instead.
+`metadata/seabed_XXXXX.json` (per-row pose/time/speed/altitude/bottom/source ping, the
+display model, the pixel-to-world formula) and `metadata/seabed_XXXXX_world.npz`
+(per-pixel `world_x`/`world_y` grids, the **raw float `intensity_db`**, the model
+curves, `row_ping_index`). The replay window "Save pictures from the log" writes the
+identical artifacts to `seabed_images_<logname>/` next to the `.svlog` instead.
 
-> The PNG is display-normalized (per-image 2–98 %) for annotation tools. **Train on
-> the `.npz` `intensity_db`, not on the PNG.**
+> The PNG is the **display model's transfer** (see *One display model* above): the same
+> `e = db + TL(r) − A(r/h)` and `u = 10^(γ(e−hi)/10)` as the waterfall and the mosaic,
+> one model for every tile of a mission → the same seabed reads at the same brightness
+> (what a detector needs), and it is **losslessly invertible** from the JSON/npz. **The
+> AI feed is the pictures + their JSON metadata (decided 2026-09-01)**; the `.npz` is an
+> auxiliary record carrying the raw float `intensity_db`.
 
-Windowing: 256 rows, stride 128 (50 % overlap), 800 columns — the standard tiling
-guarantee that an object smaller than the stride appears whole in at least one image.
-**The overlap is deliberate**: consecutive images sharing their middle 128 rows
-("half of one picture appears in the next") is the tiling guarantee working, not a
-registration bug — do not "fix" it without weakening the detector dataset.
-A final truncated image flushes the remaining pings so no data is lost.
+The tiles carry the **full raw dB, water column included**: nothing is erased, the
+nadir is darkened by the model (extrapolated transmission loss), the thin first-bottom-
+return line survives as a bright centre edge, as in SonarView. Tiles are hole-free
+(CM-10), continuous, and invertible; no despeckling, no equalisation.
 
-Row 0 = oldest ping, column 0 = +range (port). Pixel to world:
-`y_local(i,j) = range[i]·(1 − 2j/(W−1))`, then rotate/translate by that row pose
+**Row geometry — `seabed.row_geometry: square` (decided 2026-09-05, PROVISIONAL).**
+A picture row is one across-track bin pitch of along-track distance, so a pixel is the
+same size along- and across-track and an object keeps its shape at any boat speed (the
+sidescan literature's "speed correction"; SonarView draws true scale). Each row copies
+exactly one ping's bins verbatim — the ping nearest to the row's along-track position
+(`ping_index` per row in the JSON) — and its pose/time are interpolated along-track so
+the world grids stay continuous. When the boat outruns the pitch some pings are absent
+from the *picture* (they remain in `waterfall_raw.npz`); when it is slower a ping fills
+several rows. `rows` (256) / `stride` (128) count picture rows: at 25–53 mm pitch a tile
+is 6.4–13.6 m along-track. **If detector results are worse with square pixels, revert
+with the one line `seabed.row_geometry: ping` in `config/default.yaml`** — that is the
+previous contract (one row per ping, `rows`/`stride` in pings), kept in the code and in
+`tests/test_seabed_pictures.py`; nothing else changes.
+
+Windowing: a range change ends the window so every image is one homogeneous grid; the
+50 % overlap is the standard tiling guarantee that an object smaller than the stride
+appears whole in at least one image. **The overlap is deliberate**: consecutive images
+sharing their middle half is the tiling guarantee working, not a registration bug — do
+not "fix" it without weakening the detector dataset. A final truncated image flushes the
+remaining rows so no data is lost.
+
+Row 0 = **newest** (SonarView orientation; every row-indexed array and the world grids
+are flipped together so bbox→world stays one lookup), column 0 = +range (port). Pixel to
+world: `k = (W/2−1−j)` or `(j−W/2)`, `s = (k+0.5)·bin_pitch_m`,
+`y_local = ±sqrt(max(s² − altitude_i², 0))`, then rotate/translate by that row pose
 (`world_x = x − sin(yaw)·y_local`, `world_y = y + cos(yaw)·y_local`).
 
 ---
@@ -676,15 +813,16 @@ superproject checked out under `~/ros2_ws/src/BlueBoat-SideScanSonar/`.
 
 **Headless GUI testing** — the regression suite, run from `blueboat_sss/`:
 ```bash
-QT_QPA_PLATFORM=offscreen python3 -m pytest -q     # 214 tests: 186 GCS + 28 robot-side
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q     # ~300 tests: GCS half needs no ROS
 pip install --user --break-system-packages -r ../requirements-dev.txt
 ```
 Runtime depends entirely on what is available. With neither a sourced
-`blueboat_interfaces` nor the field corpus, 151 pass and 63 skip in ~13 s on this
-machine (ROS 2 Jazzy is sourced globally, so the rclpy-only
-`test_mcs_sim_gps_compat.py` still runs; a truly ROS-free laptop gets 150 / 64), and
-164 pass / 50 skip with a sourced workspace but no corpus; the full-corpus run is
-longer. **The corpus path is hard-coded** in
+`blueboat_interfaces` nor the field corpus, **225 pass and 66 skip** (291 collected,
+2026-09-05) in ~16 s on this machine (ROS 2 Jazzy is sourced globally, so the
+rclpy-only `test_mcs_sim_gps_compat.py` still runs; a truly ROS-free laptop gets one
+more skip); a sourced workspace adds the robot-side half; the full-corpus run is
+longer. `pytest.ini` already passes `-q`: a second `-q` on the command line silences
+the pass/skip summary line. **The corpus path is hard-coded** in
 `tests/test_processor_assembly.py` as
 `/media/kyyrron/OS/Users/killi/Desktop/Research Kyutech/BlueBoat/allSvlogData`, an
 external mount; every corpus test skips when it is absent, so a green suite is not
@@ -695,13 +833,18 @@ The **GCS half** (`test_sweeps.py`, `test_sim_session.py`, `test_svlog_writer.py
 `test_planned_path_dedupe.py`, `test_pinger_gating.py`, `test_heading_policy.py`,
 `test_geo_anchor.py` and `test_navsat_gating.py`, plus the update suites
 `test_recording_guards.py`, `test_pose_freeze.py`, `test_waterfall_buffer.py`,
-`test_waterfall_pick.py`, `test_svlog_merge.py` and `test_range_control.py` —
-185 tests) needs no ROS, no boat and no display; `test_mcs_sim_gps_compat.py`
+`test_waterfall_pick.py`, `test_svlog_merge.py`, `test_range_control.py`,
+`test_nadir_blanking.py`, and the 2026-09-05 display suites `test_display_model.py`
+(altitude invariance, shadows black, no banding from a fixed-range wall, invertibility,
+warm-up/freeze), `test_live_native.py` (profile cache, attach hit/miss/one-sided, FIFO
+order, live-vs-replay row parity) and `test_seabed_pictures.py` (square vs ping
+geometry, JSON keys, PNG inversion, picture == waterfall mapping, live == replay
+pictures)) needs no ROS, no boat and no display; `test_mcs_sim_gps_compat.py`
 (1 test) needs only `rclpy` + message packages — it reproduces the MCS bridge's
 simulated-GPS publisher on the wire (NavSatFix with the default `status = -2`,
 BEST_EFFORT) and asserts the live listener/GeoService chain anchors from it —
 and skips cleanly without them. The no-ROS half covers:
-the compile sweep (**58 files, 0 failures**); the ROS-free import sweep (**54 of 58**,
+the compile sweep (**62 files, 0 failures**); the ROS-free import sweep (**58 of 62**,
 the four failures being exactly `ros/{detections,pinger,sonar,telemetry}_listener`,
 which take `rclpy` at module level — asserting their *identity* is what enforces
 NC #10); NC #7 verbatim-copy hashes; NC #8 processor-name consistency; two `--sim`
@@ -736,13 +879,46 @@ tile rendering, full-fidelity npz + decimated PNG export); waterfall click→wor
 against SelectionLayer); the svlog merge (two-segment load, ping-count conservation,
 untouched sources by SHA-256, order auto-detection, status/mavlink rewrites, GPS
 pose alignment and its no-GPS fallback, headerless-log header synthesis, the rebuilt
-session layout, and the GUI merge button end-to-end); and the runtime range dance
+session layout, and the GUI merge button end-to-end); the runtime range dance
 (refusals, full dance, failure-resumes-pinging, reentrancy, sim refusal, GUI gating
-+ the waterfall seam).
++ the waterfall seam); and nadir + contrast (the ground/mosaic blank removes the
+ringing and nothing wider, relocates no surviving sample; `auto` is bit-for-bit
+unchanged; the two `project_side` implementations agree across every blank/altitude
+combination; the FBR tracker advances in all three modes; the clamp keeps a ping from
+being emptied; the raw-slant waterfall and seabed tiles erase nothing and darken the
+water column by the colour window; the display window is losslessly invertible back to
+dB; and the regression guard that the display model keeps the **far-range seabed
+from being crushed to black** under a strong range falloff while the nadir still maps
+dark — **continuity and full-swath visibility are the invariants these guard hardest**).
 
-The **robot-side half** (`test_processor_assembly.py`, 28 tests) drives the real
+**GCS live-pipeline budget (2026-09-03).** With every ping arriving as one
+two-sided row at 20 Hz the app slowed and died: `MosaicService._derive_cell_size`
+took the median spacing of the *merged* port+starboard `y_local` (interleaved by
+any transducer asymmetry → the `min_cell_size_m` clamp, 3× the cells), and
+`MosaicGrid._ensure_contains` padded seven planes with no cap before the budget
+was checked (±200 m at 2 cm = 7 GB). Now: the cell size comes from one side; the
+grid honours `max_grid_cells` **before** allocating by coarsening in place
+(`MosaicGrid.coarsen`, block aggregation, never two grids resident) and refuses a
+growth past `max_extent_m` (pose glitch); the mosaic re-colormaps only the dirty
+sliver between full passes at `mosaic_render_hz` (2 Hz) with a 5 s auto-range
+hold; the waterfall re-renders a window move `_STALE_PER_PASS` tiles per pass
+(never the whole buffer), freezes its auto window after 2000 rows, debounces
+the display sliders, resolves a detection's row once, caps memory in
+**samples** (`waterfall_max_samples`, rows × native columns) and its view drops
+pixmaps beyond `_MAX_ITEMS` tiles (re-requested on scroll); seabed-image saves
+run on a pool thread; and the main window pauses rendering (never ingestion)
+when the queue is more than `ping_lag_throttle` pings behind
+(`AppSignals.sonar_latest_seq`). Measured 2026-09-05 with the shared display model
+wired as in the main window (`python3 -m blueboat_gcs.analysis.ping_bench --pings
+4000 --turn`): ingest 0.85 ms/ping, mosaic render ~3 ms (sliver) / 43 ms max,
+waterfall ~18 ms per pass (the model's per-tile gather + power transfer), RSS 510 MB
+flat after the caps. `tests/test_gcs_throughput.py` (9 tests) pins the caps.
+
+The **robot-side half** (`test_processor_assembly.py`, 31 tests) drives the real
 `sss_processor_node` for NC #2 — row assembly, one-sided emission, the bounded flush,
-the pre-roll, the counter-offset estimator against the field `.svlog` corpus, and the
+the pre-roll, the counter restart re-base, the wall-vs-stream clock separation of the
+flush timer, the torn-row warning, the counter-offset estimator against the field
+`.svlog` corpus, and the
 odom buffer's nearest-stamp tolerance (fresh sample served, far sample refused with
 the measured skew recorded, stale samples pruned at lookup). It needs a sourced ROS 2
 workspace and skips cleanly without one, so the suite stays laptop-runnable. It never

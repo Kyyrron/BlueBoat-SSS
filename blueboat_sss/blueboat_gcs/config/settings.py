@@ -27,6 +27,10 @@ class RosTopics:
     vfr_hud: str = "/mavros/vfr_hud"
     ping_enable: str = "/side_scan_sonar/ping/enable"
     svlog_enable: str = "/sss_processor/log/enable"
+    # Raw per-side profiles (blueboat_interfaces/OmniscanProfile) from the
+    # sonar driver: the verbatim native bins the processor also consumes.
+    port_profile: str = "/side_scan_sonar/port/profile"
+    starboard_profile: str = "/side_scan_sonar/starboard/profile"
     # ---- placeholders (repositories not present yet) ----------------------
     detections: str = "/sss_ai/detections"     # see ros/detections_listener.py
     pinger: str = "/blueboat/pinger_coordinates"  # Float32MultiArray [x, y]
@@ -82,22 +86,117 @@ class MosaicConfig:
     initial_half_extent_m: float = 30.0
     render_hz: float = 4.0             # GUI raster refresh rate
     contrast_percentiles: List[float] = field(default_factory=lambda: [2.0, 98.0])
+    # Cell-value policy where survey lines overlap (mapping/mosaic.py
+    # PRIORITY_MODES): average | closest | oldest | newest. "closest"
+    # (smallest slant range wins) is SonarView's default and the sharpest
+    # single-pass choice.
+    priority_mode: str = "closest"
+    # ---- seabed-referenced EGN + window (SonarView parity, core/contrast) ----
+    # When ``nadir_contrast`` is on (default) the waterfall/seabed pictures
+    # are seabed-referenced-EGN'd (per-column seabed mean subtracted so the
+    # pre-TVG range falloff is flattened and the whole swath is visible),
+    # then windowed over the equalized values: high handle at a high seabed
+    # percentile, low handle at a low seabed percentile. The un-referenced
+    # water column keeps its raw low level and maps toward black; nothing is
+    # erased. The window + EGN reference are stored in the seabed-image
+    # metadata / npz so a picture stays losslessly invertible back to dB.
+    nadir_contrast: bool = True
+    seabed_high_pct: float = 99.5      # high handle: bright seabed / returns
+    seabed_low_pct: float = 5.0        # low handle: dark seabed / shadows
+    # Retained for signature/config stability; NO LONGER sets a handle — the
+    # low handle now comes from the seabed distribution (its bright
+    # near-field would otherwise re-crush the far range, the SonarView bug).
+    water_column_pct: float = 90.0
+    # Transmit-ringing core [m slant] excluded from the EGN reference and the
+    # window statistics: a thin bright artefact that would otherwise skew
+    # them. Still displayed (a thin bright centre line), never erased.
+    water_column_min_m: float = 1.0
     # DEPRECATED — the waterfall is no longer a fixed ring; kept so old
     # YAML files load. Sizing now comes from waterfall_max_rows below.
     waterfall_rows: int = 1500
-    # Waterfall buffer: across-track resampling width (columns spanning
-    # the full swath) and the live memory cap in rows. The buffer grows
-    # with the mission (every ping stays scrollable); past the cap the
-    # oldest rows are dropped. 100k rows x 800 columns ~ 340 MB
-    # (float32 data + float64 metadata). Replay raises the cap to the
-    # log's own ping count so a whole file is always scrollable.
+    # DEPRECATED — the waterfall draws native slant bins now (one column
+    # per device range bin, width adapting to the acquisition), so
+    # nothing is resampled onto a fixed 800-column grid any more. Kept
+    # so old YAML files load.
     waterfall_columns: int = 800
+    # Live waterfall memory cap in rows. The buffer grows with the
+    # mission (every ping stays scrollable); past the cap the oldest
+    # rows are dropped. Replay raises the cap to the log's own ping
+    # count so a whole file is always scrollable.
     waterfall_max_rows: int = 100_000
+    # Performance bounds (the GUI thread must stay responsive at 20 Hz
+    # pings — an overloaded GUI starves the ROS executor and BEST_EFFORT
+    # then drops real pings):
+    # * max_grid_cells — cap on total mosaic cells; past it the grid is
+    #   coarsened (existing data preserved via resample_from). 8 M cells
+    #   ≈ 250 MB of planes.
+    # * max_render_pixels — cap on the raster actually colormapped per
+    #   render pass; larger grids render decimated (full extent, every
+    #   Nth cell). Display only; the grid keeps full resolution.
+    max_grid_cells: int = 8_000_000
+    max_render_pixels: int = 2_000_000
+    # * max_extent_m — a single ping whose samples would grow the grid
+    #   past this extent is refused (pose glitch guard), never allocated.
+    # * mosaic_render_hz — the mosaic's own colormap cadence (the
+    #   waterfall keeps render_hz); a ping touches a sliver, so the
+    #   mosaic re-colormaps only that sliver between full renders.
+    # * waterfall_max_samples — the live waterfall's memory cap in
+    #   samples (rows x columns), which is what the native-bin buffer
+    #   actually costs: 100 k rows were sized for 800 columns, at 1200 /
+    #   2400 native columns the row cap alone reached 1-2 GB.
+    max_extent_m: float = 5000.0
+    mosaic_render_hz: float = 2.0
+    waterfall_max_samples: int = 120_000_000
+    # * ping_lag_throttle — pings queued behind the GUI thread before
+    #   rendering is skipped until it catches up (no ping is dropped from
+    #   the buffers; only the display waits). 0 disables.
+    ping_lag_throttle: int = 40
     # Professional-quality rasterization (see mapping/rasterizer.py):
     # across/along-track ping densification + bilinear splatting. Set
     # both to false to recover the legacy point-scatter mosaic (A/B).
     densify: bool = True
     bilinear_splat: bool = True
+
+
+@dataclass
+class DisplayConfig:
+    """The one dB->pixel model every picture goes through
+    (core/display_model.py; docs/SCIENTIFIC_BACKGROUND.md §9).
+
+    * ``tl_k`` / ``tl_alpha_db_per_m`` — deterministic two-way
+      transmission loss ``k·log10 r + 2·α·r`` removed first (the stream is
+      pre-TVG): 40 dB/decade spherical spreading, 0.1 dB/m absorption at
+      450 kHz.
+    * ``x_bins`` / ``x_max`` — the empirical seabed curve ``A(r/h)`` is
+      estimated per side on ``x_bins`` log-spaced bins of normalised slant
+      range ``x = r/h`` up to ``x_max`` (30 = a 3 m altitude at 90 m).
+    * ``min_bin_count`` — below this many samples a bin blends toward the
+      Lambert prior.
+    * ``warmup_rows`` — live, the model accumulates this many rows then
+      freezes (one re-render of every tile); replay fits in one pass.
+    * ``hi_pct`` — the window top ``hi`` is this percentile of the
+      normalised seabed level; there is NO low handle (shadows go black by
+      the power-law transfer on their own).
+    * ``gamma`` — transfer exponent ``u = 10^(gamma·(e−hi)/10)``: 1.0 is
+      linear power (SonarView), 0.5 amplitude. Seeds the Contrast slider.
+    """
+
+    tl_k: float = 40.0
+    tl_alpha_db_per_m: float = 0.10
+    x_bins: int = 40
+    x_max: float = 30.0
+    min_bin_count: int = 100
+    warmup_rows: int = 300
+    hi_pct: float = 95.0
+    gamma: float = 0.7
+    # Soft knee of the transfer: above this unit brightness highlights are
+    # compressed instead of clipped (1.0 = hard clip). A wall face keeps
+    # its texture for a few dB past ``hi``.
+    knee: float = 0.7
+    # How far [dB] the empirical seabed curve may leave the robust
+    # physical line fitted through it: bins dominated by a wall's shadow
+    # (or its face) on every ping are pulled back onto physics.
+    curve_tolerance_db: float = 6.0
 
 
 @dataclass
@@ -121,6 +220,14 @@ class SonarStreamConfig:
 
     queue_depth: int = 200
     warn_on_ping_gap: bool = True
+    # Raw OmniscanProfile subscriptions (the native slant bins the
+    # waterfall and the AI pictures draw): same depth reasoning as above
+    # (a shallower queue drops profiles exactly under GUI load), a bounded
+    # per-side cache keyed by ping_number, and how long a processed row
+    # waits for a late profile before falling back to the re-projection.
+    profile_queue_depth: int = 200
+    profile_cache_per_side: int = 512
+    profile_wait_ms: int = 60
 
 
 @dataclass
@@ -138,6 +245,26 @@ class DepthConfig:
       geometrically almost identical and far more robust than a wrong
       altitude, which both deletes real samples and warps the near range.
 
+    The selector governs the **correction** only. Separately from it, and
+    in every mode, the first ``nadir_blank_m`` of slant range is removed:
+    the profile leaves the transducer at ~55 dB — brighter than any seabed
+    return — and that transmit ringing used to sit as a bright core right
+    under the boat in every ``off`` image and splat onto the track line in
+    the mosaic.
+
+    The blank is deliberately **narrow, and is not the water column**.
+    Measured on ``diffDepthCompensation.svlog`` the ringing decays through
+    43 dB at 0.27 m to 33 dB at 1 m, after which the water column settles
+    to 16–28 dB — darker than the seabed, honest data, and needed on
+    screen: the waterfall, the mosaic and the AI tiles all have to be
+    continuous. Blanking out to the tracked altitude (9.4 m on that log)
+    punches a hole through every one of them.
+
+    ``blank_nadir``: set False to disable the blank entirely.
+    ``nadir_max_fraction``: cap on the blank as a share of the ping's
+    slant extent, so a mis-set ``nadir_blank_m`` can never empty a ping —
+    downstream reads an all-NaN row as a session gap.
+
     ``warn_bottom_fraction``: if the detected bottom sits closer than
     this fraction of the ping, the range setting is too long for the
     depth and bottom detection becomes unreliable (our 80 m sea-trial
@@ -145,8 +272,16 @@ class DepthConfig:
     exactly those files).
     """
 
-    mode: str = "auto"                 # auto | manual | off
+    mode: str = "off"                  # auto | manual | off  (default off)
     manual_m: float = 0.0
+    # Nadir blank: still applied to the GROUND projection (the mosaic) so
+    # the transmit ringing never splatters the boat track in `off` mode.
+    # The raw-slant waterfall and the AI pictures no longer erase it —
+    # they carry the full raw dB and darken the nadir by the colour window
+    # instead (see mosaic.nadir_contrast).
+    blank_nadir: bool = True
+    nadir_blank_m: float = 0.75
+    nadir_max_fraction: float = 0.5
     warn_bottom_fraction: float = 0.12
 
 
@@ -200,9 +335,20 @@ class SeabedConfig:
     rows/stride: 256/128 = 50 % overlap; see the module docstring for
     the along-track-footprint and tiling-guarantee justification."""
 
-    rows: int = 256          # pings per image (window height)
-    stride: int = 128        # emit every N pings; overlap = rows - stride
-    columns: int = 800       # across-track resampling width
+    rows: int = 256          # picture rows per image (window height)
+    stride: int = 128        # emit every N rows; overlap = rows - stride
+    # Along-track geometry of a picture row (decision 2026-09-05,
+    # PROVISIONAL — revert to "ping" if detector results are worse):
+    #   "square" — rows are resampled to one across-track bin pitch each
+    #              (nearest-ping selection, ping index recorded per row),
+    #              so a pixel is the same size along- and across-track and
+    #              objects keep their shape at any boat speed;
+    #   "ping"   — one row per ping, the previous dataset contract.
+    row_geometry: str = "square"
+    # DEPRECATED — images are raw waterfall now (one column per native
+    # slant bin, width adapting to the acquisition); kept so old YAML
+    # files load.
+    columns: int = 800
 
 
 @dataclass
@@ -302,6 +448,7 @@ class AppConfig:
     alignment: AlignmentConfig = field(default_factory=AlignmentConfig)
     depth: DepthConfig = field(default_factory=DepthConfig)
     sonar_stream: SonarStreamConfig = field(default_factory=SonarStreamConfig)
+    display: DisplayConfig = field(default_factory=DisplayConfig)
     map: MapConfig = field(default_factory=MapConfig)
     geo: GeoConfig = field(default_factory=GeoConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)

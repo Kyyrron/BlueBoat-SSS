@@ -8,10 +8,11 @@ software offers:
   button that jumps there);
 * drag pan + scrollbars through the entire buffered history — the
   service grows with the mission, so scrolling reaches the first ping;
-* **pin-to-newest**: while the view is at the bottom it follows the
-  incoming pings like a paper recorder; the moment the operator scrolls
-  up to inspect history the pinning releases, and scrolling back to the
-  bottom re-engages it — no fighting the user for the camera;
+* **pin-to-newest**: the newest ping is at the **top** (SonarView
+  convention: the waterfall scrolls downward as it fills). While the view
+  is at the top it follows the incoming pings; the moment the operator
+  scrolls down to inspect history the pinning releases, and scrolling
+  back to the top re-engages it — no fighting the user for the camera;
 * **click to locate**: a click (as opposed to a drag) emits
   ``point_selected(row, col)`` in absolute buffer coordinates; the
   windows resolve it to a world position + GPS and mark it on the map.
@@ -20,9 +21,12 @@ software offers:
 Display model: the service emits fixed-height tiles
 (``tile_updated(first_row, image)``), each backed by its own pixmap
 item positioned at its absolute row, plus ``layout_changed(row0,
-total_rows, cols, range_m)`` for the scene rect. Scene coordinates ==
-absolute buffer pixels: x = column, y = ping index — which is what
-keeps ``mapToScene`` on a click a direct row/col lookup.
+total_rows, cols, range_m)`` for the scene rect. Scene coordinates:
+x = column, **y = -(ping index)** so the newest ping (largest index)
+sits at the top; each tile pixmap is mirrored vertically and placed
+accordingly. ``mapToScene`` on a click therefore recovers the row as
+``floor(-y)``. The service's storage stays oldest-first — only the view
+maps it newest-on-top.
 
 The overlay (port/starboard labels, current range, nadir line, follow
 state, detection markers, selection crosshair) is drawn in
@@ -32,11 +36,12 @@ imagery.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (QColor, QFont, QImage, QMouseEvent, QPainter,
-                           QPen, QPixmap, QWheelEvent)
+                           QPen, QPixmap, QTransform, QWheelEvent)
 from PySide6.QtWidgets import (QGraphicsPixmapItem, QGraphicsScene,
                                QGraphicsView)
 
@@ -53,6 +58,13 @@ class WaterfallView(QGraphicsView):
     """Zoomable / scrollable display of the WaterfallService output."""
 
     follow_changed = Signal(bool)
+    #: Rows scrolled into view whose tile pixmaps were evicted (absolute
+    #: first row, last row): the service re-renders them.
+    tiles_requested = Signal(int, int)
+    #: Pixmap items kept resident around the viewport; beyond this the
+    #: farthest tiles are dropped (a 100 k-row buffer held ~200 pixmaps
+    #: = the same again as the numpy buffer).
+    _MAX_ITEMS = 48
     #: A genuine click (not a pan): absolute buffer (row, col).
     point_selected = Signal(int, int)
 
@@ -75,6 +87,13 @@ class WaterfallView(QGraphicsView):
         self._cols = 0
         self._follow = True
         self._fitted_once = False
+        # True-scale display (SonarView draws the waterfall at its
+        # physical aspect): scene units stay (column, row), the view
+        # transform stretches rows by along-track metres per row over the
+        # column pitch. ``_zoom`` is the x scale; y = zoom * aspect.
+        self._true_scale = True
+        self._row_pitch_m = 0.0
+        self._zoom = 1.0
         self._press_pos = None
         self._detections: list = []      # {"row", "col", "label"} absolute px
         self._show_detections = True
@@ -109,9 +128,16 @@ class WaterfallView(QGraphicsView):
         self._det_check.setToolTip(
             "Show / hide AI detection markers on the waterfall.")
         self._det_check.toggled.connect(self._set_show_detections)
+        self._scale_check = QCheckBox("True scale")
+        self._scale_check.setChecked(True)
+        self._scale_check.setToolTip(
+            "Draw rows at their along-track size (metres per ping over the\n"
+            "bin pitch), as SonarView does. Off: one pixel row per ping.")
+        self._scale_check.toggled.connect(self.set_true_scale)
         lay.addWidget(zoom_out)
         lay.addWidget(zoom_in)
         lay.addWidget(fit_btn)
+        lay.addWidget(self._scale_check)
         lay.addWidget(self._det_check)
         self._controls.setStyleSheet(
             "QWidget{background: rgba(16,21,27,190); border-radius: 4px;}")
@@ -119,7 +145,27 @@ class WaterfallView(QGraphicsView):
         self._controls.move(8, 24)
         self._controls.raise_()
 
-    # ---- manual zoom -----------------------------------------------------------
+    # ---- manual zoom / true scale ------------------------------------------------
+    @property
+    def aspect(self) -> float:
+        """Row height over column width in scene units (1 = square)."""
+        if not self._true_scale or self._row_pitch_m <= 0.0 or self._cols <= 0:
+            return 1.0
+        col_pitch = self._range_m / (self._cols / 2.0) if self._range_m > 0 else 0.0
+        if col_pitch <= 0.0:
+            return 1.0
+        return max(0.05, min(20.0, self._row_pitch_m / col_pitch))
+
+    def set_true_scale(self, on: bool) -> None:
+        self._true_scale = bool(on)
+        if self._scale_check.isChecked() != self._true_scale:
+            self._scale_check.setChecked(self._true_scale)
+        self._apply_transform(self._zoom)
+
+    def _apply_transform(self, zoom: float) -> None:
+        self._zoom = zoom
+        self.setTransform(QTransform().scale(zoom, zoom * self.aspect))
+
     def _min_scale(self) -> float:
         """Dynamic zoom floor: never below what fits the whole mission.
 
@@ -130,15 +176,15 @@ class WaterfallView(QGraphicsView):
             return _MIN_SCALE
         margin = 16
         fit = min((self.viewport().width() - margin) / rect.width(),
-                  (self.viewport().height() - margin) / rect.height())
+                  (self.viewport().height() - margin)
+                  / (rect.height() * self.aspect))
         return max(_ABS_MIN_SCALE, min(_MIN_SCALE, fit))
 
     def _apply_zoom(self, step: float) -> None:
-        current = self.transform().m11()
+        current = self._zoom
         target = max(self._min_scale(), min(_MAX_SCALE, current * step))
-        factor = target / current
-        if abs(factor - 1.0) > 1e-9:
-            self.scale(factor, factor)
+        if abs(target / current - 1.0) > 1e-9:
+            self._apply_transform(target)
         self._update_follow_from_scrollbar()
 
     def zoom_in(self) -> None:
@@ -152,9 +198,7 @@ class WaterfallView(QGraphicsView):
         rect = self._scene.sceneRect()
         if rect.isEmpty():
             return
-        self.resetTransform()
-        factor = self._min_scale()
-        self.scale(factor, factor)
+        self._apply_transform(self._min_scale())
         self.centerOn(rect.center())
         self._update_follow_from_scrollbar()
 
@@ -176,10 +220,15 @@ class WaterfallView(QGraphicsView):
 
     # ---- data slots -----------------------------------------------------------
     def on_layout(self, row0: int, total: int, cols: int,
-                  range_m: float) -> None:
-        """Buffer geometry from the service; scene y = absolute row."""
+                  range_m: float, row_pitch_m: float = 0.0) -> None:
+        """Buffer geometry from the service; scene y = absolute row.
+        ``row_pitch_m`` (along-track metres per row) drives true scale."""
         self._range_m = range_m
         self._row0, self._total, self._cols = row0, total, cols
+        old_aspect = self.aspect
+        self._row_pitch_m = float(row_pitch_m)
+        if self._fitted_once and abs(self.aspect - old_aspect) > 0.05 * old_aspect:
+            self._apply_transform(self._zoom)      # the running estimate moved
         if total <= row0:                     # cleared
             for item in self._items.values():
                 self._scene.removeItem(item)
@@ -192,30 +241,69 @@ class WaterfallView(QGraphicsView):
         # Tiles evicted by the memory cap: drop their items.
         for first_row in [k for k in self._items if k < row0]:
             self._scene.removeItem(self._items.pop(first_row))
-        self._scene.setSceneRect(QRectF(0, row0, cols, total - row0))
+        # y = -(row): rows [row0, total) occupy y in [-total, -row0).
+        self._scene.setSceneRect(QRectF(0, -total, cols, total - row0))
         if not self._fitted_once:
             self._fit_width()
             self._fitted_once = True
         if self._follow:
-            self._scroll_to_bottom()
+            self._scroll_to_newest()
         self.viewport().update()
 
     def on_tile(self, first_row: int, image: QImage) -> None:
-        """One re-rendered tile from the service."""
+        """One re-rendered tile from the service (newest ping on top).
+
+        The tile pixmap is mirrored vertically and placed at
+        ``y = -(first_row + height)`` so that, with the ``y = -row`` scene
+        mapping, its rows land on their absolute indices with the newest
+        at the smallest (topmost) y.
+        """
+        h = image.height()
         item = self._items.get(first_row)
         if item is None:
             item = QGraphicsPixmapItem()
             item.setTransformationMode(Qt.SmoothTransformation)
-            item.setPos(QPointF(0, first_row))
             self._scene.addItem(item)
             self._items[first_row] = item
-        item.setPixmap(QPixmap.fromImage(image))
+        item.setPos(QPointF(0, -(first_row + h)))
+        item.setPixmap(QPixmap.fromImage(image.mirrored(False, True)))
+        self._evict_far_items(first_row)
         self.viewport().update()
+
+    def _visible_rows(self) -> Tuple[int, int]:
+        r = self.mapToScene(self.viewport().rect()).boundingRect()
+        return int(math.floor(-r.bottom())), int(math.ceil(-r.top()))
+
+    def _evict_far_items(self, keep_row: int) -> None:
+        if len(self._items) <= self._MAX_ITEMS:
+            return
+        lo, hi = self._visible_rows()
+        centre = 0.5 * (lo + hi)
+        by_dist = sorted(self._items, key=lambda k: abs(k - centre), reverse=True)
+        for first in by_dist[: len(self._items) - self._MAX_ITEMS]:
+            if first == keep_row:
+                continue
+            self._scene.removeItem(self._items.pop(first))
+
+    def _request_missing(self) -> None:
+        """After a scroll: ask for the visible tiles that were evicted."""
+        if self._total <= self._row0:
+            return
+        lo, hi = self._visible_rows()
+        lo, hi = max(lo, self._row0), min(hi, self._total - 1)
+        if hi < lo:
+            return
+        tile_rows = 512
+        first_tiles = range(self._row0 + ((lo - self._row0) // tile_rows) * tile_rows,
+                            hi + 1, tile_rows)
+        missing = [f for f in first_tiles if f not in self._items]
+        if missing:
+            self.tiles_requested.emit(min(missing), max(missing) + tile_rows - 1)
 
     def set_follow(self, follow: bool) -> None:
         self._follow = follow
         if follow:
-            self._scroll_to_bottom()
+            self._scroll_to_newest()
         self.follow_changed.emit(follow)
 
     # ---- interaction -----------------------------------------------------------
@@ -240,7 +328,7 @@ class WaterfallView(QGraphicsView):
         if moved > _CLICK_SLOP_PX or self._total <= self._row0:
             return
         sp = self.mapToScene(pos)
-        row = int(sp.y())
+        row = int(math.floor(-sp.y()))        # y = -(row)
         col = int(sp.x())
         if (self._row0 <= row < self._total
                 and 0 <= col < self._cols):
@@ -249,29 +337,29 @@ class WaterfallView(QGraphicsView):
     def scrollContentsBy(self, dx: int, dy: int) -> None:  # noqa: N802
         super().scrollContentsBy(dx, dy)
         self._update_follow_from_scrollbar()
+        self._request_missing()
 
     def _update_follow_from_scrollbar(self) -> None:
-        """Pin when at the bottom, release when the user scrolls away."""
+        """Pin when at the top (newest), release when the user scrolls away."""
         bar = self.verticalScrollBar()
-        at_bottom = bar.value() >= bar.maximum() - _PIN_TOLERANCE_PX
-        if at_bottom != self._follow:
-            self._follow = at_bottom
-            self.follow_changed.emit(at_bottom)
+        at_newest = bar.value() <= bar.minimum() + _PIN_TOLERANCE_PX
+        if at_newest != self._follow:
+            self._follow = at_newest
+            self.follow_changed.emit(at_newest)
 
-    def _scroll_to_bottom(self) -> None:
+    def _scroll_to_newest(self) -> None:
         bar = self.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        bar.setValue(bar.minimum())
 
     def _fit_width(self) -> None:
         rect = self._scene.sceneRect()
         if rect.width() <= 0:
             return
-        self.resetTransform()
         margin = 16
         factor = max(self._min_scale(), min(
             _MAX_SCALE,
             (self.viewport().width() - margin) / rect.width()))
-        self.scale(factor, factor)
+        self._apply_transform(factor)
 
     # ---- overlay ------------------------------------------------------------------
     def drawForeground(self, painter: QPainter, rect) -> None:  # noqa: N802
@@ -296,7 +384,7 @@ class WaterfallView(QGraphicsView):
             painter.resetTransform()
             painter.setFont(QFont("DejaVu Sans", 8))
             for det in self._detections:
-                pt = self.mapFromScene(det["col"] + 0.5, det["row"] + 0.5)
+                pt = self.mapFromScene(det["col"] + 0.5, -(det["row"] + 0.5))
                 pen = QPen(theme.COLOR_DETECTION, 1.6)
                 painter.setPen(pen)
                 painter.setBrush(Qt.NoBrush)
@@ -310,7 +398,7 @@ class WaterfallView(QGraphicsView):
             painter.save()
             painter.resetTransform()
             pt = self.mapFromScene(self._selected[1] + 0.5,
-                                   self._selected[0] + 0.5)
+                                   -(self._selected[0] + 0.5))
             pen = QPen(QColor(80, 220, 255), 1.8)
             painter.setPen(pen)
             painter.setBrush(Qt.NoBrush)
@@ -330,6 +418,6 @@ class WaterfallView(QGraphicsView):
         txt = f"{self._range_m:.0f} m  ⟶  STARBOARD"
         painter.drawText(w - painter.fontMetrics().horizontalAdvance(txt) - 8,
                          16, txt)
-        state = ("following newest ping ↓" if self._follow
-                 else "history view — scroll to bottom to follow")
+        state = ("following newest ping ↑" if self._follow
+                 else "history view — scroll to top to follow")
         painter.drawText(8, h - 8, state)
