@@ -29,7 +29,7 @@ tests, ``nadir_contrast`` off) the grid holds raw dB as before.
 
 from __future__ import annotations
 
-from dataclasses import replace as dc_replace
+from dataclasses import dataclass, replace as dc_replace
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -85,6 +85,9 @@ class MosaicService(QObject):
         self._rasterizer = PingRasterizer(self._cell_size)
         self._renderer = MosaicRenderer(
             percentiles=tuple(config.mosaic.contrast_percentiles))
+        # Same seed as the waterfall: the config gamma the slider shows.
+        self._renderer.settings = DisplaySettings(
+            gamma=float(getattr(config.display, "gamma", 1.0)))
         self._interpolate = False
         # Overlap policy default from config (see MosaicGrid.PRIORITY_MODES);
         # "closest" (smallest slant range) is SonarView's default.
@@ -98,6 +101,13 @@ class MosaicService(QObject):
         self._timer.setInterval(int(1000.0 / config.mosaic.mosaic_render_hz))
         self._timer.timeout.connect(self._render_if_dirty)
         self._timer.start()
+        # Display-settings debounce (same as the waterfall's): a slider
+        # drag applies once, not one full re-colormap per tick.
+        self._pending_settings: Optional[DisplaySettings] = None
+        self._display_timer = QTimer(self)
+        self._display_timer.setSingleShot(True)
+        self._display_timer.setInterval(self._DISPLAY_DEBOUNCE_MS)
+        self._display_timer.timeout.connect(self._apply_pending_display)
         # Partial re-colormapping: the last rendered raster and its RGBA
         # are kept so a ping that touched a sliver only re-colormaps that
         # sliver (the full-raster colormap was ~40 ms, 4x/s).
@@ -285,9 +295,11 @@ class MosaicService(QObject):
         e = db.copy()
         hh = h if h > 0.0 else snap.fallback_h
         r = np.hypot(np.abs(y), hh)
+        gains = self._model.gain_offsets(ping)
         for side, mask in ((0, y > 0.0), (1, y < 0.0)):
             if mask.any():
-                e[mask] = snap.normalise_samples(db[mask], r[mask], h, side)
+                e[mask] = snap.normalise_samples(db[mask], r[mask], h, side,
+                                                 gains[side])
         return dc_replace(ping, intensity_db=e)
 
     def flush_warmup(self) -> None:
@@ -310,10 +322,13 @@ class MosaicService(QObject):
                 self._autotune_countdown = self.AUTOTUNE_EVERY_PINGS
                 self._enforce_cell_budget()
         if self._model is not None:
-            if not self._model.frozen:
-                # Hold back until the mapping is final, so the grid is
-                # on ONE normalisation (bounded: the oldest are ingested
-                # with the running estimate if the warm-up overruns).
+            if not (self._model.frozen or self._model.ready):
+                # Hold back until the mapping exists at all, so the grid is
+                # not seeded on a normalisation that has seen nothing
+                # (bounded: the oldest are ingested with the running estimate
+                # if the warm-up overruns). Live the model is never frozen
+                # any more -- it re-publishes instead (display_model.py) --
+                # so readiness, not finality, is what releases the queue.
                 self._warmup.append(ping)
                 if len(self._warmup) > self._warmup_cap:
                     self._ingest(self._warmup.pop(0))
@@ -371,11 +386,24 @@ class MosaicService(QObject):
             self._force_render()
 
     def set_display(self, settings) -> None:
-        """Apply operator display settings (visualization only)."""
+        """Apply operator display settings (visualization only) —
+        debounced by ``_DISPLAY_DEBOUNCE_MS`` so a slider drag costs one
+        full re-colormap, not one per tick."""
+        self._pending_settings = settings
+        self._display_timer.start()
+
+    def _apply_pending_display(self) -> None:
+        settings, self._pending_settings = self._pending_settings, None
+        if settings is None:
+            return
+        if settings == self._renderer.settings:
+            return                      # nothing changed: keep the cache
         self._renderer.settings = settings
         self._unit_renderer.settings = settings.with_(
             gamma=1.0, auto_range=False, vmin_db=0.0, vmax_db=1.0)
         self._force_render()
+
+    _DISPLAY_DEBOUNCE_MS = 120
 
     def _model_active(self) -> bool:
         return self._model is not None and self._model.ready
@@ -406,7 +434,10 @@ class MosaicService(QObject):
         bbox = self._grid.consume_dirty_bbox()
         settings = self._renderer.settings
         active = self._model_active()
-        key = (h, w, stride, self._priority, self._interpolate, id(settings),
+        # Keyed on the settings VALUE (frozen dataclass), not id(): an
+        # equal settings object re-emitted by the panel used to miss the
+        # cache and force a full re-colormap.
+        key = (h, w, stride, self._priority, self._interpolate, settings,
                active, self._model.version if active else None)
         limits = None
         now = time.monotonic()
@@ -455,27 +486,35 @@ class MosaicService(QObject):
     def has_data(self) -> bool:
         return self._t_first is not None or bool(self._warmup)
 
-    def save_into(self, target: Path) -> Optional[Path]:
-        """Write mosaic .npz/.png + trajectory/depth CSV into ``target``."""
+    def export_snapshot(self) -> Optional["MosaicExport"]:
+        """An immutable copy of everything ``save_into`` writes (grid
+        planes, model items, trajectory), taken on the GUI thread so a
+        pool thread can write the files while pings keep accumulating
+        (project_review.md §3.4). None when nothing was accumulated."""
         # Pings still held for the model warm-up are data too: a session
         # shorter than the warm-up must not export an empty mosaic.
         self.flush_warmup()
         if self._t_first is None:
             return None
-        target.mkdir(parents=True, exist_ok=True)
         extra = {"value_domain": "raw_db"}
         if self._model is not None:
             extra = {"value_domain": ("normalised_db" if self._model.ready
                                       else "raw_db"),
                      **self._model.snapshot().npz_items()}
-        self._grid.save(target, extra=extra)  # unrendered, never interpolated
-        import csv
-        with open(target / "boat_trajectory.csv", "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["t_since_first_s", "x_m", "y_m", "depth_m"])
-            for t, (x, y), z in zip(self._depth_t, self._traj, self._depth_z):
-                w.writerow([f"{t:.3f}", f"{x:.3f}", f"{y:.3f}", f"{z:.3f}"])
-        return target
+        import copy
+        return MosaicExport(
+            grid=copy.deepcopy(self._grid), extra=extra,
+            trajectory=[(t, x, y, z) for t, (x, y), z
+                        in zip(self._depth_t, self._traj, self._depth_z)])
+
+    def save_into(self, target: Path) -> Optional[Path]:
+        """Write mosaic .npz/.png + trajectory/depth CSV into ``target``,
+        synchronously (offline rebuild; the live session writes the same
+        snapshot on a pool thread)."""
+        snap = self.export_snapshot()
+        if snap is None:
+            return None
+        return snap.write(Path(target))
 
     def save(self) -> Optional[Path]:
         """Legacy quick-save into data_root/<date> (used when no recording
@@ -483,3 +522,26 @@ class MosaicService(QObject):
         stamp = datetime.today().strftime("%Y_%m_%d-%H_%M")
         return self.save_into(
             Path(self._config.data_root).expanduser() / stamp)
+
+
+@dataclass
+class MosaicExport:
+    """Frozen export payload of a :class:`MosaicService` (see
+    :meth:`MosaicService.export_snapshot`); :meth:`write` is thread-safe
+    — it owns its grid copy."""
+
+    grid: MosaicGrid
+    extra: dict
+    trajectory: list                    # (t_since_first_s, x, y, depth)
+
+    def write(self, target: Path) -> Path:
+        target = Path(target)
+        target.mkdir(parents=True, exist_ok=True)
+        self.grid.save(target, extra=self.extra)  # unrendered, never interpolated
+        import csv
+        with open(target / "boat_trajectory.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["t_since_first_s", "x_m", "y_m", "depth_m"])
+            for t, x, y, z in self.trajectory:
+                w.writerow([f"{t:.3f}", f"{x:.3f}", f"{y:.3f}", f"{z:.3f}"])
+        return target

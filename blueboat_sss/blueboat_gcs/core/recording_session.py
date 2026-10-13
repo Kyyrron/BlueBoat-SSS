@@ -30,15 +30,28 @@ time falls inside the session window is *moved* to the **session root**,
 alongside ``metadata.json``. If the processor writes elsewhere, add that
 directory to the sweep list.
 
-Adoption timing: ``end()`` saves every artifact immediately but does
-NOT adopt — the ``log_enable=False`` message is asynchronous, and
-moving the file while the processor still holds its old absolute path
-open makes its next append recreate a headerless stub in ``data_root``.
-The caller schedules :meth:`adopt_now` after a short settle delay
-(``recording.adopt_delay_s``); STOP and app-close call it synchronously
-because pinging is already off there. Anything under ``sessions/`` or
-``merged_sessions/`` is never adopted (a merged session is derived
-data with the same primary-record protection, NC #6).
+Adoption timing: ``end()`` writes ``metadata.json`` and the detections
+immediately but does NOT adopt — the ``log_enable=False`` message is
+asynchronous, and moving the file while the processor still holds its
+old absolute path open makes its next append recreate a headerless
+stub in ``data_root``. The caller schedules :meth:`adopt_now` after a
+short settle delay (``recording.adopt_delay_s``); STOP and app-close
+call it synchronously because pinging is already off there. Anything
+under ``sessions/`` or ``merged_sessions/`` is never adopted (a merged
+session is derived data with the same primary-record protection, NC #6).
+
+Export threading (2026-09-15): the mosaic and waterfall files are the
+slow part of ``end()`` — 2.5–7.4 s of compressed npz on a full mission
+(project_review.md §3.4), which is exactly the "Record OFF / STOP
+freezes the app" field symptom. ``end()`` now takes immutable
+snapshots of both services on the GUI thread
+(``MosaicService.export_snapshot`` / ``WaterfallService.export_snapshot``)
+and hands them to one :class:`_ExportJob` on the global ``QThreadPool``
+(the same pool the seabed-image saves use); it returns as soon as
+``metadata.json`` is on disk. :meth:`wait_for_exports` blocks until
+the pool drains — the app's ``closeEvent`` calls it so the process
+never exits under a write, and a test that lists the session folder
+calls it before asserting. Record OFF and STOP themselves never wait.
 """
 
 from __future__ import annotations
@@ -51,7 +64,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from ..config.settings import AppConfig
 from ..models.detection import Detection
@@ -92,6 +105,38 @@ def update_session_metadata(session: Path, **updates) -> None:
         meta = {}
     meta.update(updates)
     write_session_metadata(session, meta)
+
+
+class _ExportJob(QRunnable):
+    """Write a session's ``mosaic/`` and ``waterfall/`` from frozen
+    snapshots off the GUI thread (see the module docstring). Failures
+    are reported on the status bus, never raised into the pool."""
+
+    def __init__(self, session: Path, mosaic_snap, waterfall_snap,
+                 signals: AppSignals) -> None:
+        super().__init__()
+        self._session = session
+        self._mosaic = mosaic_snap
+        self._waterfall = waterfall_snap
+        self._signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:  # noqa: D401
+        written = []
+        try:
+            if self._mosaic is not None:
+                self._mosaic.write(self._session / "mosaic")
+                written.append("mosaic")
+            if self._waterfall is not None:
+                self._waterfall.write(self._session / "waterfall")
+                written.append("waterfall")
+        except Exception as exc:  # pragma: no cover - reported, never raised
+            self._signals.status_message.emit(
+                f"WARNING: session {self._session.name} export failed: {exc}")
+            return
+        self._signals.status_message.emit(
+            f"Recording session saved to {self._session}"
+            + (f" ({', '.join(written)})" if written else " (no sonar data)"))
 
 
 class RecordingManager(QObject):
@@ -177,16 +222,27 @@ class RecordingManager(QObject):
         start_wall, self._start_wall = self._start_wall, None
         session = self.session_dir
 
-        self._mosaic.save_into(session / "mosaic")
-        self._waterfall.export_into(session / "waterfall")
+        # Snapshots on the GUI thread (cheap copies), files on the pool.
+        mosaic_snap = self._mosaic.export_snapshot()
+        waterfall_snap = self._waterfall.export_snapshot()
         self._write_detections(session)
         self._write_metadata(session, start_wall, [])
         self._pending_adoption = (session, start_wall, self._ping_count)
+        QThreadPool.globalInstance().start(
+            _ExportJob(session, mosaic_snap, waterfall_snap, self._signals))
 
         self.recording_state.emit(False)
         self._signals.status_message.emit(
-            f"Recording session saved to {session}")
+            f"Recording session {session.name} closed — mosaic and "
+            "waterfall are being written in the background.")
         return session
+
+    @staticmethod
+    def wait_for_exports(timeout_s: Optional[float] = None) -> bool:
+        """Block until every pending export (and seabed-image save) on
+        the global pool has finished; True when the pool drained."""
+        ms = -1 if timeout_s is None else max(int(timeout_s * 1000), 0)
+        return bool(QThreadPool.globalInstance().waitForDone(ms))
 
     def adopt_now(self) -> List[str]:
         """Run the deferred .svlog adoption of the last ended session.

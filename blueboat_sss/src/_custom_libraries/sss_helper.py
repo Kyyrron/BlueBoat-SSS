@@ -29,6 +29,40 @@ def project_to_world(
     return x_world, y_world
 
 
+def side_from_fields(channel_number: int,
+                     transducer_heading_deg: float) -> Optional[int]:
+    """Side identity of one profile: 0 = port, 1 = starboard, None = unresolved.
+
+    NON-NEGOTIABLE #1 / CM-5, in one place. ``channel_number`` decides
+    when it is 0 or 1. Otherwise (two field logs carry 255 on every
+    packet) the transducer bearing decides — **wrapped to (-180, 180]**
+    first: the device reports the mounting angle (-90 port / +90
+    starboard on 100 % of field packets), but a writer that encodes an
+    absolute compass bearing (the simulator did until 2026-09-15) puts
+    the same side at 270 as at -90, and a raw sign test mirrors it. A
+    bearing of exactly 0 (or 360), or a non-finite one, carries no side:
+    the caller falls back to the arrival topic and counts the packet,
+    rather than silently calling it port.
+
+    Ported verbatim to ``blueboat_gcs.core.live_native.resolve_side_of_profile``
+    and ``blueboat_gcs.core.svlog.side_of``; change all three together.
+    """
+    if channel_number in (0, 1):
+        return int(channel_number)
+    try:
+        h = float(transducer_heading_deg)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(h) or h == 0.0:
+        return None
+    rel = (h + 180.0) % 360.0 - 180.0
+    if rel == -180.0:
+        rel = 180.0
+    if rel == 0.0:
+        return None
+    return 1 if rel > 0.0 else 0
+
+
 def scale_to_db(
     pwr_u16: Sequence[int], min_pwr_db: float, max_pwr_db: float
 ) -> List[float]:

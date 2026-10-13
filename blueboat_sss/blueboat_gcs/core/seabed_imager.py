@@ -99,6 +99,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from ..config.settings import AppConfig
 from ..models.sonar import (SonarPing, build_slant_row, native_bins,
                             slant_col_to_y_local)
+from .along_track import AlongTrackEstimator
 from .display_model import DisplayModel, DisplayModelSnapshot
 
 SCHEMA_VERSION = 4
@@ -148,6 +149,10 @@ class SeabedImage:
     row_ping_index: Optional[np.ndarray] = None
     row_along_m: Optional[np.ndarray] = None
     row_geometry: str = "ping"
+    #: Receive-gain offsets [dB] per row, (H, 2) = (port, starboard): what
+    #: the display model removed (``20·log10(analog_gain / reference)``);
+    #: None / zeros = nothing removed (gain unknown).
+    row_gain_db: Optional[np.ndarray] = None
     #: The mission display model that maps this tile to pixels (frozen
     #: snapshot: safe on the save thread). None -> legacy per-image
     #: 2-98 % stretch of the raw dB (nadir_contrast off).
@@ -162,13 +167,19 @@ class SeabedImage:
             return np.asarray(self.row_bottom, dtype=np.float64)
         return np.asarray(self.row_altitude, dtype=np.float64)
 
+    def _gains(self) -> np.ndarray:
+        n = self.intensity_db.shape[0]
+        if self.row_gain_db is None:
+            return np.zeros((n, 2), np.float32)
+        return np.asarray(self.row_gain_db, dtype=np.float32).reshape(n, 2)
+
     def normalised(self) -> np.ndarray:
         """The model's normalised level ``e`` (raw dB untouched); the raw
         dB itself when no model applies."""
         if self.display is None or not self.display.ready:
             return self.intensity_db
         return self.display.normalise(self.intensity_db, self.bin_pitch_m,
-                                      self._bottoms())
+                                      self._bottoms(), self._gains())
 
     def to_png8(self) -> np.ndarray:
         if self.display is not None and self.display.ready:
@@ -191,6 +202,7 @@ class SeabedImage:
         along = (self.row_along_m if self.row_along_m is not None
                  else np.zeros(n))
         bottoms = self._bottoms()
+        gains = self._gains()
         return {
             "schema": SCHEMA_VERSION,
             "image_id": self.image_id,
@@ -240,7 +252,9 @@ class SeabedImage:
                  "altitude_m": float(self.row_altitude[i]),
                  "bottom_m": float(bottoms[i]),
                  "ping_index": int(ping_index[i]),
-                 "along_track_m": float(along[i])}
+                 "along_track_m": float(along[i]),
+                 "gain_port_db": float(gains[i, 0]),
+                 "gain_stbd_db": float(gains[i, 1])}
                 for i in range(n)
             ],
             "boat": self.boat_summary(),
@@ -292,6 +306,7 @@ class SeabedImage:
                             intensity_db=self.intensity_db,
                             row_altitude_m=np.asarray(self.row_altitude, np.float32),
                             row_bottom_m=self._bottoms().astype(np.float32),
+                            row_gain_db=self._gains(),
                             row_ping_index=(np.asarray(self.row_ping_index, np.int32)
                                             if self.row_ping_index is not None
                                             else np.arange(self.intensity_db.shape[0],
@@ -370,9 +385,16 @@ class SeabedImager(QObject):
         self._next_id = 0
         self._since_last = 0                 # pings since the last emission
         self._buf_rows: List[np.ndarray] = []
-        #: per buffered ping: (t, x, y, yaw, range, depth, speed, h, along_m)
+        #: per buffered ping: (t, x, y, yaw, range, depth, speed, h, along_m,
+        #: gain_port_db, gain_stbd_db)
         self._buf_meta: List[tuple] = []
-        self._last_pose: Optional[Tuple[float, float, float]] = None
+        # The one along-track estimator (core/along_track.py): the same
+        # ground speed × ping period the waterfall draws at true scale,
+        # integrated into the cumulative position the square rows sample.
+        at = getattr(config, "along_track", None)
+        self._track = AlongTrackEstimator(
+            window_s=float(getattr(at, "window_s", 5.0)),
+            pair_s=float(getattr(at, "pair_s", 1.0)))
         self._along = 0.0                    # cumulative along-track [m]
         self._s_emit: Optional[float] = None # along position of the last emission
         self._emitted_any = False
@@ -387,11 +409,17 @@ class SeabedImager(QObject):
         (i.e. while a recording session is active)."""
         self._out_dir = Path(out_dir) if out_dir is not None else None
 
+    @property
+    def along_track(self) -> AlongTrackEstimator:
+        """The imager's along-track estimator (the same class, fed the
+        same pings, as the waterfall's — so pitch and speed agree)."""
+        return self._track
+
     def reset(self) -> None:
         self._buf_rows.clear()
         self._buf_meta.clear()
         self._since_last = 0
-        self._last_pose = None
+        self._track.reset()
         self._along = 0.0
         self._s_emit = None
         self._next_id = 0
@@ -421,21 +449,21 @@ class SeabedImager(QObject):
         h = float(ping.bottom_slant_m)
         if h <= 0.0:
             h = max(float(ping.water_depth), 0.0)
+        gains = self._model.gain_offsets(ping)
         if self._owns_model:
-            self._model.observe_row(row, self._pitch, h)
-        speed = 0.0
-        if self._last_pose is not None:
-            dt = ping.t - self._last_pose[0]
-            step = math.hypot(ping.robot_x - self._last_pose[1],
-                              ping.robot_y - self._last_pose[2])
-            if dt > 1e-3:
-                speed = step / dt
-            self._along += step
-        self._last_pose = (ping.t, ping.robot_x, ping.robot_y)
+            self._model.observe_row(row, self._pitch, h, gains)
+        # Along-track: ground speed × ping period, integrated (the same
+        # estimate the waterfall draws at true scale, never the raw
+        # per-ping displacement, which repeated poses zero and jitter
+        # inflates — project_review.md §3.1).
+        self._track.observe(float(ping.t), float(ping.robot_x),
+                            float(ping.robot_y))
+        self._along = self._track.advance(float(ping.t))
+        speed = self._track.speed_mps
         self._buf_rows.append(row)
         self._buf_meta.append((ping.t, ping.robot_x, ping.robot_y, ping.yaw,
                                self._half * self._pitch, ping.water_depth,
-                               speed, h, self._along))
+                               speed, h, self._along, gains[0], gains[1]))
         self._since_last += 1
         if self._geometry == "ping":
             # Bound memory to one window.
@@ -482,7 +510,7 @@ class SeabedImager(QObject):
         self._buf_rows.clear()
         self._buf_meta.clear()
         self._since_last = 0
-        self._last_pose = None
+        self._track.reset()
         self._along = 0.0
         self._s_emit = None
 
@@ -528,8 +556,9 @@ class SeabedImager(QObject):
         bottoms = np.array([m[7] for m in meta], np.float64)
         along = np.array([m[8] for m in meta], np.float64)
         along = along - along.min()
+        gains = np.array([[m[9], m[10]] for m in meta], np.float32)
         self._finish(np.vstack(rows), t, pose, rng, depth, speed, bottoms,
-                     np.arange(n), along)
+                     np.arange(n), along, gains)
 
     def _emit_square(self, s_top: float, n_rows: int) -> None:
         """"square" geometry: picture row k (0 = newest) sits at along-track
@@ -545,7 +574,7 @@ class SeabedImager(QObject):
         nearest = np.where(np.abs(s[hi] - targets) < np.abs(targets - s[lo]),
                            hi, lo)
         arr = np.vstack([self._buf_rows[i] for i in nearest])
-        meta = np.array(self._buf_meta, np.float64)      # (n, 9)
+        meta = np.array(self._buf_meta, np.float64)      # (n, 11)
         span = np.maximum(s[hi] - s[lo], 1e-9)
         f = np.clip((targets - s[lo]) / span, 0.0, 1.0)
         f = np.where(s[hi] > s[lo], f, 0.0)
@@ -561,14 +590,15 @@ class SeabedImager(QObject):
         depth = meta[nearest, 5].astype(np.float32)
         speed = meta[nearest, 6].astype(np.float32)
         bottoms = meta[nearest, 7]
+        gains = meta[nearest, 9:11].astype(np.float32)
         self._finish(arr, t, pose, rng, depth, speed, bottoms,
                      nearest - int(nearest.min()) if nearest.size else nearest,
-                     targets - s[0])
+                     targets - s[0], gains)
 
     def _finish(self, arr, t, pose, rng, depth, speed, bottoms, ping_index,
-                along) -> None:
+                along, gains) -> None:
         image = self._build(arr, t, pose, rng, depth, speed, bottoms,
-                            ping_index, along, self._next_id)
+                            ping_index, along, gains, self._next_id)
         self._next_id += 1
         image.detections = self._analyzer(image)
         for det in image.detections:
@@ -593,7 +623,7 @@ class SeabedImager(QObject):
         self.image_ready.emit(image)
 
     def _build(self, arr, t, pose, rng, depth, speed, bottoms, ping_index,
-               along, image_id: int) -> SeabedImage:
+               along, gains, image_id: int) -> SeabedImage:
         """Assemble the picture (arrays already newest-first)."""
         W = arr.shape[1]
         # Per-pixel world grids (vectorized over the whole window); each
@@ -618,6 +648,7 @@ class SeabedImager(QObject):
             row_ping_index=np.asarray(ping_index, np.int32),
             row_along_m=np.asarray(along, np.float64),
             row_geometry=self._geometry,
+            row_gain_db=np.asarray(gains, np.float32).reshape(-1, 2),
             display=snap)
 
 

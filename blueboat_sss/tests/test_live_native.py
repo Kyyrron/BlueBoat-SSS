@@ -180,3 +180,71 @@ def test_live_and_replay_native_rows_are_identical():
     assert nl.extent_bins == nr.extent_bins == N
     np.testing.assert_array_equal(build_slant_row(nl, pitch, N),
                                   build_slant_row(nr, pitch, N))
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-15: analog gain through the live path; the wrapped side rule
+# ---------------------------------------------------------------------------
+def test_analog_gain_is_cached_and_attached_per_side():
+    pm, sm = fake_profile(0, 20), fake_profile(1, 20)
+    pm.analog_gain, sm.analog_gain = 142.8, 74.55
+    _, _, pp = profile_from_msg(pm)
+    _, _, sp = profile_from_msg(sm)
+    assert pp.analog_gain == pytest.approx(142.8) and sp.analog_gain == pytest.approx(74.55)
+    c = ProfileCache()
+    c.put(0, 20, pp)
+    c.put(1, 20, sp)
+    out, hits = attach_native(fields(P(0, 20), P(1, 20)), c)
+    assert hits == (True, True)
+    assert out["port_analog_gain"] == pytest.approx(142.8)
+    assert out["stbd_analog_gain"] == pytest.approx(74.55)
+    # A message without the field (older interface) reads as unknown = 0.
+    _, _, bare = profile_from_msg(fake_profile(0, 21))
+    assert bare.analog_gain == 0.0
+
+
+def test_side_rule_wraps_the_bearing_and_reports_unresolved():
+    from blueboat_gcs.core.live_native import resolve_side_of_profile as r
+    assert r(0, 123.0) == (0, True) and r(1, -123.0) == (1, True)
+    assert r(255, -90.0) == (0, True) and r(255, 90.0) == (1, True)
+    # An absolute-bearing writer (the simulator until 2026-09-15): 270 is
+    # the port transducer of a boat heading north, not starboard.
+    assert r(255, 270.0) == (0, True) and r(255, 450.0) == (1, True)
+    assert r(255, -270.0) == (1, True)
+    # No sign to read: port, flagged.
+    assert r(255, 0.0) == (0, False)
+    assert r(255, 360.0) == (0, False)
+    assert r(255, float("nan")) == (0, False)
+    side, _, _ = profile_from_msg(fake_profile(255, 1, heading=270.0))
+    assert side == 0
+
+
+def test_live_nadir_blank_matches_replay():
+    """Live applies the same nadir blank the replay decoder does.
+
+    Before 2026-09-19 ``depth.blank_nadir`` / ``nadir_blank_m`` were read
+    only by ``core/svlog.py``. The robot's processor passes no blank
+    (``sss_helper.py``), so live kept the transmit ringing -- measured at
+    55 dB, brighter than any seabed return in the file -- and painted it
+    down the track at ground range ~0.
+    """
+    port, stbd = P(0, 21), P(1, 21)
+    c0 = ProfileCache()
+    c0.put(0, 21, port.prof)
+    c0.put(1, 21, stbd.prof)
+    plain, _ = attach_native(fields(port, stbd), c0)
+    c1 = ProfileCache()
+    c1.put(0, 21, P(0, 21).prof)
+    c1.put(1, 21, P(1, 21).prof)
+    blanked, _ = attach_native(fields(port, stbd), c1, 0.75)
+
+    pitch = blanked["bin_size_m"]
+    n_blank = int(0.75 / pitch)
+    assert n_blank > 1
+    assert np.all(np.isnan(blanked["port_db"][:n_blank]))
+    assert np.all(np.isnan(blanked["stbd_db"][:n_blank]))
+    # everything past the blank is the verbatim profile, untouched
+    np.testing.assert_array_equal(blanked["port_db"][n_blank:],
+                                  plain["port_db"][n_blank:])
+    # and 0 (the default) keeps every bin, exactly as before
+    assert np.isfinite(plain["port_db"][:n_blank]).all()

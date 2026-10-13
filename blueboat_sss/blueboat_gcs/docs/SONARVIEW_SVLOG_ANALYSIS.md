@@ -58,7 +58,7 @@ dropping the row.
 
 ---
 
-## 3. Real ping loss (robot-side, not fixable inside the GCS)
+## 3. Real ping loss (node-side, not fixable inside the GCS)
 
 `ping_number` gaps in our file, routed by `channel_number`: **211 missing on channel 0
 (7.7 %) and 49 on channel 1 (1.8 %)** against a span of 2755 pings per side — 260 in
@@ -87,7 +87,7 @@ So the loss must be attacked without removing the topic:
    *GCS side (done):* subscriber depth raised to **200** (`sonar_stream.queue_depth`).
    A RELIABLE subscriber is **not** an option unless the publisher changes too —
    RELIABLE-subscriber/BEST_EFFORT-publisher is QoS-incompatible and would receive
-   nothing. *Robot side (recommended):* make both `sss_node`'s publishers and the
+   nothing. *Node side (recommended):* make both `sss_node`'s publishers and the
    processor's subscriptions RELIABLE with `depth=50`; at ~1.2 kB and 20 Hz per side
    this is cheap and removes the middleware as a loss source.
 2. **Serialization cost in the hot loop.** `_publish_raw` does
@@ -298,7 +298,7 @@ available altitude (locked → provisional → last known) and exposes `locked`
 separately, so quality can be reported without discarding data; the caller falls back
 to 0.0 (no correction) when nothing has ever been detected. **No ping is ever dropped
 for lack of a depth lock.** On `reflection_evidence.svlog`, 593 pings that were
-previously discarded are now displayed with a provisional altitude. The robot side
+previously discarded are now displayed with a provisional altitude. The processor
 carries the same behaviour in `sss_helper.FBRTracker`, and counts pings emitted while
 unlocked (`_unlocked_pings`) rather than pings dropped.
 
@@ -337,7 +337,7 @@ and the simulator that do not provide it.
 
 ---
 
-## 9. Robot-side state
+## 9. Node-side state
 
 ### 9.1 Side identity is read from the packet (done)
 
@@ -382,7 +382,7 @@ processor and re-recording gives **0.0 % mismatch with all 5250 profiles preserv
 
 ### 9.2 Live projection (done) and assembly (done)
 
-The live path is projected on the robot, so the mirror had to be fixed there too.
+The live path is projected in the processor, so the mirror had to be fixed there too.
 `_emit_group` resolves both the sign and the transducer offset per message through
 `_side_geometry`, applying the identical rule:
 
@@ -399,7 +399,7 @@ Consumers merge on the sign, not the field name.
 
 Assembly now matches the replay path: rows are keyed by `ping_number`, one-sided rows
 are published rather than dropped, and no ping is withheld while the bottom tracker
-bootstraps. A missing `/blueboat/odom` pose is the only remaining robot-side drop.
+bootstraps. A missing `/blueboat/odom` pose is the only remaining drop in the processor.
 
 ### 9.3 The two devices do not share a ping counter
 

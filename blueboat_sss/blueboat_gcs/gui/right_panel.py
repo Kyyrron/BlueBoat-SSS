@@ -249,6 +249,15 @@ class RightPanel(QWidget):
                   else DisplaySettings().gamma)
         self._gamma = self._slider(30, 300, int(round(gamma0 * 100)))  # 0.3 … 3.0
         self._gamma_lbl = QLabel()
+        self._gamma.setToolTip(
+            "Display-model transfer control (core/display_model.py).\n"
+            "transfer = power (default): the exponent γ of the power law\n"
+            "  u = 10^(γ·(e − hi)/10)  — 1 = SonarView's linear power,\n"
+            "  0.5 = amplitude, 0.7 = the shipped default.\n"
+            "transfer = db_window: the window is window_db / γ dB wide\n"
+            "  below hi — a larger value narrows the window (more contrast).\n"
+            "The same value is applied to the on-screen waterfall, the\n"
+            "mosaic and the AI pictures written by this window.")
         form.addRow("Contrast", self._wrap(self._gamma, self._gamma_lbl))
 
         self._bright = self._slider(-50, 50, 0)      # /100 -> -0.5 … +0.5
@@ -328,6 +337,20 @@ class RightPanel(QWidget):
     def _emit_opacity(self, value: int) -> None:
         self._opacity_lbl.setText(f"{value} %")
         self.sss_opacity_changed.emit(value / 100.0)
+
+    def emit_display(self) -> None:
+        """Re-emit the current display settings.
+
+        The box emits once at construction, before the window has
+        connected anything, so that first emission reaches nobody: the
+        services started on ``DisplaySettings()`` (γ 1.0) while the
+        slider showed ``display.gamma`` (0.7) and the AI pictures used
+        the config value — three different transfers on screen, in the
+        metadata and in the dataset. The window calls this right after
+        wiring ``display_changed`` so every consumer starts on the value
+        the slider shows.
+        """
+        self._emit_display()
 
     def _emit_display(self, *_args) -> None:
         gamma = self._gamma.value() / 100.0

@@ -1,5 +1,5 @@
 1.
-cd /blueboat_ws && . .venv/bin/activate && . install/setup.bash
+cd ~/ros2_ws && source env.sh
 ros2 launch blueboat_control BlueBoat_launch.py enable_motors:=True controller_type:='LoS' use_pinger:=True
 ros2 launch blueboat_control BlueBoat_launch.py enable_motors:=True
 
@@ -34,21 +34,28 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
 
 ----- App Simu SSS
 
-    cd src/BlueBoat-SideScanSonar/BlueBoat-SSS-Sim/blueboat_sss_sim
-    ros2 run blueboat_sss_sim generate_mission \
-        --config $(ros2 pkg prefix blueboat_sss_sim)/share/blueboat_sss_sim/config/default_mission.yaml \
-        --out ~/runs/r2 --seed 7 --speed 0.5
+    Create or edit worlds
 
-        # in ros2_ws/
-    cd ../../../../..
-    ros2 launch blueboat_sss_sim full_mission_launch.py mission_dir:=$HOME/runs/r2
+    cd ~/ros2_ws/
+    source env.sh
+    ros2 run blueboat_sss_sim world_builder
 
-    ros2 run blueboat_sss_sim export_scene_maps --bundle ~/runs/r2
+    Visualisation in Gazebo
+
+    ros2 launch blueboat_sss_sim sim_world_launch.py world_dir:=$HOME/worlds/<p>/<w>
+    ros2 launch blueboat_sss_sim full_mission_launch.py world_dir:=$HOME/worlds/<p>/<w>
+    ros2 launch blueboat_sss_sim full_mission_launch.py world_dir:=$HOME/worlds/<p>/<w> with_control:=true trajectory_file:=$HOME/.config/blueboat_mcs/trajectories/.deployed/<name>.yaml
+
+    ros2 run blueboat_sss_sim export_scene_maps --bundle $HOME/worlds/<p>/<w>
 
 ----- Live 
 
-    1. Launch file
-    ros2 launch blueboat_sss SSS_simple_launch.py range_length_mm:=20000 
+    The GCS starts the driver itself: toolbar "Sonar: Real sonars" (remembered),
+    then START. Defaults: 20 m, auto-gain, 1200 bins, pulse 0.00125.
+
+    1. Launch file (by hand, without the GCS)
+    ros2 launch blueboat_sss SSS_simple_launch.py
+    ros2 launch blueboat_sss SSS_simple_launch.py range_length_mm:=30000    (8.5 coverage pass)
 
     2. Topic commands
     Start pinging:

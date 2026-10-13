@@ -56,7 +56,7 @@ from ..core.svlog import (DEVICE_ID_PORT, DEVICE_ID_STBD, JSON_WRAPPER_ID,
                           OS_MONO_PROFILE_ID, FBRTracker,
                           decode_os_mono_profile, decode_session_header,
                           detect_fbr_slant_m, estimate_counter_offset,
-                          project_side, scale_to_db, side_of, walk_packets)
+                          project_side, scale_to_db, resolve_side, side_of, walk_packets)
 
 #: Across-track columns in the rendered waterfalls, matching
 #: ``mosaic.waterfall_columns`` in the shipped GCS config.
@@ -242,6 +242,10 @@ class SrcConsistency:
     @property
     def pct(self) -> float:
         return 100.0 * self.mismatches / self.profiles if self.profiles else 0.0
+
+    #: Packets whose side neither channel_number nor the (wrapped) bearing
+    #: carried — counted as port by the loader, reported here.
+    unresolved: int = 0
 
     @property
     def heading_fallback_pct(self) -> float:
@@ -443,8 +447,11 @@ def analyse(path: Path, *, render: bool = True,
         # The side rule itself lives in core.svlog.side_of and is called, not
         # restated here: it encodes NC #1 / CM-5, and a second copy of it in
         # this module is exactly the drift that rule exists to prevent.
-        ch = side_of({"channel_number": channel_number,
-                      "transducer_heading_deg": heading})
+        ch = resolve_side({"channel_number": channel_number,
+                           "transducer_heading_deg": heading})
+        if ch is None:
+            src.unresolved += 1
+            ch = 0
 
         if seg_index < 0:                  # profiles before any session header
             seg_index = 0
@@ -884,7 +891,10 @@ def render_report(r: Forensics, *, generated: Optional[str] = None) -> str:
     if r.src.heading_fallback_pct > 0:
         L.append(f"{r.src.heading_fallback_pct:.1f} % of packets carry a "
                  f"`channel_number` outside (0, 1); their side comes from the "
-                 f"sign of `transducer_heading_deg` (NC #1 / CM-5).")
+                 f"wrapped sign of `transducer_heading_deg` (NC #1 / CM-5).")
+        if r.src.unresolved:
+            L.append(f"**{r.src.unresolved} of them carried no usable bearing "
+                     f"either** (0 or non-finite) and were counted as port.")
         L.append("")
 
     L.append("## 6. Bottom detection (FBR)")

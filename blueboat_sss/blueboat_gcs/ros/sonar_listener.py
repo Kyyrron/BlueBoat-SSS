@@ -64,8 +64,13 @@ class SonarListener:
                  profile_topics: Optional[Sequence[str]] = None,
                  profile_queue_depth: int = 200,
                  profile_cache_per_side: int = 512,
-                 profile_wait_ms: int = 60) -> None:
+                 profile_wait_ms: int = 60,
+                 nadir_blank_m: float = 0.0) -> None:
         self._signals = signals
+        # The same nadir blank the replay decoder applies (core/svlog.py).
+        # Live had none: the robot's processor passes no blank, so the 55 dB
+        # transmit ringing went straight into the mosaic.
+        self._nadir_blank_m = max(float(nadir_blank_m), 0.0)
         self._warn_gaps = warn_on_ping_gap
         # Raw-profile attach (core/live_native): cache + in-order FIFO,
         # all touched on the executor thread only.
@@ -150,7 +155,7 @@ class SonarListener:
             self._emit(item, f, timed_out)
 
     def _emit(self, base: dict, f: ProcessedFields, timed_out: bool) -> None:
-        out, hits = attach_native(f, self._cache)
+        out, hits = attach_native(f, self._cache, self._nadir_blank_m)
         if self._profiles_enabled:
             for present, hit in ((f.port_pn, hits[0]), (f.stbd_pn, hits[1])):
                 if not present:

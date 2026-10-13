@@ -40,7 +40,7 @@ PKG_PARENT = Path(__file__).resolve().parents[1]
 if str(PKG_PARENT) not in sys.path:
     sys.path.insert(0, str(PKG_PARENT))
 
-# The robot-side helpers are installed flat into lib/blueboat_sss/ and import
+# The node-side helpers are installed flat into lib/blueboat_sss/ and import
 # each other with no package prefix, so tests reach them the same way the
 # nodes do: by directory, not by package.
 HELPERS = PKG_PARENT / "src" / "_custom_libraries"
@@ -51,12 +51,12 @@ GCS_ROOT = PKG_PARENT / "blueboat_gcs"
 REPO_ROOT = PKG_PARENT.parent
 
 # ``tools/`` is excluded from both sweeps: it holds the verbatim copies of
-# the robot-side converter, which need a sourced ROS 2 environment to
+# the node-side converter, which need a sourced ROS 2 environment to
 # import (CLAUDE.md NC #7). Their integrity is checked by hash instead.
 SWEEP_EXCLUDED_PARTS = ("tools",)
 
 # The ROS distribution modules the GCS may reach for. Blocking exactly
-# this set reproduces a ROS-free basestation laptop.
+# this set reproduces a ROS-free environment.
 ROS_MODULE_PREFIXES = (
     "rclpy",
     "std_msgs",

@@ -98,7 +98,7 @@ class GeoService(QObject):
         self.anchored.emit(float(lat0), float(lon0))
 
     def reset(self) -> None:
-        """Forget the anchor (new robot-side world origin expected)."""
+        """Forget the anchor (a new run, so a new world origin, expected)."""
         self._referencer = GeoReferencer(self._cfg)
         self._fixed_fit = None
         self._was_ready = False

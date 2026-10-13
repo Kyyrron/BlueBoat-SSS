@@ -188,8 +188,19 @@ From the Cerulean documentation (fetched 2026-09-05):
 
 So SonarView's visible behaviour — a bottom-tracked blank nadir, uniform seabed across
 the swath, black shadows, true-scale rows — is consistent with: a bottom tracker, a
-smooth range gain, a linear-power transfer, and a geometric row scale. None of it
-requires erasing data on our side; the same appearance is obtained by the mapping in §9.
+smooth range gain, a transfer on the per-ping dB-linear counts, and a geometric row
+scale. None of it requires erasing data on our side; the same appearance is obtained by
+the mapping in §9.
+
+**What SonarView actually records (added 2026-09-15, `project_review.md` §3.2/§3.5).**
+The "linear power" inference above was replaced by evidence: SonarLink writes its view
+state into the `.svlog` as packet id 12, and the July field log carries `gamma 0.2`
+with `signal_range_min 0.08` / `signal_range_max 0.85` — a **window on the normalised
+dB-linear counts** (`pwr_results` are dB, §8), i.e. a transfer that is linear in dB
+between two fractions of the per-ping span, with a strong gamma on top. That is the
+`db_window` transfer of §9 item 4, added next to the power law so the two can be
+compared on the same log; the power law stays the shipped default until a paired
+comparison on real data decides (`TODO.md`).
 
 ## 7. Geometry of the AI pictures
 
@@ -251,7 +262,14 @@ shadow at a fixed range biased its column's mean (vertical bands, lifted far rim
 2. **Normalisation** `e = db + TL(r) − A_side(r/h)` with `TL(r) = k·log10 r + 2αr`
    (defaults `k = 40`, `α = 0.1` dB/m — the physical part, §2) and `A_side(x)` an
    empirical curve in normalised slant range `x = r/h` (the grazing-angle part, §2),
-   per side because the two units carry independent gains. Per log-spaced bin of `x`
+   per side because the two units carry independent gains, **and per ping the
+   receive-gain step `g = 20·log10(analog_gain / 74.55)` is removed first** (2026-09-15;
+   reference = gain index 4, the simulator's calibration anchor). The per-side curve
+   absorbed a *static* gain difference between the units; the device's auto-gain walks
+   the ladder inside a recording, and each step is a level shift the curve cannot
+   follow — measured on two harbour logs, the downward steps match `20·log10` of the
+   reported `analog_gain` ratio to ~1 dB (the ladder is an amplitude gain). Per
+   log-spaced bin of `x`
    the **mode** of the level histogram over seabed samples (`r ≥ max(h, ringing)`) is
    read (immune to shadows, walls and targets while plain seabed holds the plurality;
    a median already shifts by half a texture deviation at 30 % contamination). The
@@ -268,22 +286,32 @@ shadow at a fixed range biased its column's mean (vertical bands, lifted far rim
    predicts a seabed far brighter than anything in the water column, so `e` falls tens
    of dB below the seabed level and the transfer sends it to black. Nothing is masked,
    nothing erased; the raw float dB is kept (§1, §5).
-4. **Transfer** `p = 10^(γ·(e − hi)/10)`, a power law with exponent `γ` (operator
-   "Contrast"; `γ = 1` is SonarView's linear power, `γ = 0.5` amplitude), `hi` a robust
-   high percentile of `e` over seabed samples, no low handle (§5); above a soft `knee`
-   (0.7) highlights are compressed, `u = knee + (1−knee)(1 − e^{−(p−knee)/(1−knee)})`,
-   so a wall face keeps its texture for a few dB past `hi` instead of clipping. Shadows
-   go black because they are 15–40 dB below `hi`, not because a threshold was set.
-   Defaults calibrated on the 2026-09-04 simulation log against SonarView's screenshot
-   of the 2026-09-03 log: `γ = 0.7`, `hi` = p95 (median seabed brightness matched, ~4 %
-   of seabed pixels saturated), `knee = 0.7`, `curve_tolerance_db = 6`.
+4. **Transfer** — two, `display.transfer` (2026-09-15). `power` (default):
+   `p = 10^(γ·(e − hi)/10)`, a power law with exponent `γ` (operator "Contrast"; `γ = 1`
+   is linear power, `γ = 0.5` amplitude), `hi` a robust high percentile of `e` over
+   seabed samples, no low handle (§5); above a soft `knee` (0.7) highlights are
+   compressed, `u = knee + (1−knee)(1 − e^{−(p−knee)/(1−knee)})`, so a wall face keeps
+   its texture for a few dB past `hi` instead of clipping. `db_window`:
+   `u = clip((e − (hi − W)) / W, 0, 1)` with `W = window_db / γ` (40 dB at γ 1), linear in
+   dB with a hard clip and no knee — the shape of SonarView's recorded view state (§6).
+   Shadows go black under both because they are 15–40 dB below `hi`, not because a
+   threshold was set. Defaults calibrated on the 2026-09-04 simulation log against
+   SonarView's screenshot of the 2026-09-03 log: `γ = 0.7`, `hi` = p95 (median seabed
+   brightness matched, ~4 % of seabed pixels saturated), `knee = 0.7`,
+   `curve_tolerance_db = 6`; the choice between the two transfers is open (`TODO.md`).
 5. **Invertibility**: the JSON of every picture carries the model (`k`, `α`, bin
-   centres, the two curves, `hi`, `γ`, `knee`) and the `.npz` the curves and the raw dB;
-   `p = u` below the knee else `knee − (1−knee)·ln(1 − (u−knee)/(1−knee))`,
-   `e = hi + (10/γ)·log10 p`, `db = e − TL(r) + A(x)`.
+   centres, the two curves, `hi`, `γ`, `knee`, `transfer`, `window_db`, the gain
+   reference) and per row the gain offsets removed; the `.npz` the curves, the raw dB
+   and `row_gain_db`. Power: `p = u` below the knee else
+   `knee − (1−knee)·ln(1 − (u−knee)/(1−knee))`, `e = hi + (10/γ)·log10 p`; window:
+   `e = hi − W + u·W`; then `db = e − TL(r) + A(x) + g`.
 6. **Display geometry**: the on-screen waterfall is drawn at true scale (along-track
-   metres per ping over the bin pitch, §1); the AI pictures are resampled to square
-   pixels by nearest-ping selection with the ping index recorded per row (§7).
+   metres per ping over the bin pitch, §1) — since 2026-09-15 from one estimator shared
+   with the pictures: ground speed over a ~5 s window of ping poses × the ping period,
+   because the raw per-ping displacement is biased low at 20 Hz where consecutive pings
+   share a pose sample (`project_review.md` §3.1); the AI pictures are resampled to
+   square pixels by nearest-ping selection along that same integrated position, with
+   the ping index recorded per row (§7).
 7. **Not done, by decision**: no despeckling in the feed (§3); no histogram equalisation
    in the feed (§5); no bottom-tracked mask (§1, §6).
 

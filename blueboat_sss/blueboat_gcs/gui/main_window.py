@@ -18,8 +18,8 @@ import numpy as np
 
 from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QCloseEvent, QImage
-from PySide6.QtWidgets import (QDockWidget, QMainWindow, QScrollArea,
-                               QStackedWidget)
+from PySide6.QtWidgets import (QDockWidget, QMainWindow, QMessageBox,
+                               QScrollArea, QStackedWidget)
 
 from ..config.settings import AppConfig
 from ..core.geo_service import GeoService
@@ -32,6 +32,7 @@ from ..models.detection import Detection, PingerFix
 from ..models.path import PlannedPath
 from ..models.robot_state import RobotState
 from ..models.sonar import SonarPing
+from ..ros import sonar_source as ss
 from ..utils.pose_alignment import (FrozenPoseDetector, HeadingPolicy,
                                     robot_to_world)
 from . import left_panel as lp
@@ -263,6 +264,11 @@ class MainWindow(QMainWindow):
         self.right_panel.priority_changed.connect(
             self.recording.note_priority_mode)
         self.right_panel.display_changed.connect(self._on_display_changed)
+        # The panel's construction-time emission reached nobody: push the
+        # slider's value to both services and the session metadata now,
+        # so the screen, the pictures and metadata.json start on the same
+        # transfer (RightPanel.emit_display).
+        self.right_panel.emit_display()
         self.right_panel.resolution_changed.connect(self._on_resolution_changed)
         self.right_panel.depth_mode_changed.connect(self._on_depth_mode_changed)
         self.right_panel.clear_overlays_clicked.connect(
@@ -283,6 +289,14 @@ class MainWindow(QMainWindow):
         self.toolbar.stop_clicked.connect(self._on_stop)
         self.toolbar.record_toggled.connect(self._on_record_toggled)
         self.toolbar.console_toggled.connect(self._console_dock.setVisible)
+        # Sonar source (Simulation / Real sonars): only a ROS pipeline has
+        # one to choose; the built-in --sim simulator does not.
+        has_source = hasattr(self._acquisition, "set_source")
+        self.toolbar.set_sonar_selector_available(has_source)
+        if has_source:
+            self.toolbar.set_sonar_source(self._acquisition.source)
+        self.toolbar.sonar_source_changed.connect(
+            self._on_sonar_source_changed)
 
         # Apply the initial (all-disabled) layer states to the scene so
         # checkboxes and items agree at startup.
@@ -321,7 +335,10 @@ class MainWindow(QMainWindow):
             self._pending_swath = None
 
     def _on_planned_path(self, path: PlannedPath) -> None:
-        # A new message fully replaces the previously displayed path.
+        # A new path fully replaces the previously displayed one (an empty
+        # one clears it). World-frame poses, drawn as they come: the
+        # listener asks the running path server for the whole mission
+        # (ros/path_listener.py), /set_path being its fallback.
         self.planned_path_layer.set_path(path.points)
 
     def _on_robot_state(self, state: RobotState) -> None:
@@ -414,7 +431,7 @@ class MainWindow(QMainWindow):
         elsewhere — the live '(0,0) pings with GPS on' pathology (the
         processor's /blueboat/odom is zeroed or clock-mismatched; rosbag
         replays are sane because their odom is synthesized). A console
-        warning identifies the robot-side root cause once.
+        warning identifies the upstream root cause once.
         """
         mode = self._config.alignment.pose_source
         ping = self._restamp_ping_heading(ping)
@@ -432,7 +449,7 @@ class MainWindow(QMainWindow):
                     "app",
                     "ALIGNMENT: ProcessedSSSPing poses are frozen at (0,0) "
                     "while the boat moves — re-stamping pings from GCS "
-                    "telemetry. Root cause is robot-side: /blueboat/odom "
+                    "telemetry. Root cause is upstream: /blueboat/odom "
                     "seen by sss_processor_node is zeroed or its stamps "
                     "are on a different clock than the sonar profiles "
                     "(see HANDOVER 'Sea-trial pose alignment').")
@@ -546,6 +563,17 @@ class MainWindow(QMainWindow):
         # One settings object drives both views identically.
         self._mosaic_service.set_display(settings)
         self.waterfall_service.set_display(settings)
+        # ... and the pictures too. The transfer exponent lives on the
+        # display model, which is what the seabed imager writes its PNGs
+        # through; until 2026-09-18 the slider reached the screen and the
+        # mosaic but not `DisplayModel.gamma`, so a session run at the
+        # operator's contrast saved its AI pictures at the config's
+        # (0.48 on screen, 0.7 on disk -- 2026-09-18 review par. 3.11).
+        # Every picture stores the gamma it was written with, so old
+        # sessions stay interpretable either way.
+        g = float(getattr(settings, "gamma", self.display_model.gamma))
+        if np.isfinite(g) and g > 0.0:
+            self.display_model.gamma = g
         self.recording.note_display_settings(settings)
 
     def _on_clear_sss(self) -> None:
@@ -578,6 +606,13 @@ class MainWindow(QMainWindow):
             cleared.append("pinger")
         if self.left_panel.is_layer_enabled(lp.LAYER_PLANNED_PATH):
             self.planned_path_layer.clear()
+            # The listener drops verbatim re-sends of the path it last
+            # forwarded and asks the path server once per deployment;
+            # forget both so the next poll (or /set_path's next 5 s
+            # refresh) redraws the mission the operator just cleared.
+            reset = getattr(self._acquisition, "reset_planned_path", None)
+            if reset is not None:
+                reset()
             cleared.append("planned path")
         # Measurements, the selected point and the range line have no
         # visibility checkbox: they are on screen, hence "currently
@@ -722,6 +757,32 @@ class MainWindow(QMainWindow):
         self.toolbar.on_viz_state(True)
         self.statusBar().showMessage("Live acquisition started.", 6000)
 
+    def _on_sonar_source_changed(self, source: str) -> None:
+        """Toolbar "Sonar" selector. The choice is remembered; a pipeline
+        that is up is stopped (STOP: pinging off, an open recording session
+        saved) and launched again with it, after the operator confirms."""
+        acq = self._acquisition
+        if not hasattr(acq, "set_source"):
+            return
+        state = getattr(getattr(acq, "state", None), "value", "stopped")
+        up = state in ("starting", "running", "stopping")
+        if up:
+            text = (f"Switch the sonar to {ss.LABELS[ss.normalise(source)]}?"
+                    "\n\nThe processing pipeline is stopped and started again"
+                    + (", and the recording session is closed and saved"
+                       if self.recording.active else "") + ".")
+            answer = QMessageBox.question(self, "Sonar source", text)
+            if answer != QMessageBox.StandardButton.Yes:
+                self.toolbar.set_sonar_source(acq.source)
+                return
+            self._on_stop()
+        ss.store_source(source)
+        acq.set_source(source, relaunch=up)
+        self.statusBar().showMessage(
+            f"Sonar: {ss.LABELS[ss.normalise(source)]}"
+            + (" — restarting the pipeline." if up
+               else " — used by the next pipeline start."), 8000)
+
     def _on_record_toggled(self, on: bool) -> None:
         """Record ON/OFF — independent from visualization."""
         if on:
@@ -814,4 +875,7 @@ class MainWindow(QMainWindow):
         self.recording.adopt_now()   # never lose a deferred adoption on exit
         self._acquisition.disable_pinging()
         self._acquisition.stop()
+        # The mosaic/waterfall export and the seabed-image saves run on
+        # the pool; the process must not exit under them.
+        self.recording.wait_for_exports()
         super().closeEvent(event)

@@ -43,14 +43,39 @@ class CachedProfile:
     length_mm: int
     num_results: int
     gain_index: int
+    #: The device's reported amplitude gain of this profile (0 = unknown).
+    analog_gain: float = 0.0
 
 
 def side_of_profile(channel_number: int, transducer_heading_deg: float) -> int:
     """CM-5: side from the packet — ``channel_number`` (0 port / 1 stbd),
-    falling back to the sign of the transducer bearing."""
+    falling back to the sign of the transducer mounting angle, **wrapped
+    to (−180, 180]** (the device reports a constant ±90; the simulator
+    used to report an absolute bearing in [0, 360), which an unwrapped
+    sign misread as starboard at every heading). A heading of exactly 0
+    or non-finite is unresolvable and lands on port; the caller counts
+    it through :func:`resolve_side_of_profile`."""
+    side, _resolved = resolve_side_of_profile(channel_number,
+                                              transducer_heading_deg)
+    return side
+
+
+def resolve_side_of_profile(channel_number: int,
+                            transducer_heading_deg: float) -> Tuple[int, bool]:
+    """(side, resolved): the same rule as ``sss_helper.side_from_fields``
+    in the processor and ``core.svlog.resolve_side`` on replay, ported verbatim
+    so the three cannot drift — channel 0/1 decides, else the **wrapped**
+    sign of the transducer bearing; a bearing of exactly 0 or a non-finite
+    one resolves nothing (``resolved`` False, side port)."""
     if channel_number in (0, 1):
-        return int(channel_number)
-    return 1 if float(transducer_heading_deg) > 0.0 else 0
+        return int(channel_number), True
+    h = float(transducer_heading_deg)
+    if not np.isfinite(h) or h == 0.0:
+        return 0, False
+    rel = (h + 180.0) % 360.0 - 180.0
+    if rel == -180.0:
+        rel = 180.0
+    return (1 if rel > 0.0 else 0), rel != 0.0
 
 
 def profile_from_msg(msg: Any) -> Tuple[int, int, CachedProfile]:
@@ -63,7 +88,8 @@ def profile_from_msg(msg: Any) -> Tuple[int, int, CachedProfile]:
     prof = CachedProfile(db=np.asarray(db, dtype=np.float32),
                          start_mm=int(msg.start_mm), length_mm=int(msg.length_mm),
                          num_results=int(msg.num_results),
-                         gain_index=int(getattr(msg, "gain_index", -1)))
+                         gain_index=int(getattr(msg, "gain_index", -1)),
+                         analog_gain=float(getattr(msg, "analog_gain", 0.0) or 0.0))
     return side, int(msg.ping_number), prof
 
 
@@ -127,7 +153,8 @@ class ProcessedFields:
     stbd_db: np.ndarray
 
 
-def attach_native(f: ProcessedFields, cache: ProfileCache
+def attach_native(f: ProcessedFields, cache: ProfileCache,
+                  nadir_blank_m: float = 0.0
                   ) -> Tuple[Dict[str, Any], Tuple[bool, bool]]:
     """SonarPing keyword fields for the native payload of one row.
 
@@ -135,11 +162,21 @@ def attach_native(f: ProcessedFields, cache: ProfileCache
     verbatim profile was attached; a miss means the re-projection
     fallback (``side_bins_from_ground``) was used for that side. An
     absent side (``*_pn == 0``) is neither.
+
+    ``nadir_blank_m`` NaNs the first slant metres of each side, exactly as
+    ``core/svlog.py`` does on replay through ``clamp_nadir_mask``. Live had
+    no equivalent before 2026-09-19 -- the robot's processor passes no blank
+    (``sss_helper.py``: "This node passes no blank") and ``depth.*`` was read
+    only by the replay decoder -- so the transmit ringing, measured at 55 dB
+    and brighter than any seabed return in the file, went into the live
+    mosaic at ground range ~0 and painted a saturated stripe down the track.
+    0 keeps the old behaviour.
     """
     depth = max(float(f.water_depth), 0.0)
     out: Dict[str, Any] = {"bin_size_m": 0.0, "port_bin0": 0, "port_db": None,
                            "stbd_bin0": 0, "stbd_db": None,
                            "stbd_bin_size_m": 0.0, "gain_index": -1,
+                           "port_analog_gain": 0.0, "stbd_analog_gain": 0.0,
                            # Exact parity with replay's ``fbr.bottom``:
                            # water_depth = altitude + submersion.
                            "bottom_slant_m": max(depth - TRANSDUCER_SUBMERSION_M, 0.0)}
@@ -157,10 +194,17 @@ def attach_native(f: ProcessedFields, cache: ProfileCache
             hits[side] = True
             if prof.gain_index >= 0:
                 out["gain_index"] = prof.gain_index
+            out["port_analog_gain" if side == 0 else "stbd_analog_gain"] = \
+                float(prof.analog_gain)
         else:
             bin0, vals, size = side_bins_from_ground(np.abs(y), db, depth)
             if size <= 0.0:
                 continue
+        if nadir_blank_m > 0.0 and size > 0.0:
+            n_blank = int(max(0.0, nadir_blank_m / size - bin0))
+            if n_blank > 0:
+                vals = np.array(vals, dtype=np.float32, copy=True)
+                vals[:min(n_blank, vals.size)] = np.nan
         sizes[side] = size
         if side == 0:
             out["port_bin0"], out["port_db"] = bin0, vals

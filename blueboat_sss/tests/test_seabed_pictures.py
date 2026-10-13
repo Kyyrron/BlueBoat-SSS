@@ -184,3 +184,69 @@ def test_live_and_replay_pings_give_identical_pictures(qapp):
     for ia, ib in zip(a, b):
         np.testing.assert_array_equal(ia.to_png8(), ib.to_png8())
         np.testing.assert_array_equal(ia.intensity_db, ib.intensity_db)
+
+
+@pytest.mark.parametrize("transfer", ["power", "db_window"])
+def test_picture_and_waterfall_share_the_mapping_under_both_transfers(
+        qapp, tmp_config, transfer):
+    cfg = tmp_config
+    cfg.display.transfer = transfer
+    cfg.seabed.rows, cfg.seabed.stride = 16, 8
+    cfg.seabed.row_geometry = "ping"
+    pings = make_pings(64, step_m=0.1)
+    model = DisplayModel.fit(cfg, pings)
+    assert model.snapshot().transfer == transfer
+    images = run(cfg, pings, model)
+    img = images[-1]
+    assert img.metadata()["display_model"]["transfer"] == transfer
+    svc = WaterfallService(cfg, model)
+    for p in pings:
+        svc.on_sonar_ping(p)
+    chrono = svc.chronological()
+    unit = svc.render_unit(chrono, svc._meta_chrono()[:, 5])
+    wf_png = np.rint(np.nan_to_num(unit, nan=0.0) * 255).astype(np.uint8)
+    np.testing.assert_array_equal(img.to_png8(), wf_png[-16:][::-1])
+
+
+def test_pictures_carry_the_gain_columns_and_still_invert(qapp, tmp_path):
+    """Pings recorded one gain index up (analog 142.8) are +5.65 dB louder
+    on the wire; the picture normalises them onto the others, records the
+    offset per row and side, and the PNG still inverts to the raw dB."""
+    g = 20 * np.log10(142.8 / 74.55)
+    cfg = AppConfig()
+    cfg.seabed.rows, cfg.seabed.stride = 16, 8
+    cfg.seabed.row_geometry = "ping"
+    from dataclasses import replace as dc_replace
+    pings = make_pings(64, step_m=0.1)
+    for i in range(len(pings)):
+        if i % 2:
+            p = pings[i]
+            pings[i] = dc_replace(p, port_db=p.port_db + g, stbd_db=p.stbd_db,
+                                  port_analog_gain=142.8, stbd_analog_gain=74.55)
+    model = DisplayModel.fit(cfg, pings)
+    img = run(cfg, pings, model)[-1]
+    meta = img.metadata()
+    rows = meta["rows_data"]
+    assert {"gain_port_db", "gain_stbd_db"} <= set(rows[0])
+    gp = np.array([r["gain_port_db"] for r in rows])
+    assert set(np.round(gp, 3)) == {0.0, round(g, 3)}
+    assert all(r["gain_stbd_db"] == 0.0 for r in rows)
+    assert img.row_gain_db.shape == (16, 2)
+    # The louder port rows read like the others once normalised.
+    e = img.normalised()
+    port = e[:, :N]
+    loud = gp > 0
+    assert abs(np.nanmedian(port[loud]) - np.nanmedian(port[~loud])) < 0.5
+    # And the PNG inverts back to the raw (louder) dB with the gain rows.
+    snap = img.display
+    png = img.to_png8()
+    back = snap.invert_rows(png / 255.0, img.bin_pitch_m, img.row_bottom,
+                            gain_rows=img.row_gain_db)
+    u = snap.to_unit(snap.normalise(img.intensity_db, img.bin_pitch_m,
+                                    img.row_bottom, img.row_gain_db))
+    good = (u > 0.1) & (u < 0.65)
+    step_db = (10.0 / snap.gamma) * np.log10(1.0 + 1.0 / 25.0)
+    assert np.abs(back[good] - img.intensity_db[good]).max() < 2.0 * step_db
+    _png, json_path = img.save(tmp_path)
+    with np.load(json_path.with_name(json_path.stem + "_world.npz")) as z:
+        assert z["row_gain_db"].shape == (16, 2)

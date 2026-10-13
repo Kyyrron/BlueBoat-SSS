@@ -40,7 +40,7 @@ from ..models.robot_state import RobotState
 from ..utils.geodesy import navsat_fix_ok, quat_to_yaw, yaw_to_compass_deg
 from ..utils.pose_alignment import GpsPoseSynthesizer
 
-try:  # pragma: no cover - mavros_msgs may be absent on the basestation
+try:  # pragma: no cover - mavros_msgs may be absent (no MAVROS installed)
     from mavros_msgs.msg import VfrHud
     MAVROS_MSGS_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -148,7 +148,8 @@ class TelemetryListener:
                 "ALIGNMENT: /blueboat/odom is "
                 + ("silent" if odom_dead else "frozen at the origin")
                 + " while the GPS fix moves — RobotState is now GPS+compass "
-                  "dead-reckoned (fix the robot-side odom publisher; see "
+                  "dead-reckoned (fix the /blueboat/odom publisher, "
+                  "robot_interface; see "
                   "HANDOVER 'Sea-trial pose alignment').")
         self._signals.robot_state.emit(RobotState(
             t=t, x=x, y=y, yaw=yaw, lat=lat, lon=lon,

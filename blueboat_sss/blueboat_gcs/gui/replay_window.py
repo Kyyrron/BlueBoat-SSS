@@ -275,6 +275,7 @@ class ReplayWindow(QMainWindow):
         p.view_mode_changed.connect(self._on_view_mode)
         p.priority_changed.connect(self.mosaic_service.set_priority_mode)
         p.display_changed.connect(self._on_display)
+        p.emit_display()      # the slider's value, not DisplaySettings()
         p.sss_opacity_changed.connect(self.mosaic_layer.set_opacity)
         p.resolution_changed.connect(self._on_resolution_changed)
         p.depth_mode_changed.connect(self._on_depth_mode_changed)

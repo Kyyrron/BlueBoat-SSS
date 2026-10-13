@@ -569,3 +569,15 @@ def test_status_floats_are_not_acoustic(rel):
 def test_length_mm_fixture_is_the_documented_default():
     """Guards the import from test_svlog_forensics against silent drift."""
     assert LENGTH_MM == 20000
+
+
+def test_decoder_and_loader_carry_the_analog_gain(tmp_path):
+    """The per-ping receive gain rides through replay so the display model
+    can remove the gain ladder's level steps (project_review.md §3.2)."""
+    from blueboat_gcs.core.svlog import decode_os_mono_profile
+    pkt = profile_packet(0, 1, 50)
+    assert decode_os_mono_profile(pkt[8:-2])["analog_gain"] == pytest.approx(1.0)
+    mission = load_svlog(build_log(tmp_path / "gain.svlog", 20))
+    p = mission.pings[0]
+    assert p.port_analog_gain == pytest.approx(1.0)
+    assert p.stbd_analog_gain == pytest.approx(1.0)

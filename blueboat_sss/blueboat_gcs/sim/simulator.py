@@ -93,6 +93,9 @@ class Simulator(QObject):
     def reset_stream_health(self) -> None:
         """Interface parity with PipelineLauncher (no-op in simulation)."""
 
+    def reset_planned_path(self) -> None:
+        """Interface parity with PipelineLauncher (no-op in simulation)."""
+
     def set_range(self, range_m: float) -> bool:
         """Interface parity with PipelineLauncher: the simulator's swath
         is fixed, so the request is refused gracefully."""

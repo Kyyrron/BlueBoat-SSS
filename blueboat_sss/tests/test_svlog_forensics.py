@@ -32,7 +32,7 @@ from blueboat_gcs.analysis.svlog_forensics import (SvlogForensicsError, analyse,
                                                    main, render_comparison,
                                                    render_report)
 
-# ``svlog_helper`` is the robot-side frame writer and is ROS-free; using it
+# ``svlog_helper`` is the node-side frame writer and is ROS-free; using it
 # rather than hand-rolling frames means the synthetic files carry real
 # checksums and a real header layout.
 HELPERS = PKG_PARENT / "src" / "_custom_libraries"
@@ -478,3 +478,36 @@ def test_src_tag_is_uncorrelated_on_the_channel_255_logs():
         assert r.src.heading_fallback_pct == 100.0
         assert 35.0 < r.src.pct < 60.0, (rel, r.src.pct)
         assert set(r.params) == {0, 1}, "both sides recovered from the heading"
+
+
+def test_side_fallback_wraps_an_absolute_bearing(tmp_path):
+    """A writer that encodes an absolute compass bearing (the simulator
+    until 2026-09-15) puts a north-heading boat's port transducer at 270:
+    a raw sign test called that starboard — SonarView's mirrored pictures
+    of the simulator logs (project_review.md §3.6). The wrapped rule does
+    not."""
+    packets = [session_packet()]
+    for n in range(20):
+        packets.append(profile_packet(255, n, n * 50, heading=270.0,
+                                      src=svlog_helper.DEVICE_ID_PORT))
+        packets.append(profile_packet(255, n, n * 50, heading=90.0,
+                                      src=svlog_helper.DEVICE_ID_STBD))
+    r = analyse(write_log(tmp_path / "abs270.svlog", packets), render=False)
+    assert r.segments[0].channels[0].n == 20      # 270 -> port
+    assert r.segments[0].channels[1].n == 20
+    assert r.src.mismatches == 0 and r.src.unresolved == 0
+
+
+def test_unresolved_side_is_counted_and_reported(tmp_path):
+    from blueboat_gcs.analysis.svlog_forensics import render_report
+    from blueboat_gcs.core.svlog import load_svlog
+    packets = [session_packet()]
+    for n in range(10):
+        packets.append(profile_packet(255, n, n * 50, heading=0.0,
+                                      src=svlog_helper.DEVICE_ID_PORT))
+    path = write_log(tmp_path / "nosign.svlog", packets)
+    r = analyse(path, render=False)
+    assert r.src.unresolved == 10
+    assert r.segments[0].channels[0].n == 10      # landed on port, visibly
+    assert "no usable bearing" in render_report(r)
+    assert load_svlog(path).unresolved_side == 10

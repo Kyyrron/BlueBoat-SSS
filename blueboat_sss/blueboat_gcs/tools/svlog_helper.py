@@ -78,7 +78,7 @@ DEFAULT_MAVLINK_FILTER: str = (
 # Mavlink message subscription list reported in session_platform.options.
 # These are the mavlink message_id + rate pairs the SonarView/SonarLink
 # server requests from BlueOS. Purely descriptive in our case -- mavros
-# does the real subscribing on the robot. Values match what SonarView
+# does the real subscribing in our stack. Values match what SonarView
 # itself writes in reference .svlog files.
 DEFAULT_PERIODIC_MESSAGES: list = [
     {"message_id": 0,   "frequency_hz": 1.0},          # HEARTBEAT

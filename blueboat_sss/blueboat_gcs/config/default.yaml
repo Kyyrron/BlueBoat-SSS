@@ -20,11 +20,16 @@ topics:
 
 pipeline:
   launch_command: ["ros2", "launch", "blueboat_sss", "SSS_processing_launch.py"]
+  sonar_source: simulation     # toolbar "Sonar" selector default (the last
+                               # choice is remembered): simulation | real
+  real_sonar_launch_args: ["with_acquisition:=True"]  # "real": + sss_node.py
   publish_ping_enable: true
+  ping_enable_wait_s: 10.0     # START waits this long for a ping/enable subscriber
   start_delay_s: 2.0
   stop_grace_s: 5.0            # SIGINT -> SIGTERM after this grace
   stop_term_grace_s: 3.0       # SIGTERM -> SIGKILL after this grace
   leftover_process_patterns: ["sss_processor_node"]
+  owned_process_patterns: ["sss_node.py"]   # swept only if this app launched it
 
 mosaic:
   auto_cell_size: true     # derive resolution from the log (range/num_results)
@@ -76,9 +81,25 @@ display:                   # the ONE dB->pixel model (core/display_model.py)
   min_bin_count: 100       # sparser bins blend toward the Lambert prior
   warmup_rows: 300         # live: rows observed before the model freezes
   hi_pct: 95.0             # window top = this percentile of the seabed level
-  gamma: 0.7               # transfer exponent (1 = linear power, 0.5 = amplitude)
-  knee: 0.7                # soft knee above this brightness (1.0 = hard clip)
+  gamma: 0.5               # Contrast seed: power-law exponent (1 = linear power,
+                           # 0.5 = amplitude) or, under db_window, the window scale.
+                           # 0.7 -> 0.5 on 2026-09-18: amplitude is what the
+                           # operator kept dialling in by hand (0.48 in the
+                           # 2026-09-07 session), and it is the transfer the
+                           # shadow/highlight cue survives at a metre of
+                           # altitude. The slider now also reaches the saved
+                           # AI pictures, so the default is what they get.
+  knee: 0.7                # soft knee above this brightness (1.0 = hard clip; power only)
   curve_tolerance_db: 6.0  # seabed curve may leave its physical line by this much
+  transfer: power          # power (default, provisional) | db_window (linear in dB,
+                           # SonarView's recorded view state — project_review.md §3.2)
+  window_db: 40.0          # db_window dynamic range at gamma 1 [dB]
+  gain_compensation: true  # remove the device's receive-gain step per ping & side
+  gain_reference_analog: 74.55   # analog_gain at gain index 4 (calibration anchor)
+
+along_track:               # metres per ping for true scale + square pictures
+  window_s: 5.0            # median window for ground speed and ping period
+  pair_s: 1.0              # span of each chord-speed measurement
 
 depth:                     # slant-range correction source
   mode: "off"              # auto | manual | off  (off == SonarView "Manual 0 m", default)

@@ -21,7 +21,9 @@ software offers:
 Display model: the service emits fixed-height tiles
 (``tile_updated(first_row, image)``), each backed by its own pixmap
 item positioned at its absolute row, plus ``layout_changed(row0,
-total_rows, cols, range_m)`` for the scene rect. Scene coordinates:
+total_rows, cols, range_m, row_pitch_m)`` for the scene rect and the
+true-scale row height (``row_pitch_m`` = ground speed × ping period from
+the service's along-track estimator). Scene coordinates:
 x = column, **y = -(ping index)** so the newest ping (largest index)
 sits at the top; each tile pixmap is mirrored vertically and placed
 accordingly. ``mapToScene`` on a click therefore recovers the row as
@@ -87,12 +89,20 @@ class WaterfallView(QGraphicsView):
         self._cols = 0
         self._follow = True
         self._fitted_once = False
-        # True-scale display (SonarView draws the waterfall at its
-        # physical aspect): scene units stay (column, row), the view
-        # transform stretches rows by along-track metres per row over the
-        # column pitch. ``_zoom`` is the x scale; y = zoom * aspect.
-        self._true_scale = True
+        # The waterfall is always drawn at its physical aspect (SonarView's
+        # convention): scene units stay (column, row) and the view transform
+        # stretches rows by along-track metres per row over the column pitch.
+        # ``_zoom`` is the x scale; y = zoom * aspect. There is no "true
+        # scale" toggle any more (2026-09-18): one picture, one scale, so
+        # two operators reading the same waterfall read the same distances,
+        # and a measurement taken off the screen means something.
         self._row_pitch_m = 0.0
+        #: (first_row, metres per row) breakpoints, appended whenever the
+        #: estimate moves materially. One transform cannot draw two scales,
+        #: so the view uses the rows actually on screen and says so when
+        #: they disagree.
+        self._pitch_marks: list = []
+        self._scale_note = ""
         self._zoom = 1.0
         self._press_pos = None
         self._detections: list = []      # {"row", "col", "label"} absolute px
@@ -128,16 +138,9 @@ class WaterfallView(QGraphicsView):
         self._det_check.setToolTip(
             "Show / hide AI detection markers on the waterfall.")
         self._det_check.toggled.connect(self._set_show_detections)
-        self._scale_check = QCheckBox("True scale")
-        self._scale_check.setChecked(True)
-        self._scale_check.setToolTip(
-            "Draw rows at their along-track size (metres per ping over the\n"
-            "bin pitch), as SonarView does. Off: one pixel row per ping.")
-        self._scale_check.toggled.connect(self.set_true_scale)
         lay.addWidget(zoom_out)
         lay.addWidget(zoom_in)
         lay.addWidget(fit_btn)
-        lay.addWidget(self._scale_check)
         lay.addWidget(self._det_check)
         self._controls.setStyleSheet(
             "QWidget{background: rgba(16,21,27,190); border-radius: 4px;}")
@@ -147,20 +150,51 @@ class WaterfallView(QGraphicsView):
 
     # ---- manual zoom / true scale ------------------------------------------------
     @property
-    def aspect(self) -> float:
-        """Row height over column width in scene units (1 = square)."""
-        if not self._true_scale or self._row_pitch_m <= 0.0 or self._cols <= 0:
-            return 1.0
-        col_pitch = self._range_m / (self._cols / 2.0) if self._range_m > 0 else 0.0
-        if col_pitch <= 0.0:
-            return 1.0
-        return max(0.05, min(20.0, self._row_pitch_m / col_pitch))
+    def col_pitch_m(self) -> float:
+        """Slant metres per column (0 before the geometry is known)."""
+        if self._range_m <= 0.0 or self._cols <= 0:
+            return 0.0
+        return self._range_m / (self._cols / 2.0)
 
-    def set_true_scale(self, on: bool) -> None:
-        self._true_scale = bool(on)
-        if self._scale_check.isChecked() != self._true_scale:
-            self._scale_check.setChecked(self._true_scale)
-        self._apply_transform(self._zoom)
+    def pitch_for_rows(self, lo: int, hi: int) -> float:
+        """Along-track metres per row over an absolute row span.
+
+        The estimate changes during a mission -- the boat slows, the range
+        setting changes mid-survey (the 2026-09-07 session ran 36, then 20,
+        then 15 m) -- and one view transform can only draw one scale. The
+        rows actually on screen are the ones whose scale the picture should
+        be in, so their median pitch is what the transform uses; the old
+        code stretched the whole history at the *newest* pitch instead.
+        """
+        marks = [m for m in self._pitch_marks if m[1] > 0.0]
+        if not marks:
+            return self._row_pitch_m
+        span = [p for r, p in marks if lo <= r <= hi]
+        if not span:
+            # No breakpoint inside the window: the one in force at its start.
+            before = [p for r, p in marks if r <= lo]
+            return before[-1] if before else marks[0][1]
+        span.sort()
+        mid = len(span) // 2
+        return span[mid] if len(span) % 2 else 0.5 * (span[mid - 1] + span[mid])
+
+    @property
+    def aspect(self) -> float:
+        """Row height over column width in scene units (1 = square).
+
+        A pitch that is not a finite positive number (nothing estimated
+        yet, a stationary boat, a NaN pose) draws square pixels rather
+        than saturating the clamp -- and says so on screen, instead of
+        silently showing a picture whose along-track scale is a guess.
+        """
+        col_pitch = self.col_pitch_m
+        pitch = self._row_pitch_m
+        if self._total > self._row0:
+            lo, hi = self._visible_rows()
+            pitch = self.pitch_for_rows(lo, hi)
+        if (not math.isfinite(pitch) or pitch <= 0.0 or col_pitch <= 0.0):
+            return 1.0
+        return max(0.05, min(20.0, pitch / col_pitch))
 
     def _apply_transform(self, zoom: float) -> None:
         self._zoom = zoom
@@ -227,12 +261,23 @@ class WaterfallView(QGraphicsView):
         self._row0, self._total, self._cols = row0, total, cols
         old_aspect = self.aspect
         self._row_pitch_m = float(row_pitch_m)
+        # One breakpoint per material change of the estimate, tagged with the
+        # row it took effect at, so a mission that changed speed or range
+        # mid-survey can still be drawn in the scale of the rows on screen.
+        if math.isfinite(self._row_pitch_m) and self._row_pitch_m > 0.0:
+            if (not self._pitch_marks
+                    or abs(self._pitch_marks[-1][1] - self._row_pitch_m)
+                    > 0.05 * self._pitch_marks[-1][1]):
+                self._pitch_marks.append((int(total), self._row_pitch_m))
+                if len(self._pitch_marks) > 4096:
+                    del self._pitch_marks[:2048]
         if self._fitted_once and abs(self.aspect - old_aspect) > 0.05 * old_aspect:
             self._apply_transform(self._zoom)      # the running estimate moved
         if total <= row0:                     # cleared
             for item in self._items.values():
                 self._scene.removeItem(item)
             self._items.clear()
+            self._pitch_marks.clear()
             self._scene.setSceneRect(QRectF())
             self._fitted_once = False
             self._selected = None
@@ -421,3 +466,37 @@ class WaterfallView(QGraphicsView):
         state = ("following newest ping ↑" if self._follow
                  else "history view — scroll to top to follow")
         painter.drawText(8, h - 8, state)
+        # The along-track scale, said out loud. A waterfall whose rows are
+        # not at their physical size is a picture nobody can measure off,
+        # and before 2026-09-18 the fallback to square pixels (no speed
+        # estimate, a stationary boat, a NaN pose) was silent.
+        note = self._scale_state()
+        if note:
+            painter.setPen(QPen(theme.COLOR_WARNING
+                                if note.startswith("!") else
+                                theme.COLOR_GRID_TEXT))
+            txt_s = note.lstrip("!")
+            painter.drawText(
+                w - painter.fontMetrics().horizontalAdvance(txt_s) - 8,
+                h - 8, txt_s)
+
+    def _scale_state(self) -> str:
+        """The along-track scale line: what the rows on screen are drawn at.
+
+        A leading ``!`` marks the states worth a warning colour -- no scale
+        at all, or a screen holding rows from two different scales, which
+        one transform cannot draw correctly.
+        """
+        if self._total <= self._row0:
+            return ""
+        lo, hi = self._visible_rows()
+        pitch = self.pitch_for_rows(lo, hi)
+        col = self.col_pitch_m
+        if not math.isfinite(pitch) or pitch <= 0.0 or col <= 0.0:
+            return "!along-track scale unavailable — square pixels"
+        span = [p for r, p in self._pitch_marks if lo <= r <= hi and p > 0.0]
+        if span and (max(span) > 1.2 * min(span)):
+            return (f"!mixed along-track scale {min(span)*100:.0f}–"
+                    f"{max(span)*100:.0f} cm/ping — drawn at "
+                    f"{pitch*100:.0f}")
+        return f"{pitch*100:.0f} cm/ping × {col*100:.0f} cm/bin"

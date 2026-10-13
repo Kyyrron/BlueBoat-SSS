@@ -1,4 +1,4 @@
-"""Robot-side row assembly: never drop a ping (CLAUDE.md NC #2 / root CM-6).
+"""Processor row assembly: never drop a ping (CLAUDE.md NC #2 / root CM-6).
 
 Unlike the rest of this suite these tests need a sourced ROS 2 environment,
 because they drive the real ``sss_processor_node`` — the node under test *is*
@@ -44,7 +44,7 @@ MISSING = [m for m in REQUIRED if importlib.util.find_spec(m) is None]
 
 pytestmark = pytest.mark.skipif(
     bool(MISSING),
-    reason=f"robot-side tests need a sourced ROS 2 env (missing: {MISSING})")
+    reason=f"node-side tests need a sourced ROS 2 env (missing: {MISSING})")
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +357,57 @@ def test_side_comes_from_the_packet_not_the_topic(node):
     assert all(v < 0 for v in m.starboard_y), "-y = starboard"
 
 
+def test_channel_255_routes_by_the_wrapped_bearing(node):
+    """Two field logs carry channel_number 255 on every packet; the
+    bearing decides — wrapped, so an absolute-bearing writer's 270 (port
+    transducer, boat heading north) is port, not starboard."""
+    feed_odom(node)
+    m = make_profile(255, 800, 0)
+    m.transducer_heading_deg = 270.0
+    node._on_starboard(m)                     # wrong topic as well
+    node._flush_pending(drain_all=True)
+    row = node.published[0]
+    assert row.port_ping_number == 800 and row.starboard_ping_number == 0
+    assert all(v > 0 for v in row.port_y), "+y = port"
+    assert node._unresolved_side == 0
+
+
+def test_unresolved_side_falls_to_the_arrival_topic_on_both_paths(node):
+    """channel 255 and a bearing with no sign (0.0): the message path
+    used to call that port silently while the raw path took the topic —
+    the .svlog src byte and the published row could disagree. Both now
+    take the arrival topic, and the case is counted and warned once."""
+    import svlog_helper
+    feed_odom(node)
+    m = make_profile(255, 900, 0)
+    m.transducer_heading_deg = 0.0
+    node._on_starboard(m)
+    node._flush_pending(drain_all=True)
+    row = node.published[0]
+    assert row.starboard_ping_number == 900 and row.port_ping_number == 0
+    assert node._unresolved_side == 1 and node._unresolved_warned
+    # The raw frame of the same packet, arriving on the starboard raw topic.
+    head = struct.pack("<IIIIIHHHBBffffff", 900, 0, LENGTH_MM, 0, 0, 4,
+                       NUM_RESULTS, 15000, 255, 0, 66.5e-6, 1.0,
+                       MAX_DB, MIN_DB, 0.0, 0.0)
+    payload = head + struct.pack(f"<{NUM_RESULTS}H", *([6553] * NUM_RESULTS))
+    raw = svlog_helper.frame_packet(proc.OS_MONO_PROFILE_ID, payload,
+                                    src=proc.DEVICE_ID_STBD, dst=0)
+    assert node._src_from_packet(raw, proc.DEVICE_ID_STBD) == proc.DEVICE_ID_STBD
+    assert node._src_from_packet(raw, proc.DEVICE_ID_PORT) == proc.DEVICE_ID_PORT
+    assert node._unresolved_side == 3
+    # A bearing with a sign still decides on the raw path (wrapped).
+    head270 = struct.pack("<IIIIIHHHBBffffff", 901, 0, LENGTH_MM, 0, 0, 4,
+                          NUM_RESULTS, 15000, 255, 0, 66.5e-6, 1.0,
+                          MAX_DB, MIN_DB, 270.0, 0.0)
+    raw270 = svlog_helper.frame_packet(
+        proc.OS_MONO_PROFILE_ID,
+        head270 + struct.pack(f"<{NUM_RESULTS}H", *([6553] * NUM_RESULTS)),
+        src=proc.DEVICE_ID_STBD, dst=0)
+    assert node._src_from_packet(raw270, proc.DEVICE_ID_STBD) == proc.DEVICE_ID_PORT
+    assert node._unresolved_side == 3
+
+
 # ---------------------------------------------------------------------------
 # Stage 2 — the bootstrap gate is gone
 # ---------------------------------------------------------------------------
@@ -568,7 +619,7 @@ def _replay_offset(path: Path):
 @field_log
 @pytest.mark.parametrize("rel,expected", REPLAY_CASES)
 def test_replay_path_agrees_with_the_processor(rel, expected):
-    """The GCS replay path assembles the same rows as the robot side.
+    """The GCS replay path assembles the same rows as the processor.
 
     They are two implementations of one rule; a divergence here means one of
     them is losing or inventing rows.

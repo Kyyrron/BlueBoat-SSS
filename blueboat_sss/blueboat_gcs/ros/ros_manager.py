@@ -44,8 +44,10 @@ class RosManager:
         self._svlog_pub = None
         self._analysis_pub = None
         # Set by main.py once the listeners exist; used by
-        # reset_stream_health() at every acquisition START.
+        # reset_stream_health() at every acquisition START and by
+        # reset_planned_path() when the operator clears the overlay.
         self.sonar_listener = None
+        self.path_listener = None
         self._param_client = None
 
     # ---- lifecycle -----------------------------------------------------------
@@ -128,6 +130,16 @@ class RosManager:
         if self._ping_pub is not None:
             self._ping_pub.publish(Bool(data=enable))
 
+    def ping_enable_subscribers(self) -> Optional[int]:
+        """How many nodes subscribe to ping/enable (the sonar node is one),
+        or None when ROS is unavailable."""
+        if self._ping_pub is None:
+            return None
+        try:
+            return int(self._ping_pub.get_subscription_count())
+        except Exception:                 # pragma: no cover - rclpy teardown
+            return None
+
     def publish_svlog_enable(self, enable: bool) -> None:
         if self._svlog_pub is not None:
             self._svlog_pub.publish(Bool(data=enable))
@@ -143,6 +155,12 @@ class RosManager:
         expectations (sonar counter offset etc.)."""
         if self.sonar_listener is not None:
             self.sonar_listener.reset_pairing()
+
+    def reset_planned_path(self) -> None:
+        """The planned-path overlay was cleared: let the listener
+        forward path_publisher's next (verbatim) re-send again."""
+        if self.path_listener is not None:
+            self.path_listener.reset()
 
     # ---- runtime sonar parameters ---------------------------------------------
     def set_sonar_range(self, range_m: float) -> bool:

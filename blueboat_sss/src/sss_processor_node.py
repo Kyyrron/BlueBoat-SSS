@@ -95,6 +95,7 @@ from sss_helper import (
     detect_fbr_slant_m,
     project_side,
     scale_to_db,
+    side_from_fields,
 )
 
 from math_helper import (
@@ -118,10 +119,10 @@ HEADING_BYTE: int = 52   # payload offset 44, float32 LE: transducer_heading_deg
 # All in meters, expressed in base_link (REP-103: +x forward, +y left = port,
 # +z up). y offsets are positive magnitudes; port/starboard sign is in code.
 # ---------------------------------------------------------------------------
-TRANSDUCER_X_OFFSET_M:      float = 0.0  # TODO: forward offset (probably negative)
-TRANSDUCER_Y_OFFSET_PORT_M: float = 0.0  # TODO: lateral offset of port transducer
-TRANSDUCER_Y_OFFSET_STBD_M: float = 0.0  # TODO: lateral offset of starboard transducer
-TRANSDUCER_SUBMERSION_M:    float = 0.0  # TODO: depth below the waterline
+TRANSDUCER_X_OFFSET_M:      float = 0.0  # TODO: fore/aft offset from base_link, not measured (assumed amidships)
+TRANSDUCER_Y_OFFSET_PORT_M: float = 0.285  # hull centreline, BR-101447: 570 mm / 2
+TRANSDUCER_Y_OFFSET_STBD_M: float = 0.285  # same, magnitude (sign is in code)
+TRANSDUCER_SUBMERSION_M:    float = 0.15  # ESTIMATE, = sim sensor_depth_m; measure draft to hull bottom
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +285,11 @@ class SSSProcessorNode(Node):
         self._max_key_before: Optional[int] = None
         self._torn_recent: Deque[bool] = deque(maxlen=TORN_WINDOW_ROWS)
         self._torn_warned = False
+        # Packets whose side neither channel_number nor the transducer
+        # bearing resolved (bearing 0 / non-finite): routed by the arrival
+        # topic instead, counted, warned once per run.
+        self._unresolved_side = 0
+        self._unresolved_warned = False
 
         self._odom_buf = _OdomBuffer(int(ODOM_BUFFER_SECONDS * 1e9))
         self._fbr = FBRTracker(
@@ -426,10 +432,10 @@ class SSSProcessorNode(Node):
 
     # ----- sonar subscribers ------------------------------------------------
     def _on_port(self, msg: OmniscanProfile) -> None:
-        self._accept(msg)
+        self._accept(msg, topic_side=0)
 
     def _on_starboard(self, msg: OmniscanProfile) -> None:
-        self._accept(msg)
+        self._accept(msg, topic_side=1)
 
     def _on_odom(self, msg: Odometry) -> None:
         self._odom_buf.push(msg)
@@ -613,6 +619,19 @@ class SSSProcessorNode(Node):
         with self._aux_lock:
             rel_alt_mm = self._latest_rel_alt_mm or 0
             hdg_cdeg = self._latest_compass_hdg_cdeg or 0
+            twist = self._latest_local_twist
+        # GLOBAL_POSITION_INT carries ground velocity in cm/s, NED. The same
+        # /mavros/local_position/velocity_local the LOCAL_POSITION_NED
+        # envelope uses supplies it; it was hard-coded to zero, which made
+        # every .svlog this node writes claim a stationary boat -- and the
+        # along-track scale of a replayed waterfall is read from exactly
+        # these fields (2026-09-18 review G10). Absent velocity still means
+        # zeros, which the schema allows.
+        vx_cms = vy_cms = vz_cms = 0
+        if twist is not None:
+            vx_cms = int(round(twist.twist.linear.y * 100.0))   # ENU -> NED
+            vy_cms = int(round(twist.twist.linear.x * 100.0))
+            vz_cms = int(round(-twist.twist.linear.z * 100.0))
         return {
             "header": self._mavlink_header(),
             "message": {
@@ -622,9 +641,9 @@ class SSSProcessorNode(Node):
                 "lon":          int(round(fix.longitude * 1e7)),
                 "alt":          int(round(fix.altitude  * 1000.0)),  # mm AMSL
                 "relative_alt": int(rel_alt_mm),
-                "vx":           0,
-                "vy":           0,
-                "vz":           0,
+                "vx":           int(vx_cms),
+                "vy":           int(vy_cms),
+                "vz":           int(vz_cms),
                 "hdg":          int(hdg_cdeg),
             },
         }
@@ -693,26 +712,39 @@ class SSSProcessorNode(Node):
         }
 
     # ----- svlog helpers ----------------------------------------------------
-    @staticmethod
-    def _src_from_packet(raw: bytes, fallback: int) -> int:
+    def _src_from_packet(self, raw: bytes, fallback: int) -> int:
         """Device id read out of the packet; the topic is only a fallback.
 
         NON-NEGOTIABLE #1. `channel_number` is authoritative; where the device
-        leaves it outside (0, 1) the transducer bearing (-90 = port,
-        +90 = starboard) decides. The two agree on 100 % of packets in every
-        field recording measured, so the fallback only ever fires where
-        `channel_number` carries nothing usable.
+        leaves it outside (0, 1) the transducer bearing decides — wrapped,
+        sign only (`sss_helper.side_from_fields`, the same rule `_accept`
+        applies to the published row, so the `.svlog` `src` byte and the
+        row always agree). The two agree on 100 % of packets in every field
+        recording measured, so the fallback only ever fires where
+        `channel_number` carries nothing usable; a bearing that carries no
+        side either falls to the arrival topic and is counted.
         """
         if (len(raw) > CHANNEL_BYTE
                 and int.from_bytes(raw[4:6], "little") == OS_MONO_PROFILE_ID):
             ch = raw[CHANNEL_BYTE]
-            if ch in (0, 1):
-                return DEVICE_ID_PORT if ch == 0 else DEVICE_ID_STBD
+            heading = 0.0
             if len(raw) >= HEADING_BYTE + 4:
                 heading, = struct.unpack_from("<f", raw, HEADING_BYTE)
-                if heading:
-                    return DEVICE_ID_STBD if heading > 0 else DEVICE_ID_PORT
+            side = side_from_fields(ch, heading)
+            if side is not None:
+                return DEVICE_ID_PORT if side == 0 else DEVICE_ID_STBD
+            self._note_unresolved_side("raw", fallback)
         return fallback
+
+    def _note_unresolved_side(self, path: str, fallback) -> None:
+        self._unresolved_side += 1
+        if not self._unresolved_warned:
+            self._unresolved_warned = True
+            self.get_logger().warn(
+                f"side unresolved on a {path} packet (channel_number outside "
+                f"0/1 and transducer_heading_deg carries no sign): routed by "
+                f"the arrival topic ({fallback}); further cases are counted "
+                f"silently (total so far: {self._unresolved_side})")
 
     def _write_raw_with_src_tag(self, msg: UInt8MultiArray, fallback_src: int) -> None:
         if not self._svlog.active:
@@ -736,7 +768,7 @@ class SSSProcessorNode(Node):
         )
 
     # ----- row assembly -----------------------------------------------------
-    def _accept(self, msg: OmniscanProfile) -> None:
+    def _accept(self, msg: OmniscanProfile, topic_side: int = 0) -> None:
         """Route one profile into its ping-number group and emit what is ready.
 
         NON-NEGOTIABLE #2: nothing is discarded here. A group leaves either
@@ -748,6 +780,12 @@ class SSSProcessorNode(Node):
         profile published on the wrong topic still lands on the right side.
         """
         channel = self._channel_of(msg)
+        if channel is None:
+            # Neither field carries a side: the arrival topic is the only
+            # information left (the same fallback the raw path takes, so
+            # the .svlog src byte and this row agree).
+            channel = int(topic_side)
+            self._note_unresolved_side("profile", topic_side)
         stamp_ns = stamp_to_ns(msg.header.stamp)
         ready = []
         with self._buf_lock:
@@ -875,27 +913,28 @@ class SSSProcessorNode(Node):
 
     # ----- processing -------------------------------------------------------
     @staticmethod
-    def _channel_of(msg: OmniscanProfile) -> int:
-        """Side identity (0 = port, 1 = starboard) from the message itself.
+    def _channel_of(msg: OmniscanProfile) -> Optional[int]:
+        """Side identity (0 = port, 1 = starboard, None = unresolved) from
+        the message itself.
 
         NON-NEGOTIABLE #1, and the same rule the svlog writer applies to raw
-        frames: `channel_number` decides, with the transducer bearing as the
-        fallback for devices that leave it outside (0, 1). `msg.side` is a
-        label attached by the acquisition worker that published it and is
-        deliberately not read, nor is the topic it arrived on.
+        frames (`sss_helper.side_from_fields`): `channel_number` decides,
+        with the wrapped sign of the transducer bearing as the fallback for
+        devices that leave it outside (0, 1). `msg.side` is a label attached
+        by the acquisition worker that published it and is deliberately not
+        read; the topic it arrived on is used only when this returns None.
         """
-        ch = msg.channel_number
-        if ch not in (0, 1):
-            ch = 1 if msg.transducer_heading_deg > 0 else 0
-        return ch
+        return side_from_fields(int(msg.channel_number),
+                                float(msg.transducer_heading_deg))
 
-    @classmethod
-    def _side_geometry(cls, msg: OmniscanProfile) -> Tuple[float, float]:
-        """(side_sign, transducer y offset) from the message itself.
+    @staticmethod
+    def _side_geometry(side: int) -> Tuple[float, float]:
+        """(side_sign, transducer y offset) of a resolved side — the group
+        key the row was assembled under, never re-derived from the message.
 
         Sign convention on the wire is +y = port, -y = starboard.
         """
-        if cls._channel_of(msg) == 0:
+        if side == 0:
             return +1.0, TRANSDUCER_Y_OFFSET_PORT_M
         return -1.0, TRANSDUCER_Y_OFFSET_STBD_M
 
@@ -981,7 +1020,7 @@ class SSSProcessorNode(Node):
         port_y, port_int = [], []
         stbd_y, stbd_int = [], []
         if port is not None:
-            sign, offset = self._side_geometry(port)
+            sign, offset = self._side_geometry(0)
             port_y, port_int = project_side(
                 port_db, port.start_mm, port.length_mm, port.num_results,
                 altitude_m=altitude,
@@ -989,7 +1028,7 @@ class SSSProcessorNode(Node):
                 side_sign=sign,
             )
         if stbd is not None:
-            sign, offset = self._side_geometry(stbd)
+            sign, offset = self._side_geometry(1)
             stbd_y, stbd_int = project_side(
                 stbd_db, stbd.start_mm, stbd.length_mm, stbd.num_results,
                 altitude_m=altitude,

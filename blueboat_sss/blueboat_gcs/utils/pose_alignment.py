@@ -166,7 +166,7 @@ class HeadingPolicy:
     The MCS rule (``GPS_MAP_ARCHITECTURE.md`` §heading): the compass is
     the true-north reference and is converted **once**, at ingestion —
     ``θ = wrap(radians(90 − hdg_deg))`` — never corrected downstream;
-    odom yaw (absolute ENU since the 2026-08-31 robot-side fix) covers a
+    odom yaw (absolute ENU since the 2026-08-31 robot_interface fix) covers a
     silent compass. This is what fixed the field's misaligned live SSS
     pings; replay derives yaw from mavlink ATTITUDE and never comes
     through here.

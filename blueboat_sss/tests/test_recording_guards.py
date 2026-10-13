@@ -71,6 +71,9 @@ class FakeAcquisition:
     def reset_stream_health(self) -> None:
         pass
 
+    def reset_planned_path(self) -> None:
+        pass
+
 
 @pytest.fixture
 def gui(qapp, tmp_config, no_modal_dialogs):
@@ -244,3 +247,50 @@ def test_merged_sessions_are_never_swept(manager):
     assert rec.adopt_now() == []
     assert protected.is_file(), (
         "the adoption sweep moved a .svlog out of merged_sessions/")
+
+
+def test_end_returns_before_the_exports_finish(manager, qapp, monkeypatch):
+    """Record OFF / STOP must not block on the mosaic/waterfall writers
+    (2.5-7.4 s on a full mission): end() snapshots the services and
+    returns; the files appear after wait_for_exports()."""
+    import time
+    from blueboat_gcs.analysis.ping_bench import make_ping
+    from blueboat_gcs.core import waterfall_service as ws
+    from blueboat_gcs.core import mosaic_service as ms
+
+    rec, messages, root = manager
+    kw = dict(range_m=15.0, bins=600, depth=4.0, speed=0.5, rate_hz=20.0,
+              one_sided=False, turn=False)
+    for k in range(40):
+        p = make_ping(k, **kw)
+        rec._mosaic.on_sonar_ping(p)
+        rec._waterfall.on_sonar_ping(p)
+    # Make each writer measurably slow, so a synchronous end() would show.
+    slow_w, slow_m = ws.WaterfallExport.write, ms.MosaicExport.write
+
+    def w_write(self, target):
+        time.sleep(0.6)
+        return slow_w(self, target)
+
+    def m_write(self, target):
+        time.sleep(0.6)
+        return slow_m(self, target)
+
+    monkeypatch.setattr(ws.WaterfallExport, "write", w_write)
+    monkeypatch.setattr(ms.MosaicExport, "write", m_write)
+
+    assert rec.begin()
+    t0 = time.perf_counter()
+    session = rec.end()
+    elapsed = time.perf_counter() - t0
+    assert session is not None
+    assert elapsed < 0.5, f"end() blocked for {elapsed:.2f} s"
+    assert (session / "metadata.json").is_file()          # synchronous part
+    assert rec.wait_for_exports(timeout_s=30.0)
+    qapp.processEvents()
+    assert (session / "waterfall" / "waterfall_raw.npz").is_file()
+    assert (session / "waterfall" / "waterfall.png").is_file()
+    assert (session / "mosaic" / "sonar_mosaic.npz").is_file()
+    assert (session / "mosaic" / "boat_trajectory.csv").is_file()
+    assert any("saved to" in m for m in messages), messages
+    rec.adopt_now()

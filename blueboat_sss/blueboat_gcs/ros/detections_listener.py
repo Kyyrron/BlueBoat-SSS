@@ -22,8 +22,8 @@ Expected interface:
                 marker instead of duplicating it.
     Rate    : event-driven (per detector inference, ~0.5–2 Hz bursts)
 
-vision_msgs is a standard ROS package but may be absent on a bare
-basestation; the import is guarded so the app degrades gracefully.
+vision_msgs is a standard ROS package but may be absent from a bare
+ROS install; the import is guarded so the app degrades gracefully.
 If the detection repo settles on a custom message instead, replace the
 import and ``_msg_to_detections`` only.
 """

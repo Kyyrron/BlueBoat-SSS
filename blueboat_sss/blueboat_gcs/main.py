@@ -55,8 +55,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         from .ros.pipeline_launcher import PipelineLauncher
         from .ros.ros_manager import RosManager
         ros_manager = RosManager(config, signals)
-        acquisition = PipelineLauncher(config.pipeline, ros_manager, signals,
-                                       acquisition=config.acquisition)
+        from .ros.sonar_source import stored_source
+        acquisition = PipelineLauncher(
+            config.pipeline, ros_manager, signals,
+            acquisition=config.acquisition,
+            sonar_source=stored_source(config.pipeline.sonar_source))
         if ros_manager.start() and ros_manager.node is not None:
             # Listener construction = subscription registration.
             from .ros.detections_listener import DetectionsListener
@@ -73,18 +76,23 @@ def main(argv: Optional[list[str]] = None) -> int:
                                 config.topics.starboard_profile),
                 profile_queue_depth=config.sonar_stream.profile_queue_depth,
                 profile_cache_per_side=config.sonar_stream.profile_cache_per_side,
-                profile_wait_ms=config.sonar_stream.profile_wait_ms)
+                profile_wait_ms=config.sonar_stream.profile_wait_ms,
+                nadir_blank_m=(config.depth.nadir_blank_m
+                               if config.depth.blank_nadir else 0.0))
             TelemetryListener(node, signals, config.topics,
                               gps_fallback=config.alignment.gps_fallback)
             DetectionsListener(node, signals, config.topics.detections)
             PingerListener(node, signals, config.topics.pinger)
-            PathListener(node, signals, config.topics.planned_path)
+            ros_manager.path_listener = PathListener(
+                node, signals, config.topics.planned_path,
+                config.planned_path)
 
     window = MainWindow(config, signals, mosaic_service, acquisition)
     window.show()
     # Acquisition lifecycle: the processing pipeline is launched
-    # automatically at startup (sss_processor_node in field mode; the
-    # simulator's telemetry in --sim). Visualization layers stay off and
+    # automatically at startup (sss_processor_node in field mode, plus
+    # sss_node.py when the toolbar's Sonar selector says Real; the
+    # built-in simulator's telemetry in --sim). Visualization layers stay off and
     # no recording session is active — START enables live acquisition.
     acquisition.start()
     code = app.exec()

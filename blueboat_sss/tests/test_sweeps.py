@@ -18,17 +18,27 @@ from conftest import GCS_ROOT, PKG_PARENT, gcs_files, gcs_modules
 # Recorded counts. If either moves, update CLAUDE.md in the same commit
 # rather than loosening the assertion — the number *is* the regression
 # signal.
-EXPECTED_FILE_COUNT = 62        # 2026-09-05: +core/display_model.py, +core/live_native.py, +analysis/check_dois.py, -core/contrast.py
-EXPECTED_ROS_FREE_IMPORTABLE = 58
+EXPECTED_FILE_COUNT = 65        # 2026-09-28: +ros/sonar_source.py (the toolbar's
+                                # Sonar: Simulation / Real selector and its
+                                # double-driver guard). 2026-09-18:
+                                # +core/deployed_path.py (the planned
+                                # path read from the station's own deployed
+                                # mission, because /set_path truncates at
+                                # path_publisher's total_time). 2026-09-15:
+                                # +core/along_track.py; 2026-09-05:
+                                # +core/display_model.py, +core/live_native.py,
+                                # +analysis/check_dois.py, -core/contrast.py
+EXPECTED_ROS_FREE_IMPORTABLE = 61   # sonar_source.py and deployed_path.py need
+                                    # no ROS
 
 # The modules that legitimately cannot import without ROS: exactly the
 # four ros/ listeners that take `from rclpy.node import Node` at module
 # level. main.py imports them lazily and only outside --sim.
 #
-# The other four files in ros/ must keep importing ROS-free:
+# The other five files in ros/ must keep importing ROS-free:
 # path_listener and ros_manager guard their ROS imports in try/except,
-# pipeline_launcher imports PySide6 rather than rclpy, and __init__ is
-# empty. Asserting the *identity* of the failures — not just the count —
+# pipeline_launcher imports PySide6 rather than rclpy, sonar_source reads
+# /proc and imports Qt lazily, and __init__ is empty. Asserting the *identity* of the failures — not just the count —
 # is what protects NC #10 (no rclpy past the ros/ boundary).
 EXPECTED_ROS_FREE_FAILURES = {
     "blueboat_gcs.ros.detections_listener",
@@ -37,7 +47,7 @@ EXPECTED_ROS_FREE_FAILURES = {
     "blueboat_gcs.ros.telemetry_listener",
 }
 
-# NC #7: byte-identical copies. GCS-side path -> robot-side path.
+# NC #7: byte-identical copies. GCS-side path -> node-side path.
 VERBATIM_COPIES = [
     ("blueboat_gcs/tools/svlog_helper.py", "src/_custom_libraries/svlog_helper.py"),
     ("blueboat_gcs/tools/svlog_to_rosbag.py", "custom_scripts/svlog_to_rosbag.py"),
@@ -94,7 +104,7 @@ def test_import_sweep_without_ros(no_ros, purge_gcs_modules):
 
 @pytest.mark.parametrize("gcs_rel,robot_rel", VERBATIM_COPIES)
 def test_verbatim_tool_copies_are_identical(gcs_rel, robot_rel):
-    """NC #7: the tools/ copies are byte-identical to the robot-side files.
+    """NC #7: the tools/ copies are byte-identical to the node-side files.
 
     ``tools/`` is excluded from both sweeps because it needs ROS to
     import, so without this test nothing checks it at all. Update only by

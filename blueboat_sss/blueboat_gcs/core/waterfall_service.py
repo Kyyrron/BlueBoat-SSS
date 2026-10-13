@@ -63,7 +63,7 @@ histogram window applies and no normalisation is done.
 from __future__ import annotations
 
 import math
-from collections import deque
+from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -73,7 +73,8 @@ from PySide6.QtGui import QImage
 from ..config.settings import AppConfig
 from ..mapping.renderer import DisplaySettings, MosaicRenderer
 from ..models.sonar import SonarPing, build_slant_row, native_bins
-from .display_model import DisplayModel
+from .along_track import AlongTrackEstimator
+from .display_model import DisplayModel, DisplayModelSnapshot
 
 #: Rows per tile. 512 × ~1200 float32 ≈ 2.5 MB data + 20 KB meta; small
 #: enough that re-colormapping the dirty tail tile at 4 Hz is trivial.
@@ -96,6 +97,11 @@ _MAX_GAP_ROWS = 5
 #: PNG quick-look decimation threshold (export_into).
 _PNG_MAX_ROWS = 20_000
 
+#: Per-row metadata columns: t, x, y, yaw, water_depth, bottom_slant_m,
+#: gain_port_db, gain_stbd_db (the last two: receive-gain offsets the
+#: display model removes, core/display_model.gain_offset_db).
+_META_COLS = 8
+
 
 class WaterfallService(QObject):
     """Growable tiled buffer of all pings, rendered on a throttle."""
@@ -104,8 +110,9 @@ class WaterfallService(QObject):
     #: along-track metres per row). Rows [row0, total_rows) exist; row0 > 0
     #: means the oldest rows were evicted by the memory cap. total_rows ==
     #: row0 == 0 after clear() — the view drops everything. The last value
-    #: (running median of consecutive row displacements) lets the view
-    #: draw true scale; 0 until two placed rows exist.
+    #: (ground speed × ping period from the shared along-track estimator,
+    #: core/along_track.py) lets the view draw true scale; 0 until two
+    #: placed rows exist.
     layout_changed = Signal(int, int, int, float, float)
     #: One re-rendered tile: (absolute first row, QImage of the tile).
     tile_updated = Signal(int, QImage)
@@ -140,21 +147,34 @@ class WaterfallService(QObject):
         self._pitch = 0.0
         self._half = 0
         # Tiles: parallel lists of (data, meta) arrays. meta columns are
-        # (t, x, y, yaw, water_depth, bottom_slant_m) — the first five feed
-        # the detections overlay and the waterfall-click → world lookup;
-        # bottom_slant_m lets a remap re-classify seabed vs water column
-        # so the seabed-referenced EGN can be rebuilt exactly.
+        # (t, x, y, yaw, water_depth, bottom_slant_m, gain_port_db,
+        # gain_stbd_db) — the first five feed the detections overlay and
+        # the waterfall-click → world lookup; bottom_slant_m and the two
+        # receive-gain offsets are what the display model needs per row,
+        # so a remap or a re-render never re-estimates them.
         self._tiles: List[np.ndarray] = []
         self._metas: List[np.ndarray] = []
         self._row0 = 0                  # absolute index of the oldest row
         self._total = 0                 # absolute index one past the newest
         self._dirty_tiles: set = set()  # tile list indices needing render
         self._detections: list = []     # dicts: t_s, x, y, label
+        # The overlay (detections in buffer coordinates) is re-sent only
+        # when it can have changed: a detection added/cleared, the view
+        # enabled, a layout change, or an eviction moving row0 — not on
+        # every render pass (one repaint of the overlay per pass at 20 Hz
+        # was pure load, project_review.md §3.4).
+        self._overlay_dirty = True
+        self._overlay_key: Optional[tuple] = None   # (columns, pitch, row0)
         self._dirty = False
         self._layout_dirty = False
         self._enabled = False           # render only while the view is shown
         self._renderer = MosaicRenderer(
             percentiles=tuple(config.mosaic.contrast_percentiles))
+        # Seeded from the same config value the Contrast slider shows, so
+        # a tile rendered before the panel's first emission is already on
+        # the mission transfer (the window re-emits the slider too).
+        self._renderer.settings = DisplaySettings(
+            gamma=float(getattr(config.display, "gamma", 1.0)))
         self._pcts = tuple(config.mosaic.contrast_percentiles)
         # Plain raw-value histogram: the fallback window when the
         # nadir-aware seabed EGN is disabled (nadir_contrast off).
@@ -174,10 +194,13 @@ class WaterfallService(QObject):
         self._unit_renderer = MosaicRenderer()
         self._unit_renderer.settings = DisplaySettings(gamma=1.0)
         self._last_limits: Optional[Tuple[float, float]] = None
-        # Along-track metres per row (true-scale view): running median of
-        # the displacement between consecutive placed rows.
-        self._row_steps: deque = deque(maxlen=256)
-        self._last_xy: Optional[Tuple[float, float]] = None
+        # Along-track metres per row (true-scale view): the one estimator
+        # the seabed imager shares (ground speed × ping period from the
+        # ping poses, core/along_track.py).
+        at = getattr(config, "along_track", None)
+        self._along = AlongTrackEstimator(
+            window_s=float(getattr(at, "window_s", 5.0)),
+            pair_s=float(getattr(at, "pair_s", 1.0)))
 
         self._timer = QTimer(self)
         self._timer.setInterval(int(1000.0 / config.mosaic.render_hz))
@@ -231,10 +254,14 @@ class WaterfallService(QObject):
 
     @property
     def row_pitch_m(self) -> float:
-        """Along-track metres per row (0 until two placed rows exist)."""
-        if not self._row_steps:
-            return 0.0
-        return float(np.median(np.fromiter(self._row_steps, dtype=np.float64)))
+        """Along-track metres per row (0 until two placed rows exist):
+        ground speed × ping period from the shared estimator."""
+        return float(self._along.row_pitch_m)
+
+    @property
+    def along_track(self) -> AlongTrackEstimator:
+        """The estimator behind ``row_pitch_m`` (speed, period, cumulative)."""
+        return self._along
 
     def reserve(self, rows: int) -> int:
         """Raise the row capacity (never lowers it); returns the cap.
@@ -254,7 +281,7 @@ class WaterfallService(QObject):
         if tile_i == len(self._tiles):
             self._tiles.append(np.full((_TILE_ROWS, self.columns), np.nan,
                                        dtype=np.float32))
-            self._metas.append(np.full((_TILE_ROWS, 6), np.nan,
+            self._metas.append(np.full((_TILE_ROWS, _META_COLS), np.nan,
                                        dtype=np.float64))
         return self._tiles[tile_i], self._metas[tile_i], off
 
@@ -269,6 +296,7 @@ class WaterfallService(QObject):
             self._tiles.pop(0)
             self._metas.pop(0)
             self._row0 += _TILE_ROWS
+            self._overlay_dirty = True
             self._dirty_tiles = {i - 1 for i in self._dirty_tiles if i > 0}
             self._stale_tiles = {i - 1 for i in self._stale_tiles if i > 0}
 
@@ -365,16 +393,15 @@ class WaterfallService(QObject):
         h = float(ping.bottom_slant_m)
         if h <= 0.0:
             h = max(float(ping.water_depth), 0.0)
+        gains = self._model.gain_offsets(ping)
         meta[off] = (ping.t, ping.robot_x, ping.robot_y, ping.yaw,
-                     max(float(ping.water_depth), 0.0), h)
-        if self._last_xy is not None:
-            self._row_steps.append(math.hypot(ping.robot_x - self._last_xy[0],
-                                              ping.robot_y - self._last_xy[1]))
-        self._last_xy = (float(ping.robot_x), float(ping.robot_y))
+                     max(float(ping.water_depth), 0.0), h, gains[0], gains[1])
+        self._along.observe(float(ping.t), float(ping.robot_x),
+                            float(ping.robot_y))
         finite = np.isfinite(row)
         if finite.any():
             self._hist += np.histogram(row[finite], bins=self._hist_edges)[0]
-            self._model.observe_row(row, self._pitch, h)
+            self._model.observe_row(row, self._pitch, h, gains)
         self._advance()
 
     def break_row(self) -> None:
@@ -394,7 +421,7 @@ class WaterfallService(QObject):
         buf, meta, off = self._tail_slot()
         buf[off].fill(np.nan)
         meta[off].fill(np.nan)
-        self._last_xy = None                 # no displacement across a seam
+        self._along.mark_break()             # no chord across a seam
         self._advance()
 
     # ---- row → pose ------------------------------------------------------------
@@ -416,6 +443,7 @@ class WaterfallService(QObject):
         self._enabled = enabled
         if enabled:
             self._mark_all_dirty()
+            self._overlay_dirty = True
             self._force_render()
 
     def clear(self) -> None:
@@ -432,8 +460,7 @@ class WaterfallService(QObject):
         self._reset_stats()
         if self._owns_model:
             self._model.reset()
-        self._row_steps.clear()
-        self._last_xy = None
+        self._along.reset()
         self._dirty = False
         self._layout_dirty = False
         self.layout_changed.emit(0, 0, 0, 0.0, 0.0)
@@ -454,6 +481,7 @@ class WaterfallService(QObject):
             self._detections.pop(0)
         # The timer's next pass draws it: no synchronous full render per
         # detection (one image = one detection = one 20-45 ms render).
+        self._overlay_dirty = True
         self._dirty = True
 
     def _row_for_time(self, t_s: float) -> Optional[int]:
@@ -474,6 +502,7 @@ class WaterfallService(QObject):
 
     def clear_detections(self) -> None:
         self._detections.clear()
+        self._overlay_dirty = False
         self.detections_updated.emit([])
         if self._enabled:
             self._force_render()
@@ -527,58 +556,35 @@ class WaterfallService(QObject):
         n = self._total - self._row0
         return np.concatenate(self._metas, axis=0)[:n]
 
+    def export_snapshot(self) -> Optional["WaterfallExport"]:
+        """An immutable copy of everything ``export_into`` writes, taken
+        on the GUI thread so the files can be written on a pool thread
+        while pings keep arriving (Record OFF no longer freezes the app
+        for the seconds the compressed npz takes — project_review.md
+        §3.4). None when the buffer is empty."""
+        chrono = self.chronological()           # already a copy
+        if chrono is None:
+            return None
+        meta = self._meta_chrono().copy()
+        active = self._model_active()
+        return WaterfallExport(
+            chrono=chrono, meta=meta, pitch_m=self._pitch,
+            half_extent_m=self.half_extent_m, columns=self.columns,
+            model=self._model.snapshot(), model_active=active,
+            unit_settings=self._unit_renderer.settings,
+            raw_settings=self._renderer.settings, percentiles=self._pcts,
+            raw_limits=None if active else self._global_limits())
+
     def export_into(self, target) -> bool:
         """Write waterfall.png (display pipeline) + waterfall_raw.npz
         (the untouched native-bin buffer — an archival raw record; the
-        AI feed is the seabed **pictures**) into ``target``.
-
-        The npz carries the full-fidelity float32 buffer in the native
-        slant-bin layout (``slant_pitch_m`` metres per column, transducer
-        at the centre seam). The PNG is a quick-look through the display
-        pipeline: above ``_PNG_MAX_ROWS`` rows it is vertically decimated
-        (every Nth ping) and the stride is recorded in the npz as
-        ``png_row_stride`` so nobody mistakes it for the data.
-        """
-        chrono = self.chronological()
-        if chrono is None:
+        AI feed is the seabed **pictures**) into ``target``, synchronously
+        (the offline rebuild path; the live session hands the same
+        snapshot to a pool thread instead)."""
+        snap = self.export_snapshot()
+        if snap is None:
             return False
-        from pathlib import Path
-        import cv2
-        target = Path(target)
-        target.mkdir(parents=True, exist_ok=True)
-        stride = max(1, int(np.ceil(chrono.shape[0] / _PNG_MAX_ROWS)))
-        # PNG is newest-on-top (SonarView convention, matching the live
-        # view): flip the decimated rows before colouring. The npz keeps
-        # the archival buffer oldest-first (row_order tag below).
-        meta = self._meta_chrono()
-        rows = chrono[::stride]
-        if self._model_active():
-            # The mission model with ITS gamma (the dataset transfer), not
-            # the operator's slider: the quick-look matches the pictures.
-            unit = self._model.render_unit(rows, self._pitch,
-                                           meta[::stride, 5])[::-1]
-            rgba = self._unit_renderer.to_rgba(unit, limits=(0.0, 1.0))
-        else:
-            rgba = self._renderer.to_rgba(rows[::-1], limits=self._global_limits())
-        cv2.imwrite(str(target / "waterfall.png"),
-                    cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
-        # The display model (curves + window + TL parameters) and each
-        # row's altitude, so the PNG inverts back to the raw dB kept in
-        # intensity_db (see DisplayModelSnapshot.to_json()["mapping"]).
-        snap = self._model.snapshot()
-        np.savez_compressed(target / "waterfall_raw.npz",
-                            intensity_db=chrono,
-                            layout="slant_bins_centered",
-                            row_order="oldest_first",
-                            png_row_order="newest_first",
-                            slant_pitch_m=self._pitch,
-                            swath_half_range_m=self.half_extent_m,
-                            columns=self.columns,
-                            png_row_stride=stride,
-                            row_altitude_m=meta[:, 5].astype(np.float32),
-                            row_t_s=meta[:, 0].astype(np.float64),
-                            value_domain="raw_db",
-                            **snap.npz_items())
+        snap.write(target)
         return True
 
     def set_display(self, settings: DisplaySettings) -> None:
@@ -627,16 +633,19 @@ class WaterfallService(QObject):
         return self._nadir_contrast and self._model.ready and self.columns > 0
 
     def render_unit(self, rows: np.ndarray, h_rows: np.ndarray,
-                    gamma: Optional[float] = None) -> np.ndarray:
+                    gamma: Optional[float] = None,
+                    gain_rows: Optional[np.ndarray] = None) -> np.ndarray:
         """Unit brightness of built rows through the model (NaN kept)."""
-        return self._model.render_unit(rows, self._pitch, h_rows, gamma)
+        return self._model.render_unit(rows, self._pitch, h_rows, gamma,
+                                       gain_rows)
 
     def _tile_image(self, tile_i: int, limits) -> QImage:
         tile = self._tiles[tile_i]
         if self._model_active():
-            unit = self._model.render_unit(tile, self._pitch,
-                                           self._metas[tile_i][:, 5],
-                                           self._renderer.settings.gamma)
+            meta = self._metas[tile_i]
+            unit = self._model.render_unit(tile, self._pitch, meta[:, 5],
+                                           self._renderer.settings.gamma,
+                                           gain_rows=meta[:, 6:8])
             return self._unit_renderer.to_qimage(unit, flip=False,
                                                  limits=(0.0, 1.0))
         return self._renderer.to_qimage(tile, flip=False, limits=limits)
@@ -704,6 +713,12 @@ class WaterfallService(QObject):
                 limits = last          # hold the window steady
         if self._layout_dirty:
             self._layout_dirty = False
+            # New rows alone do not move a detection's (row, col); a
+            # column/pitch remap or an eviction (row0) does.
+            key = (self.columns, self._pitch, self._row0)
+            if key != self._overlay_key:
+                self._overlay_key = key
+                self._overlay_dirty = True
             self.layout_changed.emit(self._row0, self._total, self.columns,
                                      self.half_extent_m, self.row_pitch_m)
         todo = set(self._dirty_tiles)
@@ -719,4 +734,78 @@ class WaterfallService(QObject):
         self._dirty_tiles.clear()
         if self._stale_tiles:
             self._dirty = True          # keep the timer coming back
-        self.detections_updated.emit(self._overlay())
+        if self._overlay_dirty:
+            self._overlay_dirty = False
+            self.detections_updated.emit(self._overlay())
+
+
+@dataclass
+class WaterfallExport:
+    """Frozen export payload of a :class:`WaterfallService` (see
+    :meth:`WaterfallService.export_snapshot`); :meth:`write` is
+    thread-safe — it touches nothing but its own arrays.
+
+    The npz carries the full-fidelity float32 buffer in the native
+    slant-bin layout (``slant_pitch_m`` metres per column, transducer at
+    the centre seam). The PNG is a quick-look through the display
+    pipeline: above ``_PNG_MAX_ROWS`` rows it is vertically decimated
+    (every Nth ping) and the stride is recorded in the npz as
+    ``png_row_stride`` so nobody mistakes it for the data.
+    """
+
+    chrono: np.ndarray                  # (n, cols) raw dB, oldest first
+    meta: np.ndarray                    # (n, _META_COLS)
+    pitch_m: float
+    half_extent_m: float
+    columns: int
+    model: "DisplayModelSnapshot"
+    model_active: bool
+    unit_settings: DisplaySettings
+    raw_settings: DisplaySettings
+    percentiles: Tuple[float, float]
+    raw_limits: Optional[Tuple[float, float]]
+
+    def write(self, target) -> None:
+        from pathlib import Path
+        import cv2
+        target = Path(target)
+        target.mkdir(parents=True, exist_ok=True)
+        chrono, meta = self.chrono, self.meta
+        stride = max(1, int(np.ceil(chrono.shape[0] / _PNG_MAX_ROWS)))
+        # PNG is newest-on-top (SonarView convention, matching the live
+        # view): flip the decimated rows before colouring. The npz keeps
+        # the archival buffer oldest-first (row_order tag below).
+        rows = chrono[::stride]
+        if self.model_active:
+            # The mission model with ITS gamma (the dataset transfer), not
+            # the operator's slider: the quick-look matches the pictures.
+            e = self.model.normalise(rows, self.pitch_m, meta[::stride, 5],
+                                     meta[::stride, 6:8])
+            unit = self.model.to_unit(e)[::-1]
+            r = MosaicRenderer()
+            r.settings = self.unit_settings
+            rgba = r.to_rgba(unit, limits=(0.0, 1.0))
+        else:
+            r = MosaicRenderer(percentiles=self.percentiles)
+            r.settings = self.raw_settings
+            rgba = r.to_rgba(rows[::-1], limits=self.raw_limits)
+        cv2.imwrite(str(target / "waterfall.png"),
+                    cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+        # The display model (curves + window + TL parameters), each row's
+        # altitude and the receive-gain offset removed, so the PNG inverts
+        # back to the raw dB kept in intensity_db (see
+        # DisplayModelSnapshot.to_json()["mapping"]).
+        np.savez_compressed(target / "waterfall_raw.npz",
+                            intensity_db=chrono,
+                            layout="slant_bins_centered",
+                            row_order="oldest_first",
+                            png_row_order="newest_first",
+                            slant_pitch_m=self.pitch_m,
+                            swath_half_range_m=self.half_extent_m,
+                            columns=self.columns,
+                            png_row_stride=stride,
+                            row_altitude_m=meta[:, 5].astype(np.float32),
+                            row_gain_db=meta[:, 6:8].astype(np.float32),
+                            row_t_s=meta[:, 0].astype(np.float64),
+                            value_domain="raw_db",
+                            **self.model.npz_items())

@@ -99,10 +99,15 @@ class SonarPing:
     #: Starboard native bin pitch [m] when it differs from ``bin_size_m``
     #: (the two units are configured independently); 0 = same as port.
     stbd_bin_size_m: float = 0.0
-    #: Device receiver gain index of the ping (-1 = unknown). Consumers of
-    #: the display model treat a change as a break (the absolute dB scale
-    #: moves with the gain ladder).
+    #: Device receiver gain index of the ping (-1 = unknown), kept for
+    #: metadata; the display model compensates through the analog gain.
     gain_index: int = -1
+    #: The device's reported ``analog_gain`` of each side's profile (an
+    #: amplitude gain; 0.0 = unknown). The display model removes
+    #: ``20·log10(analog_gain / 74.55)`` per side so a mid-mission
+    #: auto-gain step does not move the picture (core/display_model.py).
+    port_analog_gain: float = 0.0
+    stbd_analog_gain: float = 0.0
     #: Monotonic arrival counter stamped by the live listener (0 on replay
     #: / synthetic pings): the GUI compares it with the listener's newest
     #: to measure how far behind the queue is and throttle rendering.

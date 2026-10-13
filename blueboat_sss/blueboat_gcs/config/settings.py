@@ -44,14 +44,28 @@ class RosTopics:
 class PipelineConfig:
     """START/STOP acquisition behaviour (bottom toolbar)."""
 
-    # Command run by START. The app never launches sss_node.py: this launch
-    # file starts the *processing* pipeline only (see launch/ directory).
+    # Pipeline launch (at application start, and by START after a STOP).
+    # This launch file starts the *processing* pipeline; with the "Real"
+    # sonar source, real_sonar_launch_args make it start sss_node.py too.
     launch_command: List[str] = field(default_factory=lambda: [
         "ros2", "launch", "blueboat_sss", "SSS_processing_launch.py",
     ])
+    # Which sonar is /side_scan_sonar (toolbar "Sonar" selector; the
+    # operator's last choice, kept in QSettings, wins over this default):
+    # "simulation" = the simulator's sss_sim_node, started with the Gazebo
+    # world -- the pipeline starts the processor only; "real" = the pipeline
+    # also starts sss_node.py for the two Omniscan units (reached over the
+    # BlueBoat Base Station WiFi). See ros/sonar_source.py.
+    sonar_source: str = "simulation"
+    real_sonar_launch_args: List[str] = field(default_factory=lambda: [
+        "with_acquisition:=True",
+    ])
     # If true, START also publishes `true` on topics.ping_enable so the
-    # already-running sss_node begins firing, and STOP publishes `false`.
+    # running sonar node begins firing, and STOP publishes `false`.
     publish_ping_enable: bool = True
+    # The enable is sent once /side_scan_sonar subscribes to it (it is a
+    # volatile message); after this long it is sent anyway, with a warning.
+    ping_enable_wait_s: float = 10.0
     # DEPRECATED — kept only so existing YAML files still load. Recording
     # is controlled by the Record ON/OFF toolbar toggle (recording
     # sessions); this flag is no longer read by the launcher.
@@ -69,6 +83,12 @@ class PipelineConfig:
     # (e.g. sss_processor_node) survives a STOP, no matter what.
     leftover_process_patterns: List[str] = field(default_factory=lambda: [
         "sss_processor_node",
+    ])
+    # Swept the same way, but only processes this application launched
+    # (sonar_source.OWNER_ENV in their environment): the real driver, which
+    # an operator may also have started by hand in a terminal.
+    owned_process_patterns: List[str] = field(default_factory=lambda: [
+        "sss_node.py",
     ])
 
 
@@ -177,8 +197,17 @@ class DisplayConfig:
     * ``hi_pct`` — the window top ``hi`` is this percentile of the
       normalised seabed level; there is NO low handle (shadows go black by
       the power-law transfer on their own).
-    * ``gamma`` — transfer exponent ``u = 10^(gamma·(e−hi)/10)``: 1.0 is
-      linear power (SonarView), 0.5 amplitude. Seeds the Contrast slider.
+    * ``gamma`` — the Contrast slider's seed. Under the ``power`` transfer
+      it is the exponent ``u = 10^(gamma·(e−hi)/10)`` (1.0 linear power,
+      0.5 amplitude); under ``db_window`` it scales the window.
+    * ``transfer`` — ``power`` (default, provisional until a paired
+      SonarView comparison on real data exists — project_review.md §3.2)
+      or ``db_window`` (linear in dB over ``window_db / gamma`` below the
+      window top, the reading of SonarView's recorded view state).
+    * ``gain_compensation`` / ``gain_reference_analog`` — remove the
+      device's receive-gain step ``20·log10(analog_gain / reference)`` per
+      ping and side before the model sees the level (reference 74.55 =
+      gain index 4, the calibration anchor; measured on the harbour logs).
     """
 
     tl_k: float = 40.0
@@ -188,7 +217,7 @@ class DisplayConfig:
     min_bin_count: int = 100
     warmup_rows: int = 300
     hi_pct: float = 95.0
-    gamma: float = 0.7
+    gamma: float = 0.5        # amplitude transfer (2026-09-18; was 0.7)
     # Soft knee of the transfer: above this unit brightness highlights are
     # compressed instead of clipped (1.0 = hard clip). A wall face keeps
     # its texture for a few dB past ``hi``.
@@ -197,6 +226,27 @@ class DisplayConfig:
     # physical line fitted through it: bins dominated by a wall's shadow
     # (or its face) on every ping are pulled back onto physics.
     curve_tolerance_db: float = 6.0
+    # Transfer selection and the dB window's dynamic range at gamma 1.
+    transfer: str = "power"
+    window_db: float = 40.0
+    # Receive-gain compensation (see the class docstring).
+    gain_compensation: bool = True
+    gain_reference_analog: float = 74.55
+
+
+@dataclass
+class AlongTrackConfig:
+    """The one along-track estimator (core/along_track.py) shared by the
+    true-scale waterfall and the square-pixel seabed pictures.
+
+    ``window_s``: seconds of ping poses over which ground speed and ping
+    period are taken as medians. ``pair_s``: the span of each chord-speed
+    measurement (long enough that repeated pose samples and centimetre
+    jitter average out, short enough to follow a turn).
+    """
+
+    window_s: float = 5.0
+    pair_s: float = 1.0
 
 
 @dataclass
@@ -378,7 +428,7 @@ class GeoConfig:
 @dataclass
 class MapConfig:
     # DEPRECATED — no longer applied. The odom frame is local ENU with
-    # absolute yaw (robot-side guarantee); a rotation here was only ever
+    # absolute yaw (guaranteed by its producer, robot_interface); a rotation here was only ever
     # a workaround for the old hybrid frame. Kept so old YAMLs load.
     frame_yaw_offset_deg: float = 0.0
     # Gate the whole map on the GPS anchor: nothing is drawn and clicks
@@ -439,6 +489,43 @@ class SimConfig:
 
 
 @dataclass
+class PlannedPathConfig:
+    """Where the planned mission path comes from.
+
+    Asked of the running path server, the way the Mission Control Station
+    draws its own preview (2026-09-28): ``path_generation``'s ``trajectory``
+    parameter names the mission, that file's duration sizes ONE
+    ``/path_request``, and the answer -- world-frame poses, the whole
+    mission -- is drawn as is. Asked again only when the deployment changes.
+    ``/set_path`` (``path_publisher``'s fixed ``total_time`` window, 1000 s
+    by default, truncating longer missions) is the fallback when no server
+    can be asked. ``from_service: false`` draws ``/set_path`` only.
+    ``core/deployed_path.py`` records why the 2026-09-18 "newest deployed
+    file" source was replaced.
+    """
+
+    from_service: bool = True
+    service: str = "/path_request"
+    #: The node serving it; its ``trajectory`` / ``yaml_path`` parameters
+    #: say which trajectory it serves.
+    generator_node: str = "/path_generation"
+    #: How often the listener checks for a new deployment [s].
+    poll_s: float = 1.0
+    #: Path-parameter step of the request [s] (MCS's ``path_preview_dt_s``).
+    dt_s: float = 0.5
+    #: Window for a built-in shape, which carries no duration [s]
+    #: (``path_publisher``'s own default).
+    default_horizon_s: float = 1000.0
+    max_points: int = 20000
+    request_timeout_s: float = 10.0
+    #: Inert since 2026-09-28 (the deployed-file source is gone); still
+    #: accepted so an override file naming them keeps loading.
+    prefer_deployed: bool = True
+    trajectory_root: str = ""
+    name: str = ""
+
+
+@dataclass
 class AppConfig:
     topics: RosTopics = field(default_factory=RosTopics)
     pipeline: PipelineConfig = field(default_factory=PipelineConfig)
@@ -449,11 +536,13 @@ class AppConfig:
     depth: DepthConfig = field(default_factory=DepthConfig)
     sonar_stream: SonarStreamConfig = field(default_factory=SonarStreamConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
+    along_track: AlongTrackConfig = field(default_factory=AlongTrackConfig)
     map: MapConfig = field(default_factory=MapConfig)
     geo: GeoConfig = field(default_factory=GeoConfig)
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     acquisition: AcquisitionConfig = field(default_factory=AcquisitionConfig)
     sim: SimConfig = field(default_factory=SimConfig)
+    planned_path: PlannedPathConfig = field(default_factory=PlannedPathConfig)
     data_root: str = "../../../../data/SSS_data"   # same root as the existing pipeline
 
 

@@ -20,7 +20,7 @@ byte-identical in behaviour):
 
 Processing layer (faithful port of the ``sss_processor_node`` pipeline +
 ``sss_helper.py``, constants copied verbatim — keep in sync with the
-robot-side repo if those are ever retuned):
+processor if those are ever retuned):
 
     raw u16 → scale_to_db → ringing-adaptive noise window → FBR
     detection per side → dual-side FBRTracker (independent bootstrap,
@@ -85,9 +85,9 @@ BOOTSTRAP_PINGS = 10
 ALTITUDE_AGREEMENT_TOL_M = 0.30
 OUTLIER_TOL_M = 1.0
 RELOCK_AFTER = 15
-TRANSDUCER_SUBMERSION_M = 0.0
-TRANSDUCER_Y_OFFSET_PORT_M = 0.0
-TRANSDUCER_Y_OFFSET_STBD_M = 0.0
+TRANSDUCER_SUBMERSION_M = 0.15   # estimate, = sim sensor_depth_m
+TRANSDUCER_Y_OFFSET_PORT_M = 0.285  # BR-101447 hull spacing 570 mm / 2
+TRANSDUCER_Y_OFFSET_STBD_M = 0.285
 PAIR_TOLERANCE_NS = 50_000_000    # 50 ms processor tolerance
 
 
@@ -130,7 +130,9 @@ def decode_os_mono_profile(payload: bytes) -> dict:
             # Authoritative side identity (see load_svlog): the device's
             # own channel tag, plus the transducer bearing as fallback.
             "channel_number": channel_number, "gain_index": gain_index,
-            "transducer_heading_deg": transducer_heading_deg}
+            "transducer_heading_deg": transducer_heading_deg,
+            # The receive-gain step the display model removes per side.
+            "analog_gain": analog_gain}
 
 
 def decode_omniscan_status(payload: bytes) -> dict:
@@ -203,17 +205,45 @@ def describe_session_devices(devices) -> Optional[str]:
     return "; ".join(p for p in parts if p) or None
 
 
+def resolve_side(d: dict) -> Optional[int]:
+    """Side identity for a decoded profile: 0 = port, 1 = stbd, None when
+    neither field carries one.
+
+    The packet's own ``channel_number``, with the **wrapped** sign of the
+    transducer bearing as the fallback for devices that leave it outside
+    (0, 1) -- two logs in the corpus carry 255 on every packet. Wrapping
+    to (-180, 180] is what keeps a writer that encodes an absolute bearing
+    (the simulator did until 2026-09-15) from mirroring half its headings,
+    the failure SonarView showed on those logs (project_review.md §3.6).
+    Verbatim port of ``sss_helper.side_from_fields`` (the processor) and the
+    twin in ``core/live_native.py``; change all three together.
+    """
+    ch = d["channel_number"]
+    if ch in (0, 1):
+        return int(ch)
+    try:
+        h = float(d.get("transducer_heading_deg", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(h) or h == 0.0:
+        return None
+    rel = (h + 180.0) % 360.0 - 180.0
+    if rel == -180.0:
+        rel = 180.0
+    if rel == 0.0:
+        return None
+    return 1 if rel > 0.0 else 0
+
+
 def side_of(d: dict) -> int:
     """Authoritative side identity for a decoded profile: 0 = port, 1 = stbd.
 
-    The packet's own ``channel_number``, with the transducer bearing as the
-    fallback for devices that leave it outside (0, 1) -- two logs in the
-    corpus carry 255 on every packet.
+    ``resolve_side`` with the unresolved case (no usable field) landing on
+    port, as the replay path has always done; ``load_svlog`` counts those
+    packets in ``SvlogMission.unresolved_side`` so the fallback is visible.
     """
-    ch = d["channel_number"]
-    if ch not in (0, 1):
-        ch = 1 if d["transducer_heading_deg"] > 0 else 0
-    return ch
+    side = resolve_side(d)
+    return 0 if side is None else side
 
 
 def estimate_counter_offset(profiles: Sequence[Tuple[int, int, int]],
@@ -628,6 +658,9 @@ class SvlogMission:
     synthetic_clock: bool = False        # any stream fell back to NS_PER_TICK
     clock_notes: List[str] = field(default_factory=list)
     unparsed_packets: Counter = field(default_factory=Counter)
+    #: Profiles whose side neither channel_number nor the transducer
+    #: bearing carried (landed on port, NC #1 fallback of last resort).
+    unresolved_side: int = 0
 
     @property
     def pings(self) -> List[SonarPing]:
@@ -880,7 +913,10 @@ def load_svlog(path: Path,
             t_ns = stamp_profile(d)
             # Authoritative side: the packet's own channel_number, with
             # the transducer bearing as a fallback for exotic writers.
-            ch = side_of(d)
+            ch = resolve_side(d)
+            if ch is None:
+                mission.unresolved_side += 1
+                ch = 0
             # Both counters expressed on the port device's numbering, and
             # scoped to the segment: a power cycle between sessions restarts
             # both the counter and the offset between the two devices.
@@ -1017,6 +1053,8 @@ def load_svlog(path: Path,
             gap_before=gap_before,
             bottom_slant_m=fbr.bottom,
             gain_index=int(ref.get("gain_index", -1)),
+            port_analog_gain=float(p.get("analog_gain", 0.0)) if p is not None else 0.0,
+            stbd_analog_gain=float(s.get("analog_gain", 0.0)) if s is not None else 0.0,
             **nat)))
         mission.ping_count += 1
         if p is not None and s is not None:

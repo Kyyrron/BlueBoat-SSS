@@ -10,9 +10,11 @@ modes:
 * `python -m blueboat_gcs.main --sim` — full GUI with a built-in simulator, no ROS;
 * `python -m blueboat_gcs.main` — field mode, subscribing to the real topics.
 
-Field prerequisites: `blueboat_interfaces` sourced in the environment; the robot-side
-`sss_node.py` running (pinging off — START enables it); `pip install PySide6 pyyaml
-opencv-python` on the basestation.
+Field prerequisites: `blueboat_interfaces` sourced in the environment; the toolbar's
+**Sonar** selector on *Real sonars* (the pipeline then starts `sss_node.py` itself,
+pinging off until START) — or on *Simulation*, where the simulator's `sss_sim_node`
+is `/side_scan_sonar`; `pip install PySide6 pyyaml opencv-python` in the workspace venv.
+Everything runs on the operator laptop.
 
 ## 2. Consumed topics (already implemented, no work needed)
 
@@ -23,7 +25,18 @@ opencv-python` on the basestation.
 | `/mavros/global_position/global` (`topics.navsat`) | `sensor_msgs/NavSatFix` | ~5 Hz | GPS origin binding + robot info |
 | `/mavros/global_position/compass_hdg` (`topics.compass_hdg`) | `std_msgs/Float64` (deg) | ~10 Hz | heading display |
 | `/mavros/vfr_hud` (`topics.vfr_hud`) | `mavros_msgs/VfrHud` | ~4 Hz | ground speed (optional; falls back to odom twist if `mavros_msgs` absent) |
-| `/set_path` (`topics.planned_path`) | `nav_msgs/Path` | ~1 Hz | planned mission path overlay (same message `path_publisher.py` sends to RViz; poses in the local odom frame; each message fully replaces the displayed path) |
+| `/set_path` (`topics.planned_path`) | `nav_msgs/Path` | ~1 Hz | planned-path **fallback** only (the message `path_publisher.py` sends to RViz, a fixed `total_time` window). It is dropped while the path server can be asked directly (below) |
+
+The planned mission path itself is **asked of the path server**, as the Mission
+Control Station does for its preview (`config.planned_path`,
+`ros/path_listener.py`, `core/deployed_path.py`):
+1. `/path_generation/get_parameters` (`trajectory`, `yaml_path`) names the running mission.
+2. ONE `/path_request` over that file's whole duration (dt 0.5 s) returns world/odom-frame
+   poses, drawn as they come; each path fully replaces the previous one.
+3. It is asked again only when the deployment changes: the file's mtime, a server restart,
+   or the overlay being cleared.
+4. While a `from_yaml` file is not deployed yet, the overlay is cleared and the status bar
+   says it is waiting.
 
 Published control topics: `std_msgs/Bool` on `/side_scan_sonar/ping/enable`
 (START → true, STOP → false) and `/sss_processor/log/enable`.
@@ -87,6 +100,19 @@ adopted. If your processor writes elsewhere, extend the sweep in
 STOP and application close export **nothing** — data only leaves the application
 through recording sessions.
 
+**Record OFF / STOP no longer freeze the app (2026-09-15).** `RecordingManager.end()`
+writes `metadata.json` and the detections synchronously, takes immutable snapshots of
+the mosaic and the waterfall (`export_snapshot()` on each service — grid planes,
+model items, trajectory; buffer, metadata, model, renderer settings) and hands them
+to one job on the global `QThreadPool` (the pool the seabed-image saves already use);
+the compressed `.npz` writes — 2.5–7.4 s on a full mission, the measured cause of the
+"STOP freezes for seconds" field symptom — happen while pings keep arriving. The
+console reports "Recording session saved to …" when the job finishes.
+`RecordingManager.wait_for_exports()` blocks until the pool drains: the app's
+`closeEvent` calls it (never exit under a write), and so must any script that lists a
+session folder right after `end()`. `session_rebuild` (offline) still writes
+synchronously through the same snapshots.
+
 **Merged sessions** (`merged_sessions/<name>/`, next to `sessions/`): the replay
 window's "Merge with another svlog…" button combines two recorded logs into one
 new multi-session `.svlog` (sources untouched — NC #6) and regenerates every
@@ -106,6 +132,9 @@ pinging off, active session closed and saved, ROS 2 nodes gracefully terminated
 `pipeline.leftover_process_patterns`, default `sss_processor_node`; the sweep also
 runs at startup and before each relaunch). **If no recording session was active,
 nothing is exported.** START after STOP relaunches the pipeline automatically.
+The **Sonar** selector (*Simulation* / *Real sonars*, remembered) decides whether that
+launch also starts the real driver; switching it while the pipeline is up asks, runs
+STOP and relaunches (`ros/sonar_source.py`).
 
 **Embedded console.** The "Console" toolbar button opens the bottom console dock:
 Python prints and app logging (via `core/logging_bus.py`), ROS 2 log messages from
@@ -167,7 +196,10 @@ release. Once frozen, promote it 1:1 to `blueboat_interfaces/SeabedAnalysis.msg`
 `<session>/seabed_images/seabed_XXXXX.png` with `metadata/seabed_XXXXX.json`
 (per-row pose/time/speed/altitude + the closed-form pixel→world formula) and
 `metadata/seabed_XXXXX_world.npz` (per-pixel `world_x`/`world_y` float32 grids +
-the raw float `intensity_db` for training — the PNG is display-normalized). A YOLO
+the raw float `intensity_db` for training — the PNG is display-normalized — and,
+since 2026-09-15, `row_gain_db`, the per-row/per-side receive-gain offset the display
+model removed; the JSON's `rows_data` carries the same as `gain_port_db` /
+`gain_stbd_db`). A YOLO
 bbox center `(row, col)` maps to the world with one lookup:
 `world = (world_x[row, col], world_y[row, col])`.
 
@@ -200,20 +232,20 @@ missing. **Run AI** recreates every seabed picture from the log (256-row windows
 detections on the map and in the waterfall view exactly as live. The offline
 processing in
 `core/svlog.py` is a port of the `sss_processor_node` pipeline with its constants
-copied verbatim — if those are ever retuned on the robot, mirror them there.
+copied verbatim — if those are ever retuned in the processor, mirror them there.
 
 ### 3.1quater Sea-trial pose alignment — pings frozen at (0,0) with GPS on (new)
 
 **Symptom.** In real trials every ping locked to (0, 0) although GPS was on; the
 waterfall was fine and rosbag replays of SonarView `.svlog` files worked in the replay
-window. **Root cause is robot-side, not in this app.** `sss_processor_node` snaps each
+window. **Root cause is upstream of this app.** `sss_processor_node` snaps each
 ping's pose from `/blueboat/odom` (tolerance-free nearest-stamp lookup). Live, that
 topic is either publishing zeros (EKF/robot_interface not yet fused) or stamping on a
 clock different from the sonar profiles, so the lookup latches a boot-time zero.
 Rosbag replays are immune because `svlog_to_rosbag` **synthesizes** `/blueboat/odom`
 on the same synthetic clock from real `LOCAL_POSITION_NED` — which is exactly why
-"bag works, live doesn't". **The real fix is on the robot: publish a valid
-`/blueboat/odom` (non-zero, correctly stamped on the sonar clock).**
+"bag works, live doesn't". **The real fix is at the source: `robot_interface` must publish a
+valid `/blueboat/odom` (non-zero, correctly stamped on the sonar clock).**
 
 **GCS-side mitigations** (so trials are usable before that is fixed), all in the
 `alignment` config block and `utils/pose_alignment.py`:
@@ -229,20 +261,27 @@ on the same synthetic clock from real `LOCAL_POSITION_NED` — which is exactly 
   origin binding and the re-stamped pings all align on the satellite map. Normal odom
   resumes automatically when it returns.
 
-These are safety nets, not a substitute for correct robot-side odom; the console
+These are safety nets, not a substitute for a correct `/blueboat/odom`; the console
 warning is deliberately explicit so the operator knows to fix the source.
 
 ### 3.1quinquies Sonar stream integrity, depth compensation & resolution (new)
 
-Full measurements and the robot-side patches are in
+Full measurements and the node-side patches are in
 `docs/SONARVIEW_SVLOG_ANALYSIS.md`. Operational summary:
 
 **Side routing.** Never trust the device/topic tag. Every profile packet carries its
 own `channel_number` (0 = port, 1 = starboard) and `transducer_heading_deg`
-(-90/+90); on real dual-Omniscan logs these agreed with each other on 100 % of
-packets but disagreed with the `src` tag on 19.8 %. The svlog reader now routes on
-`channel_number` and assembles rows by `ping_number`, which removed the mirrored and
-swapped rows entirely (11.4 % and 15.0 % of rows before).
+(-90/+90 — the mounting angle, constant); on real dual-Omniscan logs these agreed with
+each other on 100 % of packets but disagreed with the `src` tag on 19.8 %. The svlog
+reader now routes on `channel_number` and assembles rows by `ping_number`, which
+removed the mirrored and swapped rows entirely (11.4 % and 15.0 % of rows before).
+The channel-255 fallback is the sign of the bearing **wrapped to (−180, 180]** (one
+rule, `sss_helper.side_from_fields`, mirrored in `core/svlog.py` and
+`core/live_native.py`, 2026-09-15): a writer that encodes an absolute bearing — the
+simulator did — put a north-heading boat's port transducer at 270, and a raw sign test
+mirrored it, which is what SonarView showed on the simulator logs. A bearing of 0
+resolves nothing: the processor routes by the arrival topic on both its paths and
+counts it; replay counts it in `SvlogMission.unresolved_side`.
 
 **No ping is ever dropped.**
 * The reader emits a row for every `ping_number`, including one-sided ones (that is
@@ -287,7 +326,10 @@ unreliable. In the replay window, changing it re-processes the log.
 waterfall shows the **newest ping on top** (SonarView convention; the live view pins to
 the top, the exported PNG and the seabed pictures are newest-first) and is drawn at
 **true scale** (rows stretched by along-track metres per ping over the bin pitch,
-"True scale" checkbox in the view). Every picture — live waterfall, replay waterfall,
+"True scale" checkbox in the view; the metres per ping come from `core/along_track.py`
+— ground speed over a ~5 s window × ping period, shared with the seabed pictures since
+2026-09-15, because the raw per-ping displacement reads a quarter low at 20 Hz where
+pings repeat a pose sample). Every picture — live waterfall, replay waterfall,
 AI seabed pictures, mosaic — maps dB to grey through the window's ONE **display model**
 (`core/display_model.py`; the science and the measurements behind it are in
 `docs/SCIENTIFIC_BACKGROUND.md`): the two-way transmission loss `k·log10 r + 2αr` is
@@ -295,9 +337,13 @@ removed (the stream is pre-TVG: the seabed falls 60–70 dB per decade of slant 
 the field logs), then an empirical per-side seabed curve in normalised slant range
 `r/h` (the **mode** of each bin's level histogram tied to a consensus physical line —
 immune to shadows, walls and targets, even a wall shadowing the whole far range;
-altitude- and range-invariant) is divided out, then a power-law transfer
+altitude- and range-invariant) is divided out — after the ping's own receive-gain step
+`20·log10(analog_gain/74.55)` (per side; the auto-gain ladder is an amplitude gain and
+each step is a level shift) — then a transfer: the power law
 `u = 10^(γ(e−hi)/10)` with a robust window top, a soft highlight knee and **no low
-handle**. Near and far
+handle** (default), or `display.transfer: db_window`, linear in dB over
+`window_db/γ` below the top (SonarView's recorded view-state shape; the default is
+open until a paired comparison on real data — `TODO.md`). Near and far
 seabed read alike, shadows go black, and the water column and ringing core darken by
 the extrapolated transmission loss — **nothing is erased**, everything is **losslessly
 invertible** from the model stored in every JSON/npz (`display_model`, `db = e − TL(r) +
@@ -336,7 +382,7 @@ broke bottom detection outright. `launch/SSS_processing_launch.py` now defaults 
 The plan in `info.md` (feed local map patches to the detector) fits naturally as a
 separate node subscribing to `/sss_processor/processed` (or to saved mosaic tiles) and
 publishing `Detection2DArray` — the GUI needs no change. If you prefer in-process
-inference on the basestation, add a `core/detector_service.py` consuming
+inference inside the GCS, add a `core/detector_service.py` consuming
 `signals.sonar_ping` and emitting `signals.detection`; the bus makes both options
 equivalent from the GUI's perspective.
 
@@ -346,7 +392,8 @@ equivalent from the GUI's perspective.
   convention). If your odom frame is heading-aligned at boot, set
   `map.frame_yaw_offset_deg` (this supersedes `math_helper.local_to_enu(yaw0)`).
 * **Launch files**: `blueboat_sss` ships two — `launch/SSS_processing_launch.py`
-  (processor; what START runs) and `launch/SSS_simple_launch.py` (acquisition only).
+  (processor, + `sss_node.py` with the *Real sonars* selector; what the app launches)
+  and `launch/SSS_simple_launch.py` (acquisition only, for running the driver by hand).
   Both are installed by `install(DIRECTORY launch ...)` in `CMakeLists.txt`. The
   matplotlib listener node is gone; this app replaces it.
 * **Transducer offsets**: still `TODO = 0.0` in `sss_processor_node.py` — measure and

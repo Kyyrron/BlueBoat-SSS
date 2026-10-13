@@ -1,6 +1,8 @@
 # Side Scan Sonar — Usage Guide
 
-Robot-side quick start for the `blueboat_sss` ROS 2 package. The full interface
+Quick start for the `blueboat_sss` ROS 2 package (nodes, topics, parameters). Its nodes
+run on the operator laptop, like every node of the project, and reach the two Omniscan
+units over the BlueBoat Base Station WiFi. The full interface
 reference is `../.claude/CLAUDE.md`; the operator copy-paste command sheet is
 `terminals.txt`.
 
@@ -21,8 +23,10 @@ Pinging and logging are both **OFF at startup**.
 ## Launching
 
 ```bash
-# Processor only — this is what the GCS START button runs
+# Processor only — what the GCS launches with its "Sonar: Simulation" selector
 ros2 launch blueboat_sss SSS_processing_launch.py
+# Processor + driver — what it launches with "Sonar: Real sonars"
+ros2 launch blueboat_sss SSS_processing_launch.py with_acquisition:=True
 
 # Acquisition only
 ros2 launch blueboat_sss SSS_simple_launch.py
@@ -167,6 +171,6 @@ source install/setup.bash
 `lib/blueboat_sss/`; the flat layout is what lets `sss_processor_node.py` import
 `sss_helper` / `svlog_helper` / `math_helper` without a package prefix.
 
-Robot-side dependencies: `bluerobotics-ping` (`brping`), `simple_launch`,
+Node dependencies: `bluerobotics-ping` (`brping`), `simple_launch`,
 `scipy`, `mavros_msgs`, `geographic_msgs`, and `blueboat_interfaces` (supplied
 by BlueBoat-Control).

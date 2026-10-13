@@ -24,7 +24,7 @@ from typing import List
 import numpy as np
 import pytest
 
-# The robot-side frame writer: ROS-free, and the module that produces every
+# The node-side frame writer: ROS-free, and the module that produces every
 # real .svlog. conftest.py puts src/_custom_libraries on sys.path.
 import svlog_helper
 
@@ -206,6 +206,11 @@ def test_sim_recording_session_layout(sim_app):
         (ACQUIRE_MS // 2, plant_svlog),
         (ACQUIRE_MS, h.window.toolbar.stop_clicked.emit),
     ])
+    # STOP returns before mosaic/ and waterfall/ are written (they go to
+    # the pool so the app never freezes); the layout assertions below
+    # need the files, so wait here — as closeEvent does.
+    assert h.window.recording.wait_for_exports(timeout_s=30.0)
+    h.app.processEvents()
 
     assert len(h.pings) >= MIN_PINGS, f"only {len(h.pings)} pings recorded"
 
@@ -223,6 +228,12 @@ def test_sim_recording_session_layout(sim_app):
     for key in ("ping_count", "detection_count", "adopted_svlogs", "mosaic"):
         assert key in meta, f"metadata.json lost {key!r}: {sorted(meta)}"
     assert meta["ping_count"] >= MIN_PINGS, meta["ping_count"]
+    # The panel's settings reached the recorder before any control moved
+    # (2026-09-15 start-up ordering): no more `null` here, and the value
+    # is the slider's — the config gamma — not DisplaySettings()'s 1.0.
+    assert meta["display_settings_at_end"] is not None
+    assert meta["display_settings_at_end"]["gamma"] == pytest.approx(
+        h.config.display.gamma)
 
     # --- mosaic ----------------------------------------------------------------
     for name in ("sonar_mosaic.npz", "sonar_mosaic.png", "boat_trajectory.csv"):

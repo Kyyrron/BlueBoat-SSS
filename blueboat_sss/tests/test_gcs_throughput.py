@@ -165,3 +165,60 @@ def test_waterfall_capacity_is_bounded_in_samples(qapp):
     for k in range(3 * _TILE_ROWS):
         wf.on_sonar_ping(make_ping(k, **kw))
     assert wf.total_rows - wf.first_row <= 2 * _TILE_ROWS + 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-15 render-load items (project_review.md §3.4)
+# ---------------------------------------------------------------------------
+def _pings(n, **over):
+    kw = dict(range_m=15.0, bins=600, depth=4.0, speed=0.5, rate_hz=20.0,
+              one_sided=False, turn=False)
+    kw.update(over)
+    return [make_ping(k, **kw) for k in range(n)]
+
+
+def test_detections_overlay_is_emitted_only_when_it_changes():
+    svc = WaterfallService(_cfg())
+    svc._timer.stop()
+    got = []
+    svc.detections_updated.connect(lambda o: got.append(list(o)))
+    svc.set_enabled(True)                       # one emission (empty)
+    for p in _pings(30):
+        svc.on_sonar_ping(p)
+    svc._force_render()                         # first layout: one emission
+    n0 = len(got)
+    for p in _pings(30)[10:20]:
+        svc.on_sonar_ping(p)
+    svc._force_render()                         # new rows only: nothing
+    svc._dirty = True
+    svc._force_render()                         # idle pass: nothing
+    assert len(got) == n0
+    svc.add_detection(0.5, 1.0, 2.0, "target")
+    svc._force_render()
+    assert len(got) == n0 + 1 and got[-1] and got[-1][0]["label"] == "target"
+    svc._force_render()
+    assert len(got) == n0 + 1
+    svc.clear_detections()                      # explicit empty overlay
+    assert len(got) == n0 + 2 and got[-1] == []
+
+
+def test_mosaic_display_changes_are_debounced_and_value_keyed():
+    from PySide6.QtTest import QTest
+    svc = MosaicService(_cfg())
+    svc._timer.stop()
+    for p in _pings(30):
+        svc.on_sonar_ping(p)
+    svc._force_render()
+    got = []
+    svc.raster_updated.connect(lambda *a: got.append(1))
+    for k in range(10):                          # a slider drag
+        svc.set_display(DisplaySettings(gamma=0.5 + 0.05 * k))
+    assert got == []                             # nothing synchronous
+    QTest.qWait(300)
+    assert len(got) == 1                         # one render for the drag
+    svc.set_display(DisplaySettings(gamma=0.95))  # equal value re-emitted
+    QTest.qWait(300)
+    assert len(got) == 1                         # cache kept, no render
+    svc.set_display(DisplaySettings(gamma=0.6))
+    QTest.qWait(300)
+    assert len(got) == 2

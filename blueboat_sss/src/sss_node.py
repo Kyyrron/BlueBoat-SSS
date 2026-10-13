@@ -344,8 +344,13 @@ class SideScanSonarNode(Node):
         self.declare_parameter("range_length_mm", 20000)
         self.declare_parameter("msec_per_ping", 0)
         self.declare_parameter("gain_index", -1)
-        self.declare_parameter("num_results", 600)
-        self.declare_parameter("pulse_len_percent", 0.002)
+        # The device's best range resolution (2026-09-28): 1200 bins is its
+        # maximum, and pulse = max(44.3 us, pulse_len_percent x 2R/c) (measured
+        # on every corpus recording) sits on its 44.3 us floor up to ~27 m at
+        # 0.00125 -- SonarView's own 1.5 / num_results. 33 mm true range
+        # resolution at 20 m, against 40 mm at the former 600 / 0.002.
+        self.declare_parameter("num_results", 1200)
+        self.declare_parameter("pulse_len_percent", 0.00125)
 
         # ---- Publishers (best-effort: sonar is a high-rate lossy stream) ---
         sonar_qos = QoSProfile(

@@ -226,10 +226,10 @@ def test_view_shows_newest_ping_on_top(qapp, tmp_config):
 
 
 def test_true_scale_stretches_rows_and_keeps_clicks_exact(qapp, tmp_config):
-    """True scale (default on) draws each row ``row_pitch / col_pitch``
-    taller than a column; the click mapping goes through the same view
-    transform, so a viewport point resolves to the same (row, col)
-    whichever mode is on."""
+    """The waterfall draws each row ``row_pitch / col_pitch`` taller than a
+    column -- always, since 2026-09-18: there is no toggle, so one picture
+    has one scale. The click mapping goes through the same view transform,
+    so a viewport point resolves to the same (row, col) either way."""
     from PySide6.QtCore import QPoint
     from blueboat_gcs.gui.waterfall_view import WaterfallView
 
@@ -250,14 +250,79 @@ def test_true_scale_stretches_rows_and_keeps_clicks_exact(qapp, tmp_config):
     t = view.transform()
     assert t.m22() / t.m11() == pytest.approx(10.0)
 
-    # A scene point maps out and back to the same (row, col) in both modes.
+    # There is no toggle to turn it off any more.
+    assert not hasattr(view, "set_true_scale")
+    assert not any("scale" in getattr(c, "text", lambda: "")().lower()
+                   for c in view._controls.findChildren(object)  # noqa: SLF001
+                   if hasattr(c, "text"))
+    # The state is on screen rather than implied: cm per ping and per bin.
+    note = view._scale_state()                                   # noqa: SLF001
+    assert "cm/ping" in note and not note.startswith("!")
+
+    # A scene point maps out and back to the same (row, col).
     scene_pt = (123.5, -(17 + 0.5))                # column 123, row 17
-    for on in (True, False):
-        view.set_true_scale(on)
-        t = view.transform()
-        assert t.m22() / t.m11() == pytest.approx(10.0 if on else 1.0)
-        vp = view.mapFromScene(*scene_pt)
-        back = view.mapToScene(QPoint(vp.x(), vp.y()))
-        # Exact to within one device pixel in scene units, in both axes.
-        assert abs(back.x() - scene_pt[0]) <= 1.0 / t.m11() + 1e-9
-        assert abs(back.y() - scene_pt[1]) <= 1.0 / t.m22() + 1e-9
+    t = view.transform()
+    vp = view.mapFromScene(*scene_pt)
+    back = view.mapToScene(QPoint(vp.x(), vp.y()))
+    # Exact to within one device pixel in scene units, in both axes.
+    assert abs(back.x() - scene_pt[0]) <= 1.0 / t.m11() + 1e-9
+    assert abs(back.y() - scene_pt[1]) <= 1.0 / t.m22() + 1e-9
+
+
+def test_scale_state_is_visible_and_follows_the_rows_on_screen(qapp, tmp_config):
+    """One scale, said out loud (2026-09-18, review G12).
+
+    The waterfall used to stretch the *whole* history at the newest row
+    pitch and to fall back to square pixels in silence when there was no
+    speed estimate. The 2026-09-07 session changed range mid-mission
+    (36 -> 20 -> 15 m), which is exactly the case one transform cannot
+    draw: the view now takes the scale of the rows on screen and says
+    when they disagree or when there is no scale at all.
+    """
+    from blueboat_gcs.gui.waterfall_view import WaterfallView
+
+    view = WaterfallView()
+    view.resize(900, 700)
+
+    # Nothing yet: no claim about scale at all.
+    assert view._scale_state() == ""                          # noqa: SLF001
+
+    # Geometry but no speed estimate -> square pixels, and it says so.
+    view.on_layout(0, 40, 200, 10.0, 0.0)
+    assert view.aspect == pytest.approx(1.0)
+    assert view._scale_state().startswith("!")                # noqa: SLF001
+    assert "unavailable" in view._scale_state()               # noqa: SLF001
+
+    # A steady 0.5 m/ping against a 0.1 m bin: aspect 5, stated in cm.
+    for row in range(1, 60):
+        view.on_layout(0, row, 200, 10.0, 0.5)
+    assert view.aspect == pytest.approx(5.0)
+    note = view._scale_state()                                # noqa: SLF001
+    assert not note.startswith("!") and "50 cm/ping" in note
+
+    # The pitch history keeps one breakpoint per material change, not one
+    # per layout message.
+    assert len(view._pitch_marks) == 1                        # noqa: SLF001
+
+    # A second segment at half the speed: both are on screen, so the view
+    # draws one of them and warns that the picture mixes two scales.
+    for row in range(60, 120):
+        view.on_layout(0, row, 200, 10.0, 0.25)
+    view.fit_file()
+    qapp.processEvents()
+    lo, hi = view._visible_rows()                             # noqa: SLF001
+    assert lo <= 0 and hi >= 100                              # the whole file
+    mixed = view._scale_state()                               # noqa: SLF001
+    assert mixed.startswith("!") and "mixed along-track scale" in mixed
+    # ... and the scale it draws is one of the two, not their average.
+    assert 0.25 <= view.pitch_for_rows(lo, hi) <= 0.5
+
+    # Scrolled into the slow segment alone, the warning goes and the scale
+    # is that segment's.
+    assert view.pitch_for_rows(80, 110) == pytest.approx(0.25)
+    assert view.pitch_for_rows(5, 40) == pytest.approx(0.5)
+
+    # Clearing forgets the history rather than carrying it into the next
+    # mission.
+    view.on_layout(0, 0, 200, 10.0, 0.0)
+    assert view._pitch_marks == []                            # noqa: SLF001

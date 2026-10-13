@@ -1,6 +1,6 @@
 """``SvlogWriter``: a recording either exists and is named, or says why not.
 
-The writer is the robot-side half of one question — *does a recorded
+The writer is the node-side half of one question — *does a recorded
 `.svlog` exist, and where?* — and every case below is a failure mode that
 once looked like success:
 
@@ -198,7 +198,7 @@ def test_the_gcs_copy_is_the_same_module(tmp_path):
     """
     gcs_copy = Path(svlog_helper.__file__).resolve()
     assert gcs_copy.parent.name == "_custom_libraries", (
-        f"tests imported svlog_helper from {gcs_copy}, not the robot-side "
+        f"tests imported svlog_helper from {gcs_copy}, not the node-side "
         "source; conftest's sys.path order changed")
 
 
