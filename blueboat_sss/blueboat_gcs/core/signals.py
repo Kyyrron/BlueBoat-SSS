@@ -40,6 +40,10 @@ class AppSignals(QObject):
     gps_fix = Signal(float, float, float)
     #: Compass heading: (t_wall_monotonic, degrees clockwise from north).
     compass_heading = Signal(float, float)
+    #: Attitude: (t_wall_monotonic, roll, pitch, yaw rate) [rad, rad/s]
+    #: from /mavros/imu/data -- attached to live pings for the seabed-image
+    #: metadata (utils/attitude.py), never used for geometry.
+    attitude = Signal(float, float, float, float)
     #: The map's GPS anchor became valid: (lat0, lon0).
     geo_anchored = Signal(float, float)
 

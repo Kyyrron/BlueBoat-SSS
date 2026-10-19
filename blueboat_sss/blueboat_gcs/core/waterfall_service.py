@@ -75,6 +75,7 @@ from ..mapping.renderer import DisplaySettings, MosaicRenderer
 from ..models.sonar import SonarPing, build_slant_row, native_bins
 from .along_track import AlongTrackEstimator
 from .display_model import DisplayModel, DisplayModelSnapshot
+from .svlog import TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M
 
 #: Rows per tile. 512 × ~1200 float32 ≈ 2.5 MB data + 20 KB meta; small
 #: enough that re-colormapping the dirty tail tile at 4 Hz is trivial.
@@ -197,10 +198,7 @@ class WaterfallService(QObject):
         # Along-track metres per row (true-scale view): the one estimator
         # the seabed imager shares (ground speed × ping period from the
         # ping poses, core/along_track.py).
-        at = getattr(config, "along_track", None)
-        self._along = AlongTrackEstimator(
-            window_s=float(getattr(at, "window_s", 5.0)),
-            pair_s=float(getattr(at, "pair_s", 1.0)))
+        self._along = AlongTrackEstimator.from_config(config)
 
         self._timer = QTimer(self)
         self._timer.setInterval(int(1000.0 / config.mosaic.render_hz))
@@ -437,6 +435,17 @@ class WaterfallService(QObject):
             return None
         return tuple(float(v) for v in m[:5])
 
+    def row_georef(self, row: int) -> Optional[Tuple[float, float, float, float]]:
+        """(robot_x, robot_y, yaw, bottom) of an absolute row for the
+        georef convention 2 pixel->world (the seabed pictures' convention:
+        ``bottom`` = the row's tracked bottom ``h``, used with the
+        transducer lever arm), or None where :meth:`row_meta` is None."""
+        if self.row_meta(row) is None:
+            return None
+        idx = row - self._row0
+        m = self._metas[idx // _TILE_ROWS][idx % _TILE_ROWS]
+        return float(m[1]), float(m[2]), float(m[3]), float(m[5])
+
     # ---- display -----------------------------------------------------------------
     def set_enabled(self, enabled: bool) -> None:
         """Called when the view mode switches; renders eagerly on entry."""
@@ -511,10 +520,13 @@ class WaterfallService(QObject):
         """Map world detections to ABSOLUTE (row, col) buffer coordinates.
 
         Row: the ping whose time matches the detection's row time.
-        Column: invert the slant layout — ``y_local`` from the row pose,
-        ``s = hypot(y_local, depth)``, ``k = s / pitch``. Detections
-        outside the buffered time span or the row's swath are skipped
-        (they were evicted or lie off-swath at that instant).
+        Column: invert the slant layout under georef convention 2 (the
+        seabed pictures' and the clicks') — ``y_local`` from the row
+        pose, ``ground = |y_local| − lever_side`` (clamped at 0),
+        ``s = hypot(ground, h)`` with ``h`` the row's tracked bottom,
+        ``k = s / pitch``. Detections outside the buffered time span or
+        the row's swath are skipped (they were evicted or lie off-swath
+        at that instant).
         """
         out = []
         if self._total == self._row0 or not self._detections or self._half == 0:
@@ -529,12 +541,14 @@ class WaterfallService(QObject):
                 continue                    # evicted by the memory cap
             i = row - self._row0
             tile, off = divmod(i, _TILE_ROWS)
-            _t, rx, ry, yaw, depth = self._metas[tile][off, :5]
-            if not np.isfinite(depth):
+            _t, rx, ry, yaw, depth, h = self._metas[tile][off, :6]
+            if not (np.isfinite(depth) and np.isfinite(h)):
                 continue
             y_local = ((det["y"] - ry) * np.cos(yaw)
                        - (det["x"] - rx) * np.sin(yaw))
-            s = math.hypot(y_local, depth)
+            lever = (TRANSDUCER_Y_OFFSET_PORT_M if y_local >= 0
+                     else TRANSDUCER_Y_OFFSET_STBD_M)
+            s = math.hypot(max(abs(y_local) - lever, 0.0), max(h, 0.0))
             k = int(s / self._pitch)
             if k >= self._half:
                 continue

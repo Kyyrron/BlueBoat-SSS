@@ -29,7 +29,8 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import numpy as np
 
 from ..models.sonar import native_from_profile, side_bins_from_ground
-from .svlog import TRANSDUCER_SUBMERSION_M, scale_to_db
+from .svlog import (TRANSDUCER_SUBMERSION_M, TRANSDUCER_Y_OFFSET_PORT_M,
+                    TRANSDUCER_Y_OFFSET_STBD_M, scale_to_db)
 
 #: A key this far behind the newest one seen is a device counter restart
 #: (same rule as the processor's COUNTER_RESTART_PINGS).
@@ -171,15 +172,26 @@ def attach_native(f: ProcessedFields, cache: ProfileCache,
     and brighter than any seabed return in the file, went into the live
     mosaic at ground range ~0 and painted a saturated stripe down the track.
     0 keeps the old behaviour.
+
+    **Bug fix 2026-10-16 (the profile-miss fallback).** Since ``994a74b``
+    (2026-10-13) the processor projects ``|y| = 0.285 + sqrt(s² − h²)``
+    with ``h`` = its altitude = ``water_depth − submersion``; the fallback
+    still inverted with ``h = water_depth`` and no lever arm, so a row
+    whose profile was missed was re-projected onto the wrong bins (on a
+    20 m / 1200-bin ping at 1.2 m altitude: starting at bin 83 instead of
+    72, 0.18 m too far out, the far end at 20.16 m instead of 20.0 m;
+    ``tests/test_fallback_lever_arm.py``). It now inverts the processor's
+    own geometry, recovering the device bins exactly.
     """
     depth = max(float(f.water_depth), 0.0)
+    altitude = max(depth - TRANSDUCER_SUBMERSION_M, 0.0)
     out: Dict[str, Any] = {"bin_size_m": 0.0, "port_bin0": 0, "port_db": None,
                            "stbd_bin0": 0, "stbd_db": None,
                            "stbd_bin_size_m": 0.0, "gain_index": -1,
                            "port_analog_gain": 0.0, "stbd_analog_gain": 0.0,
                            # Exact parity with replay's ``fbr.bottom``:
                            # water_depth = altitude + submersion.
-                           "bottom_slant_m": max(depth - TRANSDUCER_SUBMERSION_M, 0.0)}
+                           "bottom_slant_m": altitude}
     hits = [False, False]
     sizes = [0.0, 0.0]
     for side, pn, y, db in ((0, f.port_pn, f.port_y, f.port_db),
@@ -197,7 +209,10 @@ def attach_native(f: ProcessedFields, cache: ProfileCache,
             out["port_analog_gain" if side == 0 else "stbd_analog_gain"] = \
                 float(prof.analog_gain)
         else:
-            bin0, vals, size = side_bins_from_ground(np.abs(y), db, depth)
+            # The processor's geometry inverted (see the docstring).
+            lever = (TRANSDUCER_Y_OFFSET_PORT_M if side == 0
+                     else TRANSDUCER_Y_OFFSET_STBD_M)
+            bin0, vals, size = side_bins_from_ground(np.abs(y), db, altitude, lever)
             if size <= 0.0:
                 continue
         if nadir_blank_m > 0.0 and size > 0.0:

@@ -17,7 +17,7 @@ import math
 import numpy as np
 import pytest
 
-from blueboat_gcs.core.seabed_imager import waterfall_pixel_to_world
+from blueboat_gcs.core.seabed_imager import LEVER_ARM_M, waterfall_pixel_to_world
 from blueboat_gcs.core.waterfall_service import WaterfallService
 from blueboat_gcs.models.sonar import SonarPing
 
@@ -120,18 +120,20 @@ def test_rows_have_no_holes_outside_the_water_column(qapp, tmp_config):
         assert np.isfinite(side[wc_bins:]).all(), "no holes past the FBR"
 
 
-def test_overlay_is_the_exact_inverse(qapp, tmp_config):
+@pytest.mark.parametrize("col", [211, 600])           # port, starboard
+def test_overlay_is_the_exact_inverse(qapp, tmp_config, col):
     """A world point built by the forward formula lands back on its own
-    (row, col) through the service's detection overlay."""
+    (row, col) through the service's detection overlay. Georef convention
+    2 since 2026-10-16 (Q6): the row's tracked bottom + the transducer
+    lever arm, on both sides (this test used convention 1 before)."""
     svc = WaterfallService(tmp_config)
     for i in range(30):
         svc.on_sonar_ping(make_ping(i, yaw=0.3))
-    row, col = 17, 211
-    meta = svc.row_meta(row)
-    assert meta is not None
-    _t, rx, ry, yaw, depth = meta
-    wx, wy = waterfall_pixel_to_world(rx, ry, yaw, depth, svc.pitch_m,
-                                      float(col), svc.columns)
+    row = 17
+    assert svc.row_meta(row) is not None
+    rx, ry, yaw, bottom = svc.row_georef(row)
+    wx, wy = waterfall_pixel_to_world(rx, ry, yaw, bottom, svc.pitch_m,
+                                      float(col), svc.columns, *LEVER_ARM_M)
     received = []
     svc.detections_updated.connect(received.extend)
     svc.add_detection(float(row), float(wx), float(wy), "target")
@@ -173,11 +175,12 @@ def test_click_marks_the_map_and_the_card(qapp, tmp_config, no_modal_dialogs):
         row, col = 6, 100
         window._on_waterfall_point(row, col)
 
-        meta = window.waterfall_service.row_meta(row)
+        # Georef convention 2 (Q6, 2026-10-16), as the seabed pictures.
+        rx, ry, yaw, bottom = window.waterfall_service.row_georef(row)
         wx, wy = waterfall_pixel_to_world(
-            meta[1], meta[2], meta[3], meta[4],
+            rx, ry, yaw, bottom,
             window.waterfall_service.pitch_m, float(col),
-            window.waterfall_service.columns)
+            window.waterfall_service.columns, *LEVER_ARM_M)
         group = window.selection_layer._group
         assert group.isVisible(), "the map marker did not appear"
         assert group.pos().x() == pytest.approx(float(wx))

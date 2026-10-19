@@ -112,6 +112,23 @@ class SonarPing:
     #: / synthetic pings): the GUI compares it with the listener's newest
     #: to measure how far behind the queue is and throttle rendering.
     seq: int = 0
+    #: Attitude at the ping (2026-10-16, for the seabed-image metadata;
+    #: never used for geometry). Live: the latest ``/mavros/imu/data``
+    #: sample when the ping reached the GUI (mavros on the boat, the
+    #: simulator's mavros shim in Gazebo -- the ping quaternion is not used:
+    #: it is yaw-only on the real boat). Replay: the latest ``.svlog``
+    #: ATTITUDE before the ping. ENU/FLU radians; NaN = unknown.
+    roll: float = float("nan")
+    pitch: float = float("nan")
+    #: Body z angular rate [rad/s] (ENU, CCW positive); NaN = unknown.
+    yaw_rate: float = float("nan")
+    #: Age of that attitude sample at the ping [s] (live: wall clock at
+    #: the GUI's reception; replay: the log's clock); NaN = unknown.
+    attitude_age_s: float = float("nan")
+    #: The device ping numbers of the row's two halves (0 = side absent /
+    #: unknown); they differ by the boat's constant device offset.
+    port_ping_number: int = 0
+    stbd_ping_number: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,20 +189,28 @@ def native_from_profile(start_mm: float, length_mm: float,
     return int(round(start_mm / 1000.0 / pitch)), float(pitch)
 
 
-def side_bins_from_ground(y: np.ndarray, v: np.ndarray, depth: float
-                          ) -> Tuple[int, np.ndarray, float]:
+def side_bins_from_ground(y: np.ndarray, v: np.ndarray, depth: float,
+                          lever: float = 0.0) -> Tuple[int, np.ndarray, float]:
     """Reconstruct (bin0, values, bin_size) for one side.
 
     The processor's ``project_side`` maps device bin ``i`` (slant
-    ``i*Δ``) to ``ground = sqrt(slant² − h²)`` and drops bins below the
-    cut, keeping the tail contiguous. ``s = sqrt(ground² + h²)`` is its
-    exact inverse, so the recovered slant values fall back onto the
-    uniform device grid and ``Δ`` is simply their median spacing.
+    ``i*Δ``) to ``|y| = lever + sqrt(slant² − h²)`` -- ``h`` its tracked
+    altitude, ``lever`` the transducer's lateral offset -- and drops bins
+    below the cut, keeping the tail contiguous.
+    ``s = sqrt((|y| − lever)² + h²)`` is its exact inverse, so the
+    recovered slant values fall back onto the uniform device grid and
+    ``Δ`` is simply their median spacing.
+
+    ``depth`` must therefore be the processor's **altitude** and ``lever``
+    its offset for that side (``live_native.attach_native``: bug fix
+    2026-10-16). The defaults (lever 0) are the pre-``994a74b`` inverse,
+    bit for bit -- still exact for a producer that projects with no lever
+    arm (``native_bins``' reconstruction from ``y_local``).
     """
     if y.size < 2:
         return 0, np.asarray([], dtype=np.float32), 0.0
     order = np.argsort(np.abs(y))
-    s = np.hypot(np.abs(y[order]), depth)
+    s = np.hypot(np.maximum(np.abs(y[order]) - lever, 0.0), depth)
     d = np.diff(s)
     d = d[d > 0]
     if d.size == 0:
@@ -281,14 +306,20 @@ def build_slant_row(nb: NativeBins, pitch_m: float, half_cols: int
     return row
 
 
-def slant_col_to_y_local(col, width: int, pitch_m: float, depth):
+def slant_col_to_y_local(col, width: int, pitch_m: float, depth,
+                         lever_port: float = 0.0, lever_stbd: float = 0.0):
     """Waterfall column -> lateral offset in base_link [m] (+ = port).
 
     Inverse of the :func:`build_slant_row` layout: the column's slant
     range is ``(k + 0.5) * pitch`` and the ground range follows from the
     row's altitude, ``ground = sqrt(max(s² − depth², 0))`` — a column
-    inside the water column maps to the nadir point. Accepts scalars or
-    broadcasting arrays (per-pixel world grids of a seabed image).
+    inside the water column maps to the transducer's own point. The
+    transducer sits ``lever_port`` / ``lever_stbd`` [m] off the centre
+    line, so ``y = +(lever_port + ground)`` port and
+    ``−(lever_stbd + ground)`` starboard (the processor's ``project_side``
+    geometry). The defaults (0, 0) are the original formula **bit for
+    bit**. Accepts scalars or broadcasting arrays (per-pixel world grids
+    of a seabed image).
     """
     col = np.asarray(col, dtype=np.float64)
     half = width / 2.0
@@ -296,4 +327,4 @@ def slant_col_to_y_local(col, width: int, pitch_m: float, depth):
     k = np.where(port, half - 1.0 - col, col - half)
     s = (k + 0.5) * pitch_m
     ground = np.sqrt(np.maximum(s * s - np.square(depth), 0.0))
-    return np.where(port, ground, -ground)
+    return np.where(port, lever_port + ground, -(lever_stbd + ground))

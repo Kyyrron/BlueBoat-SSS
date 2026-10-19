@@ -12,11 +12,16 @@ topics:
   svlog_enable: /sss_processor/log/enable
   port_profile: /side_scan_sonar/port/profile        # raw OmniscanProfile, native bins
   starboard_profile: /side_scan_sonar/starboard/profile
-  # ---- placeholders: set these once the other repositories are connected ----
-  detections: /sss_ai/detections
+  # ---- other repositories ----
+  detections: /sss_ai/detections     # vision_msgs/Detection2DArray from BlueBoat-Perception (the one detection source)
   pinger: /blueboat/pinger_coordinates  # Float32MultiArray: [x,y,z] body frame, or [x,y] world (fixed_pinger)
   planned_path: /set_path            # nav_msgs/Path from path_publisher.py
-  seabed_analysis: /sss_ai/seabed_analysis  # std_msgs/String JSON
+  seabed_analysis: /sss_ai/seabed_analysis  # std_msgs/String JSON (detections: [] -- Perception detects)
+  imu: /mavros/imu/data              # sensor_msgs/Imu: roll/pitch/yaw rate for the image metadata
+  # Every seabed image for BlueBoat-Perception (RELIABLE, KEEP_LAST 32):
+  seabed_image: /sss_ai/seabed_image               # sensor_msgs/Image 32FC1, raw float dB
+  seabed_image_png: /sss_ai/seabed_image/png       # sensor_msgs/Image mono8, the PNG
+  seabed_image_meta: /sss_ai/seabed_image/metadata # std_msgs/String JSON envelope
 
 pipeline:
   launch_command: ["ros2", "launch", "blueboat_sss", "SSS_processing_launch.py"]
@@ -98,7 +103,7 @@ display:                   # the ONE dB->pixel model (core/display_model.py)
   gain_reference_analog: 74.55   # analog_gain at gain index 4 (calibration anchor)
 
 along_track:               # metres per ping for true scale + square pictures
-  window_s: 5.0            # median window for ground speed and ping period
+  window_s: 2.0            # median window for ground speed and ping period (5.0 until 2026-10-16)
   pair_s: 1.0              # span of each chord-speed measurement
 
 depth:                     # slant-range correction source

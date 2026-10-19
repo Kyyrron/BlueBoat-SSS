@@ -11,7 +11,8 @@ import pytest
 from blueboat_gcs.core.live_native import (CachedProfile, PendingRows,
                                            ProcessedFields, ProfileCache,
                                            attach_native, profile_from_msg)
-from blueboat_gcs.core.svlog import scale_to_db
+from blueboat_gcs.core.svlog import (TRANSDUCER_SUBMERSION_M,
+                                     TRANSDUCER_Y_OFFSET_PORT_M, scale_to_db)
 from blueboat_gcs.models.sonar import (build_slant_row, native_bins,
                                        native_from_profile,
                                        side_bins_from_ground)
@@ -38,11 +39,16 @@ def fake_profile(channel: int, pn: int, *, start_mm: int = 0,
 
 def ground_from(prof: CachedProfile, depth: float):
     """What the processor publishes for one side: slant-corrected ground
-    samples with the water column deleted (project_side)."""
+    samples with the water column deleted (project_side), from the
+    transducer's lever arm and with the altitude = water_depth − submersion
+    (994a74b; this helper used lever 0 and altitude = water_depth before
+    the 2026-10-16 fallback fix, test_fallback_lever_arm.py). |y| only:
+    callers apply the side's sign."""
     pitch = prof.length_mm / 1000.0 / (prof.num_results - 1)
     slant = prof.start_mm / 1000.0 + np.arange(prof.num_results) * pitch
-    keep = slant > depth
-    return (np.sqrt(slant[keep] ** 2 - depth ** 2),
+    alt = max(depth - TRANSDUCER_SUBMERSION_M, 0.0)
+    keep = slant > alt
+    return (TRANSDUCER_Y_OFFSET_PORT_M + np.sqrt(slant[keep] ** 2 - alt ** 2),
             prof.db[keep].astype(np.float32))
 
 
@@ -100,7 +106,9 @@ def test_attach_hit_is_the_verbatim_profile_bins():
     assert out["stbd_bin_size_m"] == 0.0                # same pitch both sides
     np.testing.assert_array_equal(out["port_db"], port.prof.db)
     np.testing.assert_array_equal(out["stbd_db"], stbd.prof.db)
-    assert out["bottom_slant_m"] == pytest.approx(DEPTH)
+    # water_depth = altitude + submersion (994a74b); baseline repair
+    # 2026-10-16 -- this expected the submersion to be 0.
+    assert out["bottom_slant_m"] == pytest.approx(DEPTH - TRANSDUCER_SUBMERSION_M)
     assert out["gain_index"] == 4
     assert len(c) == 0                                  # consumed
 
@@ -122,9 +130,15 @@ def test_attach_miss_falls_back_to_the_reprojection():
     f = fields(port, stbd)
     out, hits = attach_native(f, c)
     assert hits == (False, True)
-    p0, pv, pd = side_bins_from_ground(np.abs(f.port_y), f.port_db, DEPTH)
+    # The fallback inverts the processor's geometry (lever arm, altitude =
+    # water_depth - submersion; fix of 2026-10-16), so the re-projected
+    # side lands on the device's own bins: the profile's tail, verbatim.
+    p0, pv, pd = side_bins_from_ground(np.abs(f.port_y), f.port_db,
+                                       DEPTH - TRANSDUCER_SUBMERSION_M,
+                                       TRANSDUCER_Y_OFFSET_PORT_M)
     assert out["port_bin0"] == p0 and out["port_bin0"] > 0
     np.testing.assert_array_equal(out["port_db"], pv)
+    np.testing.assert_array_equal(out["port_db"], port.prof.db[p0:])
     np.testing.assert_array_equal(out["stbd_db"], stbd.prof.db)
     assert out["bin_size_m"] == pytest.approx(pd, rel=1e-6)
 

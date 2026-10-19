@@ -44,7 +44,9 @@ from conftest import PKG_PARENT
 
 from blueboat_gcs.config.settings import AppConfig
 from blueboat_gcs.core.seabed_imager import SeabedImager, feed_pings
-from blueboat_gcs.core.svlog import (FBRTracker, clamp_nadir_mask, load_svlog,
+from blueboat_gcs.core.svlog import (TRANSDUCER_Y_OFFSET_PORT_M,
+                                     TRANSDUCER_Y_OFFSET_STBD_M, FBRTracker,
+                                     clamp_nadir_mask, load_svlog,
                                      project_side, resolve_altitude)
 from blueboat_gcs.core.waterfall_service import WaterfallService
 from blueboat_gcs.models.sonar import SonarPing
@@ -237,8 +239,13 @@ def test_off_mode_blanks_the_ringing_and_keeps_the_water_column(log):
     blank = _pings(load_svlog(log, depth_mode="off"))
     assert len(plain) == len(blank) > 0            # NC #2: no ping is dropped
 
-    inner_plain = min(float(np.abs(p.y_local).min()) for p in plain)
-    inner_blank = min(float(np.abs(p.y_local).min()) for p in blank)
+    # Ground ranges are measured from the transducer, which sits the
+    # lever arm off the centre line since 994a74b (2026-10-13): y_local =
+    # ±(lever + ground). Baseline repair 2026-10-16: the expectations below
+    # used to compare |y_local| itself, i.e. assumed lever = 0.
+    lever = min(TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M)
+    inner_plain = min(float(np.abs(p.y_local).min()) for p in plain) - lever
+    inner_blank = min(float(np.abs(p.y_local).min()) for p in blank) - lever
     assert inner_plain < 0.1                       # ringing, right under the boat
     assert inner_blank >= BLANK_M                  # ...removed
 
@@ -250,7 +257,7 @@ def test_off_mode_blanks_the_ringing_and_keeps_the_water_column(log):
     assert kept > 0.9, f"blank swallowed {100 * (1 - kept):.0f} % of the swath"
 
     # Correction is still off: the outer swath is untouched slant range.
-    assert (max(float(np.abs(p.y_local).max()) for p in blank)
+    assert (max(float(np.abs(p.y_local).max()) for p in blank) - lever
             == pytest.approx(RANGE_M))
 
 

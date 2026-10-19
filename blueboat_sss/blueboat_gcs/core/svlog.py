@@ -756,6 +756,10 @@ def load_svlog(path: Path,
 
     # Pose synthesis state (ATTITUDE + LOCAL_POSITION_NED -> odom).
     latest_yaw: Optional[float] = None
+    #: Latest ATTITUDE as ENU/FLU (roll, pitch, yaw rate, t_ns), for the
+    #: seabed-image metadata only: the processor wrote it from
+    #: /mavros/imu/data as NED/FRD (roll, -pitch, -yaw rate), inverted here.
+    latest_att: Optional[Tuple[float, float, float, int]] = None
     latest_lpn: Optional[dict] = None
     last_state_emit_ns = -10**18
     state_period_ns = int(1e9 / 5.0)                # 5 Hz, like live GUI
@@ -925,7 +929,8 @@ def load_svlog(path: Path,
                    else d["ping_number"] + offset)
             g = groups.get(key)
             if g is None:
-                g = groups[key] = {"t_ns": t_ns, "pose": cur_pose, "seg": seg}
+                g = groups[key] = {"t_ns": t_ns, "pose": cur_pose, "seg": seg,
+                                   "att": latest_att}
                 order.append(key)
             g[ch] = d
         elif pid == MAVLINK_WRAPPER_ID:
@@ -937,6 +942,9 @@ def load_svlog(path: Path,
             mtype = m.get("type")
             if mtype == "ATTITUDE":
                 latest_yaw = yaw_ned_to_enu(float(m.get("yaw", 0.0)))
+                latest_att = (float(m.get("roll", math.nan)),
+                              -float(m.get("pitch", math.nan)),
+                              -float(m.get("yawspeed", math.nan)), t_ns)
             elif mtype == "LOCAL_POSITION_NED":
                 latest_lpn = m
             elif mtype == "GLOBAL_POSITION_INT" and mission.origin is None:
@@ -1042,6 +1050,12 @@ def load_svlog(path: Path,
             continue
         ref = p if p is not None else s
         x, y0, yaw = pose
+        att = g.get("att")
+        if att is not None:
+            roll, pitch, yaw_rate = att[0], att[1], att[2]
+            att_age = (g["t_ns"] - att[3]) / 1e9
+        else:
+            roll = pitch = yaw_rate = att_age = math.nan
         mission.events.append(("ping", g["t_ns"] / 1e9, SonarPing(
             t=g["t_ns"] / 1e9, robot_x=x, robot_y=y0, yaw=yaw,
             water_depth=altitude + TRANSDUCER_SUBMERSION_M,
@@ -1055,6 +1069,9 @@ def load_svlog(path: Path,
             gain_index=int(ref.get("gain_index", -1)),
             port_analog_gain=float(p.get("analog_gain", 0.0)) if p is not None else 0.0,
             stbd_analog_gain=float(s.get("analog_gain", 0.0)) if s is not None else 0.0,
+            roll=roll, pitch=pitch, yaw_rate=yaw_rate, attitude_age_s=att_age,
+            port_ping_number=int(p["ping_number"]) if p is not None else 0,
+            stbd_ping_number=int(s["ping_number"]) if s is not None else 0,
             **nat)))
         mission.ping_count += 1
         if p is not None and s is not None:

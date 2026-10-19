@@ -43,6 +43,8 @@ class RosManager:
         self._ping_pub = None
         self._svlog_pub = None
         self._analysis_pub = None
+        self._image_pubs = None             # (32FC1, mono8, metadata) for Perception
+        self._image_cls = None
         # Set by main.py once the listeners exist; used by
         # reset_stream_health() at every acquisition START and by
         # reset_planned_path() when the operator clears the overlay.
@@ -75,6 +77,7 @@ class RosManager:
         # AI seabed analysis output (JSON payload; schema in HANDOVER).
         self._analysis_pub = self._node.create_publisher(
             String, self._config.topics.seabed_analysis, 10)
+        self._create_image_publishers()
         self._subscribe_rosout()
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
@@ -83,6 +86,33 @@ class RosManager:
         self._thread.start()
         self._signals.ros_connected.emit(True)
         return True
+
+    def _create_image_publishers(self) -> None:
+        """Every seabed image for BlueBoat-Perception (core/perception_bridge).
+
+        RELIABLE / KEEP_LAST 32 / VOLATILE -- the profile Perception
+        subscribes with (CM-4: changed at both ends or not at all): a large
+        sample is fragmented, and BEST_EFFORT would lose a whole image to
+        one lost fragment. sensor_msgs is imported here, inside ros/ only
+        (NC #10)."""
+        try:
+            from rclpy.qos import (DurabilityPolicy, HistoryPolicy,
+                                   QoSProfile, ReliabilityPolicy)
+            from sensor_msgs.msg import Image
+        except ImportError:                # pragma: no cover - environment
+            self._signals.status_message.emit(
+                "sensor_msgs not found — seabed images are not published "
+                "for BlueBoat-Perception (no detections).")
+            return
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         history=HistoryPolicy.KEEP_LAST, depth=32,
+                         durability=DurabilityPolicy.VOLATILE)
+        t = self._config.topics
+        self._image_cls = Image
+        self._image_pubs = (
+            self._node.create_publisher(Image, t.seabed_image, qos),
+            self._node.create_publisher(Image, t.seabed_image_png, qos),
+            self._node.create_publisher(String, t.seabed_image_meta, qos))
 
     def _subscribe_rosout(self) -> None:
         """ROS 2 log messages from ALL nodes -> embedded console.
@@ -149,6 +179,26 @@ class RosManager:
         never the pixels) on topics.seabed_analysis."""
         if self._analysis_pub is not None:
             self._analysis_pub.publish(String(data=payload_json))
+
+    def publish_seabed_image(self, key: str, stamp, db, png8, meta_json: str) -> bool:
+        """Publish one seabed image's three parts (any thread: rclpy
+        publishers are thread-safe). ``stamp`` = (sec, nanosec)."""
+        if self._image_pubs is None:
+            return False
+        Image = self._image_cls
+        for arr, enc, size, pub in ((db, "32FC1", 4, self._image_pubs[0]),
+                                    (png8, "mono8", 1, self._image_pubs[1])):
+            m = Image()
+            m.header.stamp.sec, m.header.stamp.nanosec = int(stamp[0]), int(stamp[1])
+            m.header.frame_id = key
+            m.height, m.width = int(arr.shape[0]), int(arr.shape[1])
+            m.encoding = enc
+            m.is_bigendian = 0
+            m.step = int(arr.shape[1]) * size
+            m.data = arr.astype("<f4" if size == 4 else "u1", copy=False).tobytes()
+            pub.publish(m)
+        self._image_pubs[2].publish(String(data=meta_json))
+        return True
 
     def reset_stream_health(self) -> None:
         """New acquisition START: re-establish the per-power-up stream

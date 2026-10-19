@@ -6,8 +6,10 @@ One implementation serves both consumers:
   every ``stride`` pings it emits a ``SeabedImage`` covering the last
   ``rows`` pings and (while a recording session is active) saves it under
   ``<session>/seabed_images/`` with metadata in an inner ``metadata/``
-  folder; each image is passed to the analyzer (dummy for now) and the
-  result is published (see main_window / ros_manager);
+  folder; every image is published for BlueBoat-Perception (pixels +
+  metadata, ``core/perception_bridge.py``), which is the station's **one
+  detection source** since 2026-10-16 -- the imager itself detects nothing
+  (``detections`` is always ``[]``; see main_window / ros_manager);
 * **from a log** — ``generate_from_pings`` runs the identical code over a
   decoded mission (replay window's "Save pictures from the log").
 
@@ -75,19 +77,29 @@ Row geometry (``seabed.row_geometry``, decision 2026-09-05, PROVISIONAL):
 Pixel convention (identical to the live waterfall view): row 0 = newest,
 last row = oldest; column 0 = far range **port**, last column = far
 range starboard, transducer at the centre seam; every column is one
-slant bin of ``bin_pitch_m`` metres. Pixel→world:
+slant bin of ``bin_pitch_m`` metres. Pixel→world, **georef convention 2**
+(schema 5, 2026-10-16; the processor's ``project_side`` geometry):
 
     k(j)         = (W/2 - 1 - j) if j < W/2 else (j - W/2)
     s(j)         = (k + 0.5) * bin_pitch_m
-    y_local(i,j) = ±sqrt(max(s² - depth_i², 0))   (+ port, − starboard)
+    y_local(i,j) = ±(lever_side + sqrt(max(s² - bottom_i², 0)))   (+ port, − starboard)
     world_x(i,j) = x_i - sin(yaw_i) * y_local
     world_y(i,j) = y_i + cos(yaw_i) * y_local
+
+with ``bottom_i`` the row's tracked transducer altitude (``bottom_m``) and
+``lever_side`` the transducer's lateral offset (``core/svlog.py``
+``TRANSDUCER_Y_OFFSET_*``, 0.285 m). Schema <= 4 pictures (no ``georef``
+key) used **convention 1**: lever 0 and ``altitude_m`` (the correction
+altitude + submersion) in place of ``bottom_m`` -- their stored world
+grids stay valid as written.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import secrets
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (Callable, Iterable, List, Optional, Sequence, Tuple)
@@ -101,26 +113,58 @@ from ..models.sonar import (SonarPing, build_slant_row, native_bins,
                             slant_col_to_y_local)
 from .along_track import AlongTrackEstimator
 from .display_model import DisplayModel, DisplayModelSnapshot
+from .svlog import TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M
 
-SCHEMA_VERSION = 4
+#: 5 since 2026-10-16: georef convention 2 (world grids), ``stream_id``,
+#: per-row attitude and device ping numbers (all additive keys).
+SCHEMA_VERSION = 5
+#: The transducer lateral offsets [m] (port, starboard) the world grids,
+#: the waterfall clicks and the detection overlay apply.
+LEVER_ARM_M = (TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M)
+#: ``metadata()["georef"]``: how the world grids were computed. Absent on
+#: schema <= 4 pictures, which used convention 1 (no lever, altitude_m).
+GEOREF = {"convention": 2, "altitude": "bottom_m",
+          "lever_arm_m": {"x": 0.0, "y_port": float(LEVER_ARM_M[0]),
+                          "y_stbd": float(LEVER_ARM_M[1])}}
 
 
-def waterfall_pixel_to_world(x, y, yaw, depth, pitch_m, col, width: int):
+def new_stream_id() -> str:
+    """``gcs-<UTC YYYYmmddTHHMMSSZ>-<4 hex>``: names one imaging stream
+    (generated at every :meth:`SeabedImager.reset`, i.e. every START);
+    ``image_id`` restarts at 0 in each, so ``<stream_id>/<image_id>`` is
+    the image's key for BlueBoat-Perception."""
+    return "gcs-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + \
+        "-" + secrets.token_hex(2)
+
+
+def waterfall_pixel_to_world(x, y, yaw, depth, pitch_m, col, width: int,
+                             lever_port: float = 0.0, lever_stbd: float = 0.0):
     """Waterfall pixel -> world position (the documented formula).
 
     Native slant-bin layout: the column's slant range is
     ``(k + 0.5) · pitch`` about the centre seam, the row's altitude
-    turns it into ``y_local = ±sqrt(max(s² − depth², 0))`` (+ port,
-    − starboard), then rotate/translate by the row pose:
+    turns it into ``y_local = ±(lever + sqrt(max(s² − depth², 0)))``
+    (+ port, − starboard), then rotate/translate by the row pose:
     ``wx = x − sin(yaw)·y_local``, ``wy = y + cos(yaw)·y_local``.
+
+    Georef convention 2 (the pictures, clicks and overlay since
+    2026-10-16) passes ``depth`` = the row's tracked bottom and
+    ``*LEVER_ARM_M``; the defaults (lever 0) are convention 1 bit for bit.
 
     Accepts scalars (a waterfall click) or broadcasting numpy arrays
     (the per-pixel world grids of a whole seabed image). This is the
     single definition; the waterfall service's detection overlay applies
     its exact inverse.
     """
-    y_local = slant_col_to_y_local(col, width, pitch_m, depth)
+    y_local = slant_col_to_y_local(col, width, pitch_m, depth,
+                                   lever_port, lever_stbd)
     return x - np.sin(yaw) * y_local, y + np.cos(yaw) * y_local
+
+
+def _opt(v) -> Optional[float]:
+    """JSON value of an optional float: None for NaN / unknown."""
+    v = float(v)
+    return v if math.isfinite(v) else None
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +201,17 @@ class SeabedImage:
     #: snapshot: safe on the save thread). None -> legacy per-image
     #: 2-98 % stretch of the raw dB (nadir_contrast off).
     display: Optional[DisplayModelSnapshot] = None
+    #: The imaging stream this picture belongs to (``new_stream_id``).
+    stream_id: str = ""
+    #: How ``world_x``/``world_y`` were computed (``GEOREF``); None =
+    #: convention 1 (a picture assembled by older code).
+    georef: Optional[dict] = None
+    #: Per row (H, 4): roll, pitch, yaw rate, attitude age of the row's
+    #: source ping (NaN = unknown); None = not recorded.
+    row_attitude: Optional[np.ndarray] = None
+    #: Per row (H, 2): the source ping's port / starboard device ping
+    #: numbers (0 = side absent); None = not recorded.
+    row_ping_numbers: Optional[np.ndarray] = None
 
     # ---- derived -------------------------------------------------------------
     def pixel_to_world(self, row: int, col: int) -> Tuple[float, float]:
@@ -203,7 +258,11 @@ class SeabedImage:
                  else np.zeros(n))
         bottoms = self._bottoms()
         gains = self._gains()
-        return {
+        att = (self.row_attitude if self.row_attitude is not None
+               else np.full((n, 4), np.nan))
+        pns = (self.row_ping_numbers if self.row_ping_numbers is not None
+               else np.zeros((n, 2), np.int64))
+        meta = {
             "schema": SCHEMA_VERSION,
             "image_id": self.image_id,
             "rows": H, "cols": W,
@@ -233,14 +292,17 @@ class SeabedImage:
                           "dark centre band is the physical water column, "
                           "kept in the data and darkened by the display "
                           "model (not erased)",
-                "formula": ("k = (W/2-1-j) if j < W/2 else (j-W/2); "
+                "formula": ("georef convention 2: "
+                            "k = (W/2-1-j) if j < W/2 else (j-W/2); "
                             "s = (k+0.5)*bin_pitch_m; "
-                            "y_local(i,j) = sign * sqrt(max(s^2 - "
-                            "altitude_m[i]^2, 0)) (+ port, - starboard); "
+                            "y_local(i,j) = sign * (lever_side + sqrt(max(s^2 - "
+                            "bottom_m[i]^2, 0))) (+ port, - starboard; "
+                            "lever_side = georef.lever_arm_m.y_port / y_stbd); "
                             "world = (x_i - sin(yaw_i)*y_local, "
                             "y_i + cos(yaw_i)*y_local); or use the "
                             "precomputed world_x/world_y grids in the "
-                            "companion _world.npz"),
+                            "companion _world.npz. Schema <= 4 (no georef): "
+                            "convention 1, lever 0 and altitude_m[i]"),
             },
             "rows_data": [
                 {"t_s": float(self.row_t[i]),
@@ -254,12 +316,22 @@ class SeabedImage:
                  "ping_index": int(ping_index[i]),
                  "along_track_m": float(along[i]),
                  "gain_port_db": float(gains[i, 0]),
-                 "gain_stbd_db": float(gains[i, 1])}
+                 "gain_stbd_db": float(gains[i, 1]),
+                 "roll_rad": _opt(att[i, 0]),
+                 "pitch_rad": _opt(att[i, 1]),
+                 "yaw_rate_rad_s": _opt(att[i, 2]),
+                 "attitude_age_s": _opt(att[i, 3]),
+                 "port_ping_number": int(pns[i, 0]),
+                 "stbd_ping_number": int(pns[i, 1])}
                 for i in range(n)
             ],
             "boat": self.boat_summary(),
             "detections": self.detections,
         }
+        meta["stream_id"] = self.stream_id
+        if self.georef is not None:
+            meta["georef"] = self.georef
+        return meta
 
     def boat_summary(self) -> dict:
         return {
@@ -272,7 +344,9 @@ class SeabedImage:
     def analysis_json(self, png_path: Optional[str],
                       metadata_path: Optional[str]) -> str:
         """The /sss_ai/seabed_analysis payload: metadata + detections,
-        never the pixels (schema documented in HANDOVER)."""
+        never the pixels (schema documented in HANDOVER). ``detections``
+        is always ``[]`` since 2026-10-16: the station's detections come
+        from BlueBoat-Perception on ``/sss_ai/detections``."""
         return json.dumps({
             "schema": SCHEMA_VERSION,
             "image": {
@@ -332,35 +406,14 @@ class _SaveJob(QRunnable):
 
 
 # ---------------------------------------------------------------------------
-# Analyzer (dummy until the model exists)
-# ---------------------------------------------------------------------------
-def dummy_center_analyzer(image: SeabedImage) -> List[dict]:
-    """Placeholder AI: 'detects' the center pixel of every image.
-
-    Replace with the real model here — the contract is: take a
-    SeabedImage, return a list of detection dicts with at least
-    pixel [row, col], world [x, y], class_name, confidence. Everything
-    downstream (topic payload, map markers, dataset alignment) already
-    consumes this contract.
-    """
-    h, w = image.intensity_db.shape
-    row, col = h // 2, w // 2
-    wx, wy = image.pixel_to_world(row, col)
-    return [{"pixel": [row, col], "world": [wx, wy],
-             "class_name": "dummy_center", "confidence": 0.5}]
-
-
-# ---------------------------------------------------------------------------
 # Imager
 # ---------------------------------------------------------------------------
 class SeabedImager(QObject):
     """Sliding-window waterfall imager (live service + offline function)."""
 
-    image_ready = Signal(object)        # SeabedImage (after analysis/save)
+    image_ready = Signal(object)        # SeabedImage (after its save is queued)
 
     def __init__(self, config: AppConfig,
-                 analyzer: Callable[[SeabedImage], List[dict]]
-                 = dummy_center_analyzer,
                  model: Optional[DisplayModel] = None) -> None:
         super().__init__()
         self._rows = int(config.seabed.rows)
@@ -380,21 +433,19 @@ class SeabedImager(QObject):
         self._nadir_contrast = bool(config.mosaic.nadir_contrast)
         self._model = model if model is not None else DisplayModel(config)
         self._owns_model = model is None
-        self._analyzer = analyzer
         self._out_dir: Optional[Path] = None
+        self._stream_id = new_stream_id()
         self._next_id = 0
         self._since_last = 0                 # pings since the last emission
         self._buf_rows: List[np.ndarray] = []
         #: per buffered ping: (t, x, y, yaw, range, depth, speed, h, along_m,
-        #: gain_port_db, gain_stbd_db)
+        #: gain_port_db, gain_stbd_db, roll, pitch, yaw_rate, attitude_age_s,
+        #: port_ping_number, stbd_ping_number)
         self._buf_meta: List[tuple] = []
         # The one along-track estimator (core/along_track.py): the same
         # ground speed × ping period the waterfall draws at true scale,
         # integrated into the cumulative position the square rows sample.
-        at = getattr(config, "along_track", None)
-        self._track = AlongTrackEstimator(
-            window_s=float(getattr(at, "window_s", 5.0)),
-            pair_s=float(getattr(at, "pair_s", 1.0)))
+        self._track = AlongTrackEstimator.from_config(config)
         self._along = 0.0                    # cumulative along-track [m]
         self._s_emit: Optional[float] = None # along position of the last emission
         self._emitted_any = False
@@ -408,6 +459,11 @@ class SeabedImager(QObject):
         """Images are written to disk only while a directory is set
         (i.e. while a recording session is active)."""
         self._out_dir = Path(out_dir) if out_dir is not None else None
+
+    @property
+    def stream_id(self) -> str:
+        """The current imaging stream (new at every :meth:`reset`)."""
+        return self._stream_id
 
     @property
     def along_track(self) -> AlongTrackEstimator:
@@ -426,6 +482,7 @@ class SeabedImager(QObject):
         self._emitted_any = False
         self._pitch = 0.0
         self._half = 0
+        self._stream_id = new_stream_id()
         if self._owns_model:
             self._model.reset()
 
@@ -463,7 +520,13 @@ class SeabedImager(QObject):
         self._buf_rows.append(row)
         self._buf_meta.append((ping.t, ping.robot_x, ping.robot_y, ping.yaw,
                                self._half * self._pitch, ping.water_depth,
-                               speed, h, self._along, gains[0], gains[1]))
+                               speed, h, self._along, gains[0], gains[1],
+                               getattr(ping, "roll", math.nan),
+                               getattr(ping, "pitch", math.nan),
+                               getattr(ping, "yaw_rate", math.nan),
+                               getattr(ping, "attitude_age_s", math.nan),
+                               getattr(ping, "port_ping_number", 0),
+                               getattr(ping, "stbd_ping_number", 0)))
         self._since_last += 1
         if self._geometry == "ping":
             # Bound memory to one window.
@@ -557,8 +620,10 @@ class SeabedImager(QObject):
         along = np.array([m[8] for m in meta], np.float64)
         along = along - along.min()
         gains = np.array([[m[9], m[10]] for m in meta], np.float32)
+        att = np.array([m[11:15] for m in meta], np.float64).reshape(n, 4)
+        pns = np.array([m[15:17] for m in meta], np.int64).reshape(n, 2)
         self._finish(np.vstack(rows), t, pose, rng, depth, speed, bottoms,
-                     np.arange(n), along, gains)
+                     np.arange(n), along, gains, att, pns)
 
     def _emit_square(self, s_top: float, n_rows: int) -> None:
         """"square" geometry: picture row k (0 = newest) sits at along-track
@@ -574,7 +639,7 @@ class SeabedImager(QObject):
         nearest = np.where(np.abs(s[hi] - targets) < np.abs(targets - s[lo]),
                            hi, lo)
         arr = np.vstack([self._buf_rows[i] for i in nearest])
-        meta = np.array(self._buf_meta, np.float64)      # (n, 11)
+        meta = np.array(self._buf_meta, np.float64)      # (n, 17)
         span = np.maximum(s[hi] - s[lo], 1e-9)
         f = np.clip((targets - s[lo]) / span, 0.0, 1.0)
         f = np.where(s[hi] > s[lo], f, 0.0)
@@ -591,23 +656,19 @@ class SeabedImager(QObject):
         speed = meta[nearest, 6].astype(np.float32)
         bottoms = meta[nearest, 7]
         gains = meta[nearest, 9:11].astype(np.float32)
+        # Attitude and ping numbers of each row's source ping (the ping
+        # whose bins the row copies), never interpolated.
+        att = meta[nearest, 11:15]
+        pns = meta[nearest, 15:17].astype(np.int64)
         self._finish(arr, t, pose, rng, depth, speed, bottoms,
                      nearest - int(nearest.min()) if nearest.size else nearest,
-                     targets - s[0], gains)
+                     targets - s[0], gains, att, pns)
 
     def _finish(self, arr, t, pose, rng, depth, speed, bottoms, ping_index,
-                along, gains) -> None:
+                along, gains, att=None, pns=None) -> None:
         image = self._build(arr, t, pose, rng, depth, speed, bottoms,
-                            ping_index, along, gains, self._next_id)
+                            ping_index, along, gains, self._next_id, att, pns)
         self._next_id += 1
-        image.detections = self._analyzer(image)
-        for det in image.detections:
-            # Timestamp each detection with ITS pixel row's ping time —
-            # this is what lets the waterfall view place the marker on
-            # the exact ping line the object was seen on.
-            r = int(min(max(det["pixel"][0], 0),
-                        image.intensity_db.shape[0] - 1))
-            det["t_s"] = float(image.row_t[r])
         png_path = meta_path = None
         if self._out_dir is not None:
             # Paths are deterministic (image id), so publishers get them
@@ -623,16 +684,18 @@ class SeabedImager(QObject):
         self.image_ready.emit(image)
 
     def _build(self, arr, t, pose, rng, depth, speed, bottoms, ping_index,
-               along, gains, image_id: int) -> SeabedImage:
+               along, gains, image_id: int, att=None, pns=None) -> SeabedImage:
         """Assemble the picture (arrays already newest-first)."""
         W = arr.shape[1]
-        # Per-pixel world grids (vectorized over the whole window); each
-        # row's altitude turns its slant columns into ground offsets.
+        # Per-pixel world grids (vectorized over the whole window), georef
+        # convention 2: each row's tracked bottom turns its slant columns
+        # into ground ranges from the transducer, which sits the lever arm
+        # off the centre line -- the processor's project_side geometry.
         j = np.arange(W, dtype=np.float64)
         wx, wy = waterfall_pixel_to_world(
             pose[:, 0:1], pose[:, 1:2], pose[:, 2:3],
-            np.maximum(depth[:, None].astype(np.float64), 0.0),
-            self._pitch, j[None, :], W)
+            np.maximum(np.asarray(bottoms, np.float64)[:, None], 0.0),
+            self._pitch, j[None, :], W, *LEVER_ARM_M)
         # The model snapshot is immutable: safe on the save thread.
         snap = (self._model.snapshot()
                 if self._nadir_contrast and self._model.ready else None)
@@ -649,7 +712,13 @@ class SeabedImager(QObject):
             row_along_m=np.asarray(along, np.float64),
             row_geometry=self._geometry,
             row_gain_db=np.asarray(gains, np.float32).reshape(-1, 2),
-            display=snap)
+            display=snap,
+            stream_id=self._stream_id,
+            georef=dict(GEOREF, lever_arm_m=dict(GEOREF["lever_arm_m"])),
+            row_attitude=(None if att is None
+                          else np.asarray(att, np.float64).reshape(-1, 4)),
+            row_ping_numbers=(None if pns is None
+                              else np.asarray(pns, np.int64).reshape(-1, 2)))
 
 
 # ---------------------------------------------------------------------------
@@ -681,7 +750,6 @@ def feed_pings(imager: SeabedImager, pings: Sequence[SonarPing],
 def generate_from_pings(pings: Iterable[SonarPing], out_dir: Path,
                         config: AppConfig,
                         progress: Optional[Callable[[float], None]] = None,
-                        run_analyzer: bool = False,
                         breaks: Sequence[float] = (),
                         model: Optional[DisplayModel] = None) -> int:
     """Run the identical imaging code over a decoded log; returns the
@@ -695,8 +763,6 @@ def generate_from_pings(pings: Iterable[SonarPing], out_dir: Path,
         model = DisplayModel.fit(config, pings)
     imager = SeabedImager(config, model=model)
     imager.set_output_dir(out_dir)
-    if not run_analyzer:
-        imager._analyzer = lambda img: []        # dataset mode: raw images
     written = []
     imager.image_ready.connect(lambda img: written.append(img.image_id))
     feed_pings(imager, pings, breaks, progress)

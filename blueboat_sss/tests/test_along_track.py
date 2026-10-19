@@ -126,3 +126,43 @@ def test_waterfall_and_imager_agree_on_the_same_pings(qapp, tmp_config):
     assert svc.row_pitch_m == pytest.approx(0.045, rel=1e-6)
     assert imager.along_track.row_pitch_m == pytest.approx(svc.row_pitch_m)
     assert imager.along_track.speed_mps == pytest.approx(0.9, rel=1e-6)
+
+
+# ---- the window setting (2026-10-16, decision 6.3) --------------------------
+
+def test_the_shipped_window_is_2_s_and_read_from_one_place(qapp, tmp_config):
+    """5 s -> 2 s (BlueBoat-Perception PREPROCESSING_STUDY §6.3). The yaml,
+    the dataclass default and the estimator default agree, and both
+    consumers take the value from the config through ``from_config``."""
+    from blueboat_gcs.config.settings import AlongTrackConfig, load_config
+    from blueboat_gcs.core import along_track as at
+    from blueboat_gcs.core.seabed_imager import SeabedImager
+    from blueboat_gcs.core.waterfall_service import WaterfallService
+    assert load_config().along_track.window_s == 2.0
+    assert AlongTrackConfig().window_s == 2.0 == at.DEFAULT_WINDOW_S
+    assert AlongTrackEstimator().window_s == 2.0
+    tmp_config.along_track.window_s = 3.5
+    assert SeabedImager(tmp_config).along_track.window_s == 3.5
+    assert WaterfallService(tmp_config)._along.window_s == 3.5
+    tmp_config.along_track.window_s = 0.5        # < pair_s: pair clamps to it
+    est = AlongTrackEstimator.from_config(tmp_config)
+    assert est.window_s == 0.5 and est._pair_s == 0.5
+
+
+def test_a_shorter_window_follows_a_speed_change_sooner():
+    """What the change buys: after a step from 0.5 to 1.0 m/s the 2 s window
+    reads the new speed after 1.9 s (the 1 s chord span plus half the
+    window), the 5 s window only after 3.35 s."""
+    def settle(window):
+        est = AlongTrackEstimator(window_s=window)
+        x, t = 0.0, 0.0
+        first = None
+        for i in range(400):
+            t = i * 0.05
+            x += (0.5 if t < 10.0 else 1.0) * 0.05
+            est.observe(t, x, 0.0)
+            if t >= 10.0 and first is None and abs(est.speed_mps - 1.0) < 0.05:
+                first = t - 10.0
+        return first
+    assert settle(2.0) == pytest.approx(1.9, abs=0.06)
+    assert settle(5.0) == pytest.approx(3.35, abs=0.06)

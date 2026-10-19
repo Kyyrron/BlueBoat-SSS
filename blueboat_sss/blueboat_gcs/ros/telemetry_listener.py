@@ -9,6 +9,7 @@ topics.odom                             nav_msgs/Odometry           ~20 Hz
 topics.navsat                           sensor_msgs/NavSatFix       ~5 Hz
 topics.compass_hdg                      std_msgs/Float64 (degrees)  ~10 Hz
 topics.vfr_hud (optional)               mavros_msgs/VfrHud          ~4 Hz
+topics.imu                              sensor_msgs/Imu             IMU rate
 ======================================  ==========================  ======
 
 The listener merges the latest values into a ``RobotState`` and emits it
@@ -18,6 +19,8 @@ on every odom message, throttled to ``EMIT_HZ`` — the panels do not need
 The GUI-side ``GeoService`` anchors the map by pairing ``gps_fix``
 emissions (from ``_on_navsat``, at GPS rate) with fresh odom positions;
 ``compass_heading`` feeds the live heading policy (see main_window).
+``attitude`` (roll, pitch, yaw rate of each IMU sample) is attached to the
+pings for the seabed-image metadata only (``utils/attitude.py``).
 mavros_msgs is optional: without it, speed falls back to the odom twist.
 """
 
@@ -31,12 +34,13 @@ from typing import Optional
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import Imu, NavSatFix
 from std_msgs.msg import Float64
 
 from ..config.settings import RosTopics
 from ..core.signals import AppSignals
 from ..models.robot_state import RobotState
+from ..utils.attitude import quat_to_roll_pitch
 from ..utils.geodesy import navsat_fix_ok, quat_to_yaw, yaw_to_compass_deg
 from ..utils.pose_alignment import GpsPoseSynthesizer
 
@@ -83,6 +87,8 @@ class TelemetryListener:
                                  self._on_navsat, best_effort)
         node.create_subscription(Float64, topics.compass_hdg,
                                  self._on_compass, 10)
+        # Like the other mavros sensor streams: BEST_EFFORT, depth 10.
+        node.create_subscription(Imu, topics.imu, self._on_imu, best_effort)
         if MAVROS_MSGS_AVAILABLE:
             node.create_subscription(VfrHud, topics.vfr_hud,
                                      self._on_vfr_hud, best_effort)
@@ -164,6 +170,18 @@ class TelemetryListener:
             self._compass_deg = float(msg.data) % 360.0
         self._signals.compass_heading.emit(time.monotonic(),
                                            float(msg.data) % 360.0)
+
+    def _on_imu(self, msg: Imu) -> None:
+        """Attitude for the seabed-image metadata (never geometry).
+        ``orientation_covariance[0] == -1`` means no orientation estimate
+        (sensor_msgs/Imu convention): roll/pitch are then unknown."""
+        q = msg.orientation
+        if msg.orientation_covariance[0] == -1.0:
+            roll = pitch = math.nan
+        else:
+            roll, pitch = quat_to_roll_pitch(q.x, q.y, q.z, q.w)
+        self._signals.attitude.emit(time.monotonic(), roll, pitch,
+                                    float(msg.angular_velocity.z))
 
     def _on_vfr_hud(self, msg: "VfrHud") -> None:
         with self._lock:

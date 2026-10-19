@@ -187,9 +187,12 @@ transform rather than a guessed altitude, and is the same value the GCS
 `Depth comp. = off` selector applies. `_unlocked_pings` counts pings **emitted**
 while unlocked; nothing is dropped for it. **VERIFIED.**
 
-The four transducer-geometry constants (`TRANSDUCER_X_OFFSET_M`,
-`TRANSDUCER_Y_OFFSET_PORT_M`, `TRANSDUCER_Y_OFFSET_STBD_M`,
-`TRANSDUCER_SUBMERSION_M`) are all **0.0** and carry `TODO` comments. **VERIFIED.**
+The four transducer-geometry constants: since `994a74b` (2026-10-13)
+`TRANSDUCER_Y_OFFSET_PORT_M` / `_STBD_M` = **0.285** (BR-101447 hull spacing 570 mm / 2)
+and `TRANSDUCER_SUBMERSION_M` = **0.15** (an estimate, = the simulator's `sensor_depth_m`),
+mirrored in the GCS's `core/svlog.py`; `TRANSDUCER_X_OFFSET_M` is still 0.0 (fore/aft,
+unmeasured, `TODO`). So `water_depth = altitude + 0.15` and
+`y = ±(0.285 + sqrt(s² − altitude²))`. **VERIFIED** (`sss_processor_node.py:122-125`).
 
 `.svlog` files are written to `../../../../data/SSS_data`, resolved relative to the
 launch working directory — the same root the GCS uses as `data_root`. The node resolves
@@ -206,7 +209,20 @@ decisions are in **`blueboat_sss/blueboat_gcs/CLAUDE.md`** (loads when working t
 Cross-module essentials: it subscribes `/sss_processor/processed` and the two `~/profile`
 topics (`BEST_EFFORT`, depth **200**) — **never `~/raw`** — and publishes
 `/side_scan_sonar/ping/enable`, `/sss_processor/log/enable` and `/sss_ai/seabed_analysis`
-(JSON, never pixels). Everything downstream of `ros/` consumes plain dataclasses (NC #10).
+(JSON, never pixels; `detections: []`). Everything downstream of `ros/` consumes plain
+dataclasses (NC #10).
+
+**BlueBoat-Perception (2026-10-16, by the owner's order) is the station's one detection
+source.** The GCS publishes every seabed image for it — `/sss_ai/seabed_image` (32FC1),
+`/sss_ai/seabed_image/png` (mono8), `/sss_ai/seabed_image/metadata` (JSON), RELIABLE /
+KEEP_LAST 32 — and draws only what comes back on `/sss_ai/detections`; it runs no detector
+of its own (the former in-process dummy now lives in Perception, reproduced exactly). It
+also subscribes `/mavros/imu/data` for per-row attitude metadata. What changed in this
+module, and what is pinned unchanged: `blueboat_gcs/docs/PERCEPTION_INTEGRATION.md`.
+Perception's default detector input (`fixed_gray`, its decision 6.4) is a fixed mapping of
+the **32FC1 dB** and the per-row `gain_port_db` / `gain_stbd_db`, not of the display PNG:
+a change to those values, to the pictures' slant pitch or to the live 0.75 m nadir blank
+changes what its detector is trained and run on. The display model does not reach it.
 
 ---
 
@@ -310,12 +326,13 @@ Violating any of these breaks another module, the hardware integration, or the t
     dataclasses so the GUI runs without ROS (rcl_interfaces for the runtime range
     change is imported inside `ros/ros_manager.py` only, and its result crosses the
     bus as `(bool, str)`). **VERIFIED**: `ros/` is the only place `rclpy` is
-    imported, and 59 of the 63 swept GCS modules import cleanly with no ROS at all
+    imported, and 64 of the 68 swept GCS modules import cleanly with no ROS at all
     (the four that do not are exactly the `ros/` listeners, which `main.py` imports
-    lazily and only outside `--sim`). The live listener's logic that can be tested
-    without ROS lives in `core/live_native.py` for exactly that reason. The sweep
-    count excludes `tools/`, whose three files are checked by hash instead
-    (NC #7); the package holds 66 `.py` files in total.
+    lazily and only outside `--sim`; `tests/test_sweeps.py`, 2026-10-16). The live
+    listener's logic that can be tested without ROS lives in `core/live_native.py` for
+    exactly that reason. The sweep count excludes `tools/`, whose three files are
+    checked by hash instead (NC #7). `core/perception_core.py` imports
+    BlueBoat-Perception's (ROS-free) core lazily, for the replay window's Run AI only.
 
 ### Scientific validity (from the thesis plan)
 
@@ -427,8 +444,12 @@ QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m pytest -p no:cacheprovider
 - Do not `source ~/ros2_ws/install/setup.bash` first: it switches `python3` to the
   workspace venv, which lacks pytest. The system python has pytest, rclpy, PySide6 and
   `blueboat_interfaces`.
-- **297 pass / 50 skip on 2026-09-28** with the workspace's `blueboat_interfaces`; the
-  skips are the corpus gates. **The corpus path is hard-coded** in
+- **353 pass / 50 skip on 2026-10-16** with the workspace's `blueboat_interfaces` on
+  `PYTHONPATH` / `LD_LIBRARY_PATH` (351 / 50 before the along-track window tests;
+  297 / 50 on 2026-09-28; the gate was **red, 298 /
+  4 fail / 50**, on 2026-10-16 before any edit: four stale expectations after
+  `994a74b`'s constants, repaired as a labelled baseline repair, `TODO.md`); the skips
+  are the corpus gates. **The corpus path is hard-coded** in
   `tests/test_processor_assembly.py` (an external mount, see *Verification status*); every
   corpus test skips without it, so a green suite is not by itself evidence that the
   *Measured acquisition settings* still hold.

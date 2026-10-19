@@ -13,19 +13,29 @@ rclpy node name `blueboat_gcs`. Subscribes (**VERIFIED**; topic names configurab
 | Topic | Type | Notes |
 |---|---|---|
 | `/sss_processor/processed` | `ProcessedSSSPing` | `BEST_EFFORT`, depth **200** |
-| `/side_scan_sonar/{port,starboard}/profile` | `OmniscanProfile` | `BEST_EFFORT`, depth **200** (`sonar_stream.profile_queue_depth`). **Since 2026-09-05**: the raw per-side profiles, cached by device `ping_number` and attached verbatim to the matching processed row (`core/live_native.py`), so the live waterfall and the AI pictures draw the same native bins the replay path decodes from the `.svlog` — water column, ringing and all. A profile missing after `profile_wait_ms` (60 ms) falls back to the re-projection for that side; the console warns once when more than 5 % of recent rows had to. |
+| `/side_scan_sonar/{port,starboard}/profile` | `OmniscanProfile` | `BEST_EFFORT`, depth **200** (`sonar_stream.profile_queue_depth`). **Since 2026-09-05**: the raw per-side profiles, cached by device `ping_number` and attached verbatim to the matching processed row (`core/live_native.py`), so the live waterfall and the AI pictures draw the same native bins the replay path decodes from the `.svlog` — water column, ringing and all. A profile missing after `profile_wait_ms` (60 ms) falls back to the re-projection for that side; the console warns once when more than 5 % of recent rows had to. **Bug fix 2026-10-16:** that re-projection now inverts the processor's own geometry (the 0.285 m lever arm and its altitude = `water_depth − 0.15`); since `994a74b` it had put a missed side on the wrong bins (20 m / 1200 bins at 1.2 m: bin 83 instead of 72) — `tests/test_fallback_lever_arm.py`. |
 | `/blueboat/odom` | `nav_msgs/Odometry` | `BEST_EFFORT`, depth 10 |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | `BEST_EFFORT`, depth 10. Gated by the pure `utils/geodesy.navsat_fix_ok`: **only** an explicit `STATUS_NO_FIX` (-1), non-finite coordinates, or the `(0, 0)` no-fix sentinel are rejected; `STATUS_UNKNOWN` (-2) is **accepted** — it is the ROS 2 Iron+ message *default*, and exactly what the MCS bridge's simulated GPS sends for Gazebo runs of GPS-anchored missions (MCS is the only GPS publisher in a sim graph; it fills lat/lon only). Rejecting all negative statuses silently discarded that whole feed — the "GCS says no GPS while MCS anchors" field bug. First accepted and first rejected fix are logged to the console |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | depth 10 |
 | `/mavros/vfr_hud` | `mavros_msgs/VfrHud` | optional; without `mavros_msgs`, speed comes from the odom twist |
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | gated by the pure `utils/pinger.parse_pinger`: **all-zero vectors are dropped** (the producer streams `zeros(3)` at ~20 Hz before any USBL detection — the field "marker rides the boat" bug), NaN/short arrays are dropped, and the frame is taken from the wire shape — `[x, y, z]` = vehicle frame (normal path), `[x, y]` = world frame (`fixed_pinger`). `alignment.pinger_frame: auto` (default) honours that; `robot`/`world` force one reading. The marker hides after `alignment.pinger_stale_after_s` (10 s) without a fix |
 | `/set_path` | `nav_msgs/Path` | from `path_publisher.py` — the **fallback** since 2026-09-18. That publisher asks the path service for a fixed `total_time` window (1000 s), so it truncates any longer mission: the 1317 s survey of 2026-09-07 drew as its first 1000 s and stopped mid-water. It lives in `BlueBoat-Control`, frozen at v1.0, so the station reads the trajectory **it deployed itself** instead — `core/deployed_path.py`, the newest `~/.config/blueboat_mcs/trajectories/.deployed/*.yaml`, every sample of it, placed through the designer file's `geo_anchor` — and `/set_path` only draws when there is no deployed file, no anchor, or `planned_path.prefer_deployed: false` |
-| `/sss_ai/detections` | `vision_msgs/Detection2DArray` | placeholder, not wired to a model |
+| `/sss_ai/detections` | `vision_msgs/Detection2DArray` | **from BlueBoat-Perception, the station's one detection source** (2026-10-16): one array per seabed image; every map marker, waterfall marker, left-panel count and `detections.csv` row comes from here. A non-zero per-detection `header.stamp` (its row time) wins over the array's |
+| `/mavros/imu/data` | `sensor_msgs/Imu` | `BEST_EFFORT`, depth 10 (2026-10-16). Roll / pitch / yaw rate attached to live pings at reception with their age (`utils/attitude.py`) for the seabed-image metadata — **never geometry**; the ping quaternion is not used (yaw-only on the real boat) |
 | `/rosout` | `rcl_interfaces/Log` | depth 50; the GCS filters out its own node |
 
 Publishes: `/side_scan_sonar/ping/enable` (Bool), `/sss_processor/log/enable` (Bool),
-and `/sss_ai/seabed_analysis` (`std_msgs/String`, JSON, schema 1) — image metadata +
-detections, **never pixels**.
+`/sss_ai/seabed_analysis` (`std_msgs/String`, JSON, schema = the picture metadata's,
+5 since 2026-10-16; `detections` always `[]`) — image metadata, **never pixels** — and,
+since 2026-10-16, **every seabed image for BlueBoat-Perception** (recording or not), keyed
+`"<stream_id>/<image_id>"` (`Image.header.frame_id` / the JSON envelope), RELIABLE /
+KEEP_LAST 32 / VOLATILE at both ends (CM-4): `/sss_ai/seabed_image` (`sensor_msgs/Image`
+32FC1, the raw float dB = `_world.npz:intensity_db`), `/sss_ai/seabed_image/png` (mono8,
+= the PNG), `/sss_ai/seabed_image/metadata` (`std_msgs/String`, the envelope around
+`SeabedImage.metadata()`). Built by the ROS-free `core/perception_bridge.py`, sent by
+`RosManager.publish_seabed_image` from the main window's one-thread publish pool.
+Contract: `BlueBoat-Perception/docs/topics.md`; the SSS side:
+`docs/PERCEPTION_INTEGRATION.md`.
 
 The GCS **does not subscribe to `~/raw`.** **VERIFIED.** It subscribes to the two
 `~/profile` topics (above) since 2026-09-05.
@@ -145,10 +155,12 @@ waterfall, the AI seabed pictures and the mosaic all map through it:
    brightness matched; black nadir, black wall shadows, textured debris, no bands); it
    stays the default until a paired SonarView comparison on **real** data decides
    (`TODO.md`).
-3. **Life cycle**: live, the model accumulates `display.warmup_rows` (300) rows then
-   freezes and every tile re-renders once (`version` bump); the mosaic holds pings back
-   until the freeze so its grid is on one mapping; replay, `Run AI`, `Save pictures` and
-   the session rebuild fit it in one pass (`DisplayModel.fit`). `Clear SSS data` resets it.
+3. **Life cycle**: live, the model accumulates `display.warmup_rows` (300) rows, then is
+   **re-published every `warmup_rows` rows and never frozen** (since 2026-09-19:
+   `DisplayModel.observe_row`; the earlier freeze kept the launch area's curve for the
+   whole mission), every tile re-rendering on each `version` bump; replay, `Run AI`,
+   `Save pictures` and the session rebuild fit it in one pass (`DisplayModel.fit`, which
+   freezes). `Clear SSS data` resets it.
 4. **Invertibility**: every picture's JSON carries the model (`display_model`: TL
    parameters, `x_centers`, `a_port_db`/`a_stbd_db`, `hi_db`, `gamma`, `transfer`,
    `window_db`, `gain_reference_analog`) and per row `bottom_m`, `gain_port_db`,
@@ -166,7 +178,7 @@ waterfall, the AI seabed pictures and the mosaic all map through it:
 **The on-screen waterfall is drawn at true scale (2026-09-05; estimator replaced
 2026-09-15).** The service reports the along-track metres per row (5th argument of
 `layout_changed`) from the **one along-track estimator** `core/along_track.py`:
-ground speed = median over a `along_track.window_s` (5 s) window of chord speeds over
+ground speed = median over a `along_track.window_s` (**2 s** since 2026-10-16, was 5 s; BlueBoat-Perception decision 6.3) window of chord speeds over
 ~`pair_s` (1 s) spans of the ping poses, × the median ping period. The previous
 running median of consecutive row displacements was biased −24 % at 20 Hz on the field
 log (18 % of pings repeat a pose sample, 26 % of windows read zero → "no true scale";
@@ -252,7 +264,10 @@ stored pose with `seabed_imager.waterfall_pixel_to_world` (the single definition
 the documented pixel→world formula; the detection overlay applies its exact
 inverse), mark it with `SelectionLayer` under the WorldRoot, center the map, and
 show world + GPS coordinates (coordinate card in the main window, status bar in
-replay). Gap rows and evicted history refuse with a status message.
+replay). Gap rows and evicted history refuse with a status message. Since
+2026-10-16 clicks and overlay use **georef convention 2**, as the pictures:
+`WaterfallService.row_georef` (the row's tracked bottom `h`) and
+`seabed_imager.LEVER_ARM_M` (0.285 m per side).
 
 **Runtime sonar range.** The right panel's Acquisition group (main window only,
 enabled while the pipeline is RUNNING) changes `range_length_mm` live:
@@ -464,9 +479,27 @@ remaining rows so no data is lost.
 
 Row 0 = **newest** (SonarView orientation; every row-indexed array and the world grids
 are flipped together so bbox→world stays one lookup), column 0 = +range (port). Pixel to
-world: `k = (W/2−1−j)` or `(j−W/2)`, `s = (k+0.5)·bin_pitch_m`,
-`y_local = ±sqrt(max(s² − altitude_i², 0))`, then rotate/translate by that row pose
-(`world_x = x − sin(yaw)·y_local`, `world_y = y + cos(yaw)·y_local`).
+world, **georef convention 2** (schema 5, 2026-10-16 — the processor's `project_side`
+geometry): `k = (W/2−1−j)` or `(j−W/2)`, `s = (k+0.5)·bin_pitch_m`,
+`y_local = ±(lever_side + sqrt(max(s² − bottom_i², 0)))` with `bottom_i` = the row's
+`bottom_m` and `lever_side` = 0.285 m (`core/svlog.py` `TRANSDUCER_Y_OFFSET_*`), then
+rotate/translate by that row pose (`world_x = x − sin(yaw)·y_local`,
+`world_y = y + cos(yaw)·y_local`). The JSON says so in `georef`; a schema ≤ 4 picture
+(no `georef`) used **convention 1** (`altitude_i` = `altitude_m`, the correction altitude +
+submersion, and no lever) and its stored grids stay valid as written.
+`waterfall_pixel_to_world`'s default arguments are convention 1 bit for bit
+(`tests/test_perception_golden.py`).
+
+**Schema 5 (2026-10-16), additive keys** (`tests/test_perception_golden.py` pins that
+nothing else changed): `stream_id` (`gcs-<UTC>-<4 hex>`, new at every
+`SeabedImager.reset()`, i.e. START; `image_id` restarts at 0 in each), `georef`, and per
+row `roll_rad` / `pitch_rad` / `yaw_rate_rad_s` / `attitude_age_s` (the row's **source
+ping's** — live the latest `/mavros/imu/data` sample at its reception, replay the latest
+`.svlog` ATTITUDE before it; `null` when unknown) and `port_ping_number` /
+`stbd_ping_number` (0 = side absent). `detections` is always `[]`: the station's
+detector is BlueBoat-Perception. The replay window's **Run AI** runs Perception's core
+in-process over the same pictures, through the live envelope
+(`core/perception_core.py`).
 
 ## Testing and performance notes
 

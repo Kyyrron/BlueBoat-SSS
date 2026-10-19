@@ -1,10 +1,12 @@
-"""AI detections listener — **PLACEHOLDER / INTEGRATION POINT**.
+"""AI detections listener -- the station's ONE detection source.
 
-The detection node (YOLO + classical proposer, see the project synthesis)
-does not exist yet. The GUI side (DetectionLayer markers, per-class
-summary in the left panel) is fully implemented and exercised by the
-simulator; this listener defines the contract the future node should
-publish, so that connecting it is editing one adapter function.
+Since 2026-10-16 every detection the station draws (map markers, the
+waterfall overlay, the left panel's per-class summary, the session's
+``detections/detections.csv``) arrives here, from BlueBoat-Perception
+(today its dummy detector; a YOLO model later). The GCS no longer runs a
+detector of its own, so a detection can never be drawn twice. (The no-ROS
+``--sim`` bench simulator still draws its own synthetic markers: it has no
+ROS graph and no Perception.)
 
 Expected interface:
 
@@ -20,6 +22,9 @@ Expected interface:
               * detections[i].id                -> stable uid (string int);
                 republishing the same id after a revisit *updates* the
                 marker instead of duplicating it.
+              * detections[i].header.stamp      -> the detection's own row
+                time when non-zero (places the waterfall marker on the
+                ping line the object was seen on); else the array stamp.
     Rate    : event-driven (per detector inference, ~0.5–2 Hz bursts)
 
 vision_msgs is a standard ROS package but may be absent from a bare
@@ -62,20 +67,25 @@ class DetectionsListener:
 
     @staticmethod
     def _msg_to_detections(msg: "Detection2DArray") -> List[Detection]:
-        """<-- EDIT HERE when connecting the real detection node."""
+        """The producer is BlueBoat-Perception (``/sss_ai/detections``,
+        its ``docs/topics.md`` §3) -- the station's one detection source."""
         t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         out: List[Detection] = []
         for i, d in enumerate(msg.detections):
             if not d.results:
                 continue
             hyp = d.results[0].hypothesis
+            # Per-detection row time (additive, 2026-10-16): a zero stamp
+            # -- every producer before it -- keeps the array's stamp.
+            ts = d.header.stamp
+            t_det = (ts.sec + ts.nanosec * 1e-9) if (ts.sec or ts.nanosec) else t
             try:
                 uid = int(d.id)
             except (ValueError, TypeError):
                 uid = hash(d.id or f"det-{t}-{i}") & 0x7FFFFFFF
             out.append(Detection(
                 uid=uid,
-                t=t,
+                t=t_det,
                 x=float(d.bbox.center.position.x),
                 y=float(d.bbox.center.position.y),
                 class_name=str(hyp.class_id) or "object",

@@ -62,7 +62,9 @@ def test_both_geometries_produce_invertible_tiles(qapp, tmp_path, geometry):
     assert img.row_geometry == geometry
     assert np.isfinite(img.intensity_db).all()          # nothing erased
     meta = img.metadata()
-    assert meta["schema"] == 4 and meta["row_geometry"] == geometry
+    # Schema 5 since 2026-10-16 (georef convention 2 + additive keys).
+    assert meta["schema"] == 5 and meta["row_geometry"] == geometry
+    assert meta["georef"]["convention"] == 2
     assert meta["display_model"]["schema"].startswith("blueboat_display_model")
     for key in ("ping_index", "along_track_m", "bottom_m", "altitude_m"):
         assert key in meta["rows_data"][0]
@@ -156,7 +158,13 @@ def test_live_and_replay_pings_give_identical_pictures(qapp):
     altitude) and the replay row from the same bytes yield the same PNG."""
     from blueboat_gcs.core.live_native import (ProcessedFields, ProfileCache,
                                                attach_native, profile_from_msg)
+    from blueboat_gcs.core.svlog import TRANSDUCER_SUBMERSION_M
     from test_live_native import fake_profile, ground_from
+    # Baseline repair 2026-10-16: since 994a74b both paths carry
+    # water_depth = altitude + submersion (the processor live, load_svlog on
+    # replay), and the live bottom is water_depth - submersion. The test used
+    # to hand the live row water_depth = H, i.e. an altitude of H - 0.15.
+    wd = H + TRANSDUCER_SUBMERSION_M
     cfg = AppConfig()
     cfg.seabed.rows, cfg.seabed.stride = 8, 4
     cfg.seabed.row_geometry = "ping"
@@ -166,7 +174,7 @@ def test_live_and_replay_pings_give_identical_pictures(qapp):
         _, _, pp = profile_from_msg(pm)
         _, _, sp = profile_from_msg(sm)
         base = dict(t=0.05 * n, robot_x=0.1 * n, robot_y=0.0, yaw=0.0,
-                    water_depth=H, y_local=np.zeros(0),
+                    water_depth=wd, y_local=np.zeros(0),
                     intensity_db=np.zeros(0, np.float32))
         replay.append(SonarPing(**base, bin_size_m=pp.length_mm / 1000 / (pp.num_results - 1),
                                 port_bin0=0, port_db=pp.db, stbd_bin0=0, stbd_db=sp.db,
@@ -174,7 +182,7 @@ def test_live_and_replay_pings_give_identical_pictures(qapp):
         cache = ProfileCache()
         cache.put(0, n, pp); cache.put(1, n, sp)
         py, pd = ground_from(pp, H); sy, sd = ground_from(sp, H)
-        out, hits = attach_native(ProcessedFields(n, n, H, py, pd, sy, sd), cache)
+        out, hits = attach_native(ProcessedFields(n, n, wd, py, pd, sy, sd), cache)
         assert hits == (True, True)
         live.append(SonarPing(**base, **out))
     model = DisplayModel.fit(cfg, replay)

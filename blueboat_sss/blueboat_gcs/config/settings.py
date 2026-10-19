@@ -31,13 +31,25 @@ class RosTopics:
     # sonar driver: the verbatim native bins the processor also consumes.
     port_profile: str = "/side_scan_sonar/port/profile"
     starboard_profile: str = "/side_scan_sonar/starboard/profile"
-    # ---- placeholders (repositories not present yet) ----------------------
-    detections: str = "/sss_ai/detections"     # see ros/detections_listener.py
+    # ---- other repositories ------------------------------------------------
+    # BlueBoat-Perception's detections, the station's one detection source
+    # since 2026-10-16 (see ros/detections_listener.py).
+    detections: str = "/sss_ai/detections"
     pinger: str = "/blueboat/pinger_coordinates"  # Float32MultiArray [x, y]
     # Planned mission path (nav_msgs/Path), published by path_publisher.py.
     planned_path: str = "/set_path"
     # AI seabed analysis output (std_msgs/String, JSON; schema in HANDOVER).
     seabed_analysis: str = "/sss_ai/seabed_analysis"
+    # Attitude for the seabed-image metadata (sensor_msgs/Imu: mavros on
+    # the boat, the simulator's mavros shim in Gazebo). Never geometry.
+    imu: str = "/mavros/imu/data"
+    # Every seabed image for BlueBoat-Perception (2026-10-16), keyed
+    # "<stream_id>/<image_id>" in header.frame_id / the JSON envelope:
+    # raw float dB (sensor_msgs/Image 32FC1), the PNG (mono8), and the
+    # metadata envelope (std_msgs/String JSON). RELIABLE / KEEP_LAST 32.
+    seabed_image: str = "/sss_ai/seabed_image"
+    seabed_image_png: str = "/sss_ai/seabed_image/png"
+    seabed_image_meta: str = "/sss_ai/seabed_image/metadata"
 
 
 @dataclass
@@ -243,9 +255,17 @@ class AlongTrackConfig:
     period are taken as medians. ``pair_s``: the span of each chord-speed
     measurement (long enough that repeated pose samples and centimetre
     jitter average out, short enough to follow a turn).
+
+    ``window_s`` is **2.0 s since 2026-10-16** (was 5.0; the BlueBoat-Perception
+    preprocessing decision 6.3). Measured on the recorded sets, per seabed
+    picture, the row-pose path / nominal span p5-p95 went 0.88-1.10 -> 0.94-1.07
+    on real data and 0.86-1.14 -> 0.97-1.07 in simulation, with no added
+    row-level jitter (``BlueBoat-Perception/docs/PREPROCESSING_STUDY.md`` §5,
+    M2 / M2b). 1.0 s measured "not worse" but is not validated against an
+    independent pose truth on real data.
     """
 
-    window_s: float = 5.0
+    window_s: float = 2.0
     pair_s: float = 1.0
 
 

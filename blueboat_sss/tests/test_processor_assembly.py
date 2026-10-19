@@ -431,13 +431,18 @@ def test_unlocked_altitude_is_an_identity_transform_not_a_guess(node):
     node._flush_pending(drain_all=True)
 
     m = node.published[0]
-    assert m.water_depth == 0.0, "an unlocked altitude must be distinguishable"
+    # Baseline repair 2026-10-16: since 994a74b water_depth = altitude +
+    # submersion and y = ±(lever + ground), so an unlocked (0) altitude
+    # reads as the submersion alone and every y carries the lever arm.
+    assert m.water_depth == pytest.approx(proc.TRANSDUCER_SUBMERSION_M), \
+        "an unlocked altitude must be distinguishable"
+    lever = proc.TRANSDUCER_Y_OFFSET_PORT_M
     # altitude 0 => ground range == slant range. project_side keeps
     # `slant > altitude`, so only the degenerate zero-range sample goes; the
-    # water column is not cut, and every y is the raw slant range.
+    # water column is not cut, and every y is lever + the raw slant range.
     assert len(m.port_y) == NUM_RESULTS - 1
-    assert m.port_y[0] == pytest.approx(SAMPLE_MM / 1000.0, abs=1e-6)
-    assert m.port_y[-1] == pytest.approx(LENGTH_MM / 1000.0, abs=1e-3)
+    assert m.port_y[0] == pytest.approx(lever + SAMPLE_MM / 1000.0, abs=1e-6)
+    assert m.port_y[-1] == pytest.approx(lever + LENGTH_MM / 1000.0, abs=1e-3)
 
 
 def test_bootstrap_counter_counts_emissions_never_drops(node):

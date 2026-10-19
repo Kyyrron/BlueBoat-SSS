@@ -16,7 +16,7 @@ from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, QRunnable, Qt, QThreadPool, QTimer
 from PySide6.QtGui import QCloseEvent, QImage
 from PySide6.QtWidgets import (QDockWidget, QMainWindow, QMessageBox,
                                QScrollArea, QStackedWidget)
@@ -39,7 +39,8 @@ from . import left_panel as lp
 from . import right_panel as rp
 from .left_panel import LeftPanel
 from .log_console import LogConsole
-from ..core.seabed_imager import waterfall_pixel_to_world
+from ..core.seabed_imager import LEVER_ARM_M, waterfall_pixel_to_world
+from ..utils.attitude import AttitudeBuffer
 from ..utils.geodesy import format_latlon
 from .map_layers import (DetectionLayer, MeasureLayer, MosaicLayer,
                          PingerLayer, PlannedPathLayer, SelectionLayer,
@@ -93,10 +94,19 @@ class MainWindow(QMainWindow):
                                           mosaic_service,
                                           self.waterfall_service)
         # Live AI seabed imaging (waterfall domain, core/seabed_imager.py):
-        # every stride rows -> image + metadata + dummy analysis; written
-        # to <session>/seabed_images while a recording session is active.
+        # every stride rows -> image + metadata, written to
+        # <session>/seabed_images while a recording session is active, and
+        # ALWAYS published for BlueBoat-Perception -- the station's one
+        # detection source since 2026-10-16 (its detections come back on
+        # /sss_ai/detections through ros/detections_listener.py). One
+        # dedicated thread encodes + publishes, in order, off the GUI thread.
         from ..core.seabed_imager import SeabedImager
         self.seabed_imager = SeabedImager(config, model=self.display_model)
+        self._perception_pool = QThreadPool(self)
+        self._perception_pool.setMaxThreadCount(1)
+        # Latest /mavros/imu/data attitude, attached to every live ping for
+        # the seabed-image metadata (utils/attitude.py; never geometry).
+        self._attitude = AttitudeBuffer()
         self._frozen_detector = FrozenPoseDetector(
             eps_m=config.alignment.frozen_epsilon_m,
             after=config.alignment.frozen_after_pings)
@@ -221,6 +231,7 @@ class MainWindow(QMainWindow):
         # GPS anchor: pair fixes with fresh odom, follow the fit.
         s.gps_fix.connect(self.geo.on_gps_fix)
         s.compass_heading.connect(self._heading.update_compass)
+        s.attitude.connect(self._attitude.update)
         self.geo.fit_changed.connect(
             lambda fit: self.world_root.set_translation(fit.tx, fit.ty))
         self.geo.anchored.connect(self._on_anchored)
@@ -318,6 +329,7 @@ class MainWindow(QMainWindow):
             return
         self._apply_backpressure(ping)
         ping = self._align_ping_pose(ping)
+        ping = self._attitude.attach(ping, time.monotonic())
         self._mosaic_service.on_sonar_ping(ping)
         self.waterfall_service.on_sonar_ping(ping)
         self.seabed_imager.on_sonar_ping(ping)
@@ -503,25 +515,24 @@ class MainWindow(QMainWindow):
 
     # ---- AI seabed imaging (live) -----------------------------------------------
     def _on_seabed_image(self, image) -> None:
-        """Every completed seabed image: publish the analysis (metadata +
-        detections, never pixels) and show detections on the map."""
-        payload = image.analysis_json(getattr(image, "_png_path", None),
-                                      getattr(image, "_metadata_path", None))
+        """Every completed seabed image: publish the analysis (metadata,
+        never pixels; ``detections: []``) and the image itself for
+        BlueBoat-Perception. The station draws no detection of its own:
+        Perception is its one detection source, whose results arrive on
+        /sss_ai/detections like any other (one path, never duplicates)."""
+        png_path = getattr(image, "_png_path", None)
+        meta_path = getattr(image, "_metadata_path", None)
+        payload = image.analysis_json(png_path, meta_path)
         # PipelineLauncher exposes the ros manager; Simulator has none.
         ros = getattr(self._acquisition, "_ros", None)
         if ros is not None:
             ros.publish_seabed_analysis(payload)
+            self._perception_pool.start(
+                _PerceptionPublishJob(ros, image, png_path, meta_path))
         self.console.append_line(
-            "app", f"seabed image {image.image_id}: "
-                   f"{len(image.detections)} detection(s) published")
-        for k, det in enumerate(image.detections):
-            t_row = float(det.get("t_s", image.row_t[-1]))
-            self._signals.detection.emit(Detection(
-                uid=1_000_000 + image.image_id * 16 + k,
-                t=t_row,
-                x=float(det["world"][0]), y=float(det["world"][1]),
-                class_name=det["class_name"],
-                confidence=float(det["confidence"]), extent_m=1.0))
+            "app", f"seabed image {image.stream_id}/{image.image_id} "
+                   + ("published for Perception" if ros is not None
+                      else "(no ROS: not published)"))
 
     def _on_open_svlog(self) -> None:
         from .replay_window import open_svlog_dialog
@@ -638,10 +649,12 @@ class MainWindow(QMainWindow):
                 "No position for that waterfall point (gap row, or the "
                 "history was discarded).", 6000)
             return
-        _t, rx, ry, yaw, depth = meta
+        # Georef convention 2, as the seabed pictures: the row's tracked
+        # bottom and the transducer lever arm (row_georef).
+        rx, ry, yaw, bottom = self.waterfall_service.row_georef(row)
         wx, wy = waterfall_pixel_to_world(
-            rx, ry, yaw, depth, self.waterfall_service.pitch_m,
-            float(col), self.waterfall_service.columns)
+            rx, ry, yaw, bottom, self.waterfall_service.pitch_m,
+            float(col), self.waterfall_service.columns, *LEVER_ARM_M)
         wx, wy = float(wx), float(wy)
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(
@@ -879,3 +892,23 @@ class MainWindow(QMainWindow):
         # the pool; the process must not exit under them.
         self.recording.wait_for_exports()
         super().closeEvent(event)
+
+
+class _PerceptionPublishJob(QRunnable):
+    """Encode one seabed image and publish its three parts for
+    BlueBoat-Perception (core/perception_bridge.py). Runs on the window's
+    single-thread pool: the GUI thread never encodes, and images go out
+    in emission order. The image is never mutated after emission."""
+
+    def __init__(self, ros, image, png_path, meta_path) -> None:
+        super().__init__()
+        self._ros, self._image = ros, image
+        self._paths = (png_path, meta_path)
+        self.setAutoDelete(True)
+
+    def run(self) -> None:  # noqa: D401
+        from ..core.perception_bridge import publish_parts
+        try:
+            self._ros.publish_seabed_image(*publish_parts(self._image, *self._paths))
+        except Exception as exc:  # pragma: no cover - reported, never raised
+            print(f"seabed image publish failed: {exc}")

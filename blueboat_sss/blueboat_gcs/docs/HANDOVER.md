@@ -169,26 +169,33 @@ the operator controls. The `Range EQ (waterfall)` toggle is gone (2026-09-05). P
 **Live pipeline.** While visualization runs, `core/seabed_imager.py` builds a
 waterfall-domain image every `seabed.stride` pings covering the last `seabed.rows`
 pings (defaults 128/256 = 50 % overlap; see ARCHITECTURE §2.16 for the
-justification). Each image goes through the analyzer — currently
-`dummy_center_analyzer`, which "detects" the image center; **replace that one
-function with the real model**, keeping its contract: `SeabedImage -> [ {pixel:
-[row, col], world: [x, y], class_name, confidence} ]`. Detections appear on the map
-and the analysis is published on `topics.seabed_analysis`
-(default `/sss_ai/seabed_analysis`, `std_msgs/String`, JSON):
+justification). **Since 2026-10-16 the GCS detects nothing itself: its one
+detection source is BlueBoat-Perception** (superproject module). Every image —
+recording or not — is published for it (`core/perception_bridge.py`, one dedicated
+publish thread): `topics.seabed_image` (`sensor_msgs/Image` 32FC1, the raw float dB),
+`topics.seabed_image_png` (mono8, the PNG) and `topics.seabed_image_meta`
+(`std_msgs/String`, the JSON envelope around `SeabedImage.metadata()`), keyed
+`"<stream_id>/<image_id>"`, RELIABLE / KEEP_LAST 32 (contract:
+`BlueBoat-Perception/docs/topics.md`). Perception's detections come back on
+`/sss_ai/detections` (§3.2). The in-process `dummy_center_analyzer` is gone (the dummy
+now lives in Perception, reproducing it exactly — `tests/test_perception_golden.py`), so a
+detection can never be drawn twice. The analysis is still published on
+`topics.seabed_analysis` (default `/sss_ai/seabed_analysis`, `std_msgs/String`, JSON),
+with `detections` always `[]`:
 
 ```json
-{"schema": 1,
+{"schema": 5,
  "image": {"image_id": 12, "t_start_s": ..., "t_end_s": ...,
            "rows": 256, "cols": 800,
            "png_path": ".../seabed_00012.png",         // null if not recording
            "metadata_path": ".../metadata/seabed_00012.json",
            "boat": {"mean_speed_mps": ..., "mean_altitude_m": ...,
                      "start_pose": [x,y,yaw], "end_pose": [x,y,yaw]}},
- "detections": [{"pixel": [128, 400], "world": [x, y],
-                  "class_name": "dummy_center", "confidence": 0.5}]}
+ "detections": []}
 ```
 
-Never the pixels — only metadata + analysis. Rationale for JSON-over-String: the
+(`schema` follows the picture metadata's `SCHEMA_VERSION`: 4 until 2026-10-16, 5 since;
+`t_start_s` is the **newest** row's time.) Never the pixels — only metadata. Rationale for JSON-over-String: the
 detector contract is still moving; a schema-versioned JSON needs no interface-package
 release. Once frozen, promote it 1:1 to `blueboat_interfaces/SeabedAnalysis.msg`.
 
@@ -201,19 +208,28 @@ since 2026-09-15, `row_gain_db`, the per-row/per-side receive-gain offset the di
 model removed; the JSON's `rows_data` carries the same as `gain_port_db` /
 `gain_stbd_db`). A YOLO
 bbox center `(row, col)` maps to the world with one lookup:
-`world = (world_x[row, col], world_y[row, col])`.
+`world = (world_x[row, col], world_y[row, col])`. **Schema 5 (2026-10-16)** adds
+`stream_id` (new at every START), `georef` — the grids are now **convention 2**,
+`y = ±(0.285 + sqrt(max(s² − bottom_m², 0)))` (the processor's own geometry: tracked
+bottom + transducer lever arm), where schema ≤ 4 pictures used convention 1
+(`altitude_m`, no lever) and stay valid as written — and per row `roll_rad`,
+`pitch_rad`, `yaw_rate_rad_s`, `attitude_age_s` (from `/mavros/imu/data`, `null` when
+unknown; metadata only, never geometry) and `port_ping_number` / `stbd_ping_number`.
 
 **Truncated tail & waterfall markers.** The imager's `flush()` (Record OFF, STOP,
 end of every offline pass) emits one final image with the resting pings (< 256 rows)
 so no data is wasted; a mission shorter than one window yields a single truncated
-image. Every detection is timestamped with its pixel row's ping time and therefore
-also appears as a marker on the exact ping line in the waterfall view (live and in
-replay); markers scroll out with the ring buffer.
+image. Every Perception detection carries its pixel row's time in its own
+`header.stamp` and therefore also appears as a marker on the exact ping line in the
+waterfall view (live, and in replay through Run AI); markers scroll out with the ring
+buffer.
 
 **Datasets from logs.** The replay window's "Save pictures from the log" runs the
 identical imager over every ping of the loaded .svlog and writes
 `seabed_images_<logname>/` (+ inner `metadata/`) next to the log file — raw
-to-be-annotated images, no analyzer.
+to-be-annotated images. **Run AI** runs BlueBoat-Perception's core in-process over the
+same pictures (`core/perception_core.py`: the installed package, else the superproject
+checkout; without either it says so and draws nothing).
 
 ### 3.1ter SVLOG replay window (new)
 
@@ -367,24 +383,25 @@ in the sea trials cost 4x coarser sampling, half the ping rate, a 3x longer puls
 broke bottom detection outright. `launch/SSS_processing_launch.py` now defaults to
 20 m.
 
-### 3.2 AI detections — `ros/detections_listener.py` (placeholder)
-* Expected topic: `topics.detections` (default `/sss_ai/detections`)
-* Expected type: `vision_msgs/Detection2DArray` with, per detection:
-  `results[0].hypothesis.class_id` (class name), `.score` (confidence),
+### 3.2 AI detections — `ros/detections_listener.py` (BlueBoat-Perception)
+* Topic: `topics.detections` (default `/sss_ai/detections`), produced by
+  BlueBoat-Perception — the station's **one** detection source since 2026-10-16.
+* Type: `vision_msgs/Detection2DArray`, one array per seabed image (possibly empty),
+  per detection: `results[0].hypothesis.class_id` (class name), `.score` (confidence),
   `bbox.center.position.x/.y` = object position **in the local odom frame** [m],
-  `bbox.size_x` = extent [m], `detections[i].id` = **stable uid** — republishing the
-  same id after a revisit *updates* the marker and does not double-count it in the
-  summary.
-* Rate: event-driven. `vision_msgs` import is guarded; if the detection repo settles on
-  a custom message, edit `_msg_to_detections()` only.
+  `bbox.size_x` = extent [m], `detections[i].id` = **stable uid** (`2000000 +
+  16·image_id + k`) — republishing the same id after a revisit *updates* the marker and
+  does not double-count it in the summary. `detections[i].header.stamp`, when non-zero,
+  is the detection's row time and places its waterfall marker (additive, 2026-10-16; a
+  zero stamp keeps the array's).
+* Everything the station shows of a detection — map marker, waterfall marker, left-panel
+  summary, the session's `detections/detections.csv` — comes from here. `vision_msgs` is
+  guarded; the no-ROS `--sim` bench simulator still draws its own synthetic markers.
 
-### 3.3 Future AI pipeline placement
-The plan in `info.md` (feed local map patches to the detector) fits naturally as a
-separate node subscribing to `/sss_processor/processed` (or to saved mosaic tiles) and
-publishing `Detection2DArray` — the GUI needs no change. If you prefer in-process
-inference inside the GCS, add a `core/detector_service.py` consuming
-`signals.sonar_ping` and emitting `signals.detection`; the bus makes both options
-equivalent from the GUI's perspective.
+### 3.3 AI pipeline placement (decided 2026-10-16)
+The detector is BlueBoat-Perception, a separate module and node fed the seabed
+**pictures + metadata** (§3.1bis), never ping streams or mosaic patches (CM-10). Its
+offline CLI runs the same core over a recorded session's `seabed_images/`.
 
 ## 4. Other integration notes
 
@@ -396,9 +413,11 @@ equivalent from the GUI's perspective.
   and `launch/SSS_simple_launch.py` (acquisition only, for running the driver by hand).
   Both are installed by `install(DIRECTORY launch ...)` in `CMakeLists.txt`. The
   matplotlib listener node is gone; this app replaces it.
-* **Transducer offsets**: still `TODO = 0.0` in `sss_processor_node.py` — measure and
-  fill before localization-accuracy experiments (C3); the GUI displays whatever the
-  processor publishes.
+* **Transducer offsets**: since `994a74b` (2026-10-13) `sss_processor_node.py` uses
+  `TRANSDUCER_Y_OFFSET_PORT/STBD_M = 0.285` (BR-101447 hull spacing / 2) and
+  `TRANSDUCER_SUBMERSION_M = 0.15` (an estimate), mirrored in `core/svlog.py`; the
+  fore/aft offset is still 0.0 (unmeasured). The seabed pictures, the waterfall clicks
+  and the detection overlay use the same lever arm since 2026-10-16 (georef convention 2).
 * **Tile cache**: browse the experiment area once with internet (dock Wi-Fi); tiles are
   cached in `~/.cache/blueboat_gcs/tiles` and work offline at sea. Respect OSM/Esri
   usage terms for anything beyond research use.

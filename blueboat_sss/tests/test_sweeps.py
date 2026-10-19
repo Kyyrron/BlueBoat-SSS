@@ -18,7 +18,10 @@ from conftest import GCS_ROOT, PKG_PARENT, gcs_files, gcs_modules
 # Recorded counts. If either moves, update CLAUDE.md in the same commit
 # rather than loosening the assertion — the number *is* the regression
 # signal.
-EXPECTED_FILE_COUNT = 65        # 2026-09-28: +ros/sonar_source.py (the toolbar's
+EXPECTED_FILE_COUNT = 68        # 2026-10-16: +core/perception_bridge.py,
+                                # +core/perception_core.py (BlueBoat-Perception,
+                                # the one detection source), +utils/attitude.py
+                                # (Q8 image metadata). 2026-09-28: +ros/sonar_source.py (the toolbar's
                                 # Sonar: Simulation / Real selector and its
                                 # double-driver guard). 2026-09-18:
                                 # +core/deployed_path.py (the planned
@@ -28,8 +31,8 @@ EXPECTED_FILE_COUNT = 65        # 2026-09-28: +ros/sonar_source.py (the toolbar'
                                 # +core/along_track.py; 2026-09-05:
                                 # +core/display_model.py, +core/live_native.py,
                                 # +analysis/check_dois.py, -core/contrast.py
-EXPECTED_ROS_FREE_IMPORTABLE = 61   # sonar_source.py and deployed_path.py need
-                                    # no ROS
+EXPECTED_ROS_FREE_IMPORTABLE = 64   # sonar_source.py, deployed_path.py and the
+                                    # three 2026-10-16 modules need no ROS
 
 # The modules that legitimately cannot import without ROS: exactly the
 # four ros/ listeners that take `from rclpy.node import Node` at module

@@ -315,6 +315,10 @@ class SonarListener:
             # estimate covers the whole swath.
             sides=("both" if (pn and spn) else ("port" if pn else "starboard")),
             gap_before=gap_before,
+            # The device ping numbers of the two halves (0 = absent), for
+            # the seabed-image metadata (joins rows to per-ping records).
+            port_ping_number=pn,
+            stbd_ping_number=spn,
         )
         fields = ProcessedFields(port_pn=pn, stbd_pn=spn, water_depth=depth,
                                  port_y=py, port_db=pi, stbd_y=sy, stbd_db=si)

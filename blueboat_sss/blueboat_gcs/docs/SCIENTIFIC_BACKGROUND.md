@@ -73,12 +73,23 @@ backscattering strength `BS(θ)` at grazing angle `θ = asin(h/r)`, the insonifi
 2. **Time-varying gain (TVG).** Analogue sonars compensate the deterministic part of
    the falloff in the receiver with a gain increasing with time-since-transmit —
    conventionally "20 log R" (extended targets) or "40 log R" (point targets) plus
-   `2αR` (Lurton 2010, ch. 6). The Omniscan 450 stream is **not** TVG-compensated: the
-   vendor documentation describes no such gain, `pwr_results` are documented only as
-   "power results scaled from min_pwr_db to max_pwr_db … normally converted back to linear
-   power or signal levels" (Cerulean, Omniscan API), and the falloff measured on the field
-   logs is the full physical one (§8). The simulator reproduces this deliberately
-   (`tvg_compensation: 0`, matched to the corpus).
+   `2αR` (Lurton 2010, ch. 6). Whether the Omniscan 450 stream carries a partial TVG is
+   **not established** (re-examined 2026-10-16, BlueBoat-Perception
+   `PREPROCESSING_STUDY.md` §1.4). This document's earlier reading was "not
+   TVG-compensated": the vendor documentation describes no such gain, `pwr_results`
+   are documented only as "power results scaled from min_pwr_db to max_pwr_db …
+   normally converted back to linear power or signal levels" (Cerulean, Omniscan API),
+   neither the driver's parameters nor the profile message carry a TVG setting, and
+   the falloff measured on the field logs is large (§8; the median seabed level of
+   the beach sets falls ~44 dB per decade of slant range between 2.4 and 17.6 m).
+   The simulator, recalibrated on 2026-09-18 on two altitudes at once, models
+   `tvg_compensation: 0.30`. **It was 0 before; this file said 0 until 2026-10-16,
+   which was stale.** Its own documentation records that only the product
+   `spreading_exponent · (1 − tvg_compensation)` is determined by the fit
+   (`sonar_model.md` §6). So both readings describe the same measured falloff, and
+   the device's own TVG fraction cannot be identified from its output. The display
+   model below is robust to either reading: its empirical curve `A` absorbs whatever
+   range dependence `TL` leaves.
 
 The data-driven correction of the residual (beam pattern, grazing angle, sediment) is
 the **empirical gain normalisation** (EGN) family: estimate the mean echo as a function

@@ -37,10 +37,26 @@ from collections import deque
 from typing import Deque, Optional, Tuple
 
 
+#: Defaults of ``config.along_track`` (``config/settings.py``
+#: ``AlongTrackConfig``), used only when a config carries no block.
+#: ``window_s`` 2.0 since 2026-10-16 (was 5.0).
+DEFAULT_WINDOW_S = 2.0
+DEFAULT_PAIR_S = 1.0
+
+
 class AlongTrackEstimator:
     """Ground speed, ping period and cumulative along-track from ping poses."""
 
-    def __init__(self, window_s: float = 5.0, pair_s: float = 1.0) -> None:
+    @classmethod
+    def from_config(cls, config) -> "AlongTrackEstimator":
+        """The estimator of ``config.along_track`` -- the one place the
+        waterfall and the seabed imager read their window from."""
+        at = getattr(config, "along_track", None)
+        return cls(window_s=float(getattr(at, "window_s", DEFAULT_WINDOW_S)),
+                   pair_s=float(getattr(at, "pair_s", DEFAULT_PAIR_S)))
+
+    def __init__(self, window_s: float = DEFAULT_WINDOW_S,
+                 pair_s: float = DEFAULT_PAIR_S) -> None:
         self._window_s = max(float(window_s), 1e-3)
         self._pair_s = max(min(float(pair_s), self._window_s), 1e-3)
         self._samples: Deque[Tuple[float, float, float]] = deque()
@@ -108,6 +124,11 @@ class AlongTrackEstimator:
         n = len(v)
         mid = n // 2
         return float(v[mid] if n % 2 else 0.5 * (v[mid - 1] + v[mid]))
+
+    @property
+    def window_s(self) -> float:
+        """The median window [s] (``config.along_track.window_s``)."""
+        return self._window_s
 
     @property
     def speed_mps(self) -> float:

@@ -167,7 +167,90 @@ than the same data on replay. Root cause and fixes, all O(1) per ping:
 
 ---
 
+## BlueBoat-Perception integration (2026-10-16, by the owner's order)
+
+What changed and what is pinned unchanged: `blueboat_gcs/docs/PERCEPTION_INTEGRATION.md`.
+
+- [x] **Baseline repair after `994a74b` (labelled, no behaviour change).** The gate was
+      red before any edit: 298 pass / **4 fail** / 50 skip. All four were stale
+      expectations written before `994a74b` set `TRANSDUCER_SUBMERSION_M = 0.15` and the
+      0.285 m lateral offsets; each was updated to the committed constants:
+      `test_live_native::test_attach_hit_is_the_verbatim_profile_bins` (bottom =
+      water_depth − 0.15), `test_nadir_blanking::test_off_mode_blanks_the_ringing_and_keeps_the_water_column`
+      (ground ranges measured from the transducer, i.e. minus the lever),
+      `test_processor_assembly::test_unlocked_altitude_is_an_identity_transform_not_a_guess`
+      (water_depth = the submersion, y = lever + slant) and
+      `test_seabed_pictures::test_live_and_replay_pings_give_identical_pictures` (both
+      rows given water_depth = altitude + 0.15). Gate after the repair: 302 / 0 / 50.
+- [x] **One detection source: Perception.** The in-process `dummy_center_analyzer`, the
+      imager's `analyzer` argument and `generate_from_pings(run_analyzer=…)` are gone;
+      `/sss_ai/seabed_analysis` keeps publishing with `detections: []`; Run AI uses
+      Perception's core. Golden: `tests/test_perception_golden.py` over
+      `tests/fixtures/perception_golden.json` (captured from the unmodified code).
+- [x] **Bug fix: the profile-miss fallback ignored the lever arm** (same root cause as
+      the four stale tests). `core/live_native.attach_native` now inverts with the
+      processor's altitude and lever; `tests/test_fallback_lever_arm.py` shows the row
+      position before (bin 83, far end 20.16 m) and after (bin 72, 20.0 m).
+- [ ] **The live listener's configured-range estimate ignores the lever arm.**
+      `ros/sonar_listener.py` recovers `slant_range_m = hypot(max|y_local|, water_depth)`;
+      since `994a74b` `max|y| = 0.285 + sqrt(R² − h²)` and `water_depth = h + 0.15`, so the
+      estimate is slightly long (+0.29 m at R = 20 m, h = 1.2 m). **Latent:** no GCS code
+      reads `SonarPing.slant_range_m` today (grep 2026-10-16; the waterfall and the
+      pictures use the native bins' own pitch and extent). Not changed here (not
+      ordered); fix with the inverse the fallback now uses before anything reads it.
+- [ ] **`native_bins`' reconstruction from `y_local` uses no lever arm**
+      (`models/sonar.py`, the path for a ping carrying no native payload — the bench
+      simulator, synthetic pings; live rows always get one from `attach_native`).
+      Exact for a producer projecting with no lever; wrong by the lever for one that
+      does. Check which producers still reach it.
+- [ ] **Station uids repeat across streams.** Both the old in-process range
+      (`1_000_000 + 16·image_id + k`) and Perception's (`2_000_000 + …`) restart with
+      `image_id` at every START, so a new stream's markers replace the previous stream's
+      on the map (`DetectionLayer.upsert` by uid). Behaviour kept as it was; a stream-
+      aware uid needs a contract change on both sides.
+- [x] **Along-track speed window 5 s → 2 s** (2026-10-16, BlueBoat-Perception decision
+      6.3): `config.along_track.window_s`, read in one place
+      (`AlongTrackEstimator.from_config`, used by the waterfall and the imager).
+      Per-picture along-track scale p5–p95 0.88–1.10 → 0.94–1.07 (real), 0.86–1.14 →
+      0.97–1.07 (sim), no added row jitter (Perception `PREPROCESSING_STUDY.md` §5 M2,
+      M2b). `tests/test_along_track.py`; the Perception golden pins the 5 s it was
+      captured with. **Open:** 1 s measured "not worse" but unvalidated on real data
+      (the reference is the autopilot's EKF pose) — check against RTK / USBL.
+- [ ] **TVG of the device: not identifiable from its output** (2026-10-16). The GCS's
+      "pre-TVG" reading and the simulator's `tvg_compensation: 0.30` describe the same
+      falloff (only `spreading · (1 − tvg)` is fitted). `docs/SCIENTIFIC_BACKGROUND.md`
+      §2 now says so (it claimed the simulator used 0). Settling it needs the vendor's
+      receiver documentation or a calibrated target at known ranges.
+- [ ] **Live and offline pictures differ in the first 0.75 m of slant range** (NaN live
+      from `attach_native`'s nadir blank, full dB offline). Perception treats NaN as "no
+      sample"; a detector trained offline sees the ringing there, one run live does not.
+      Perception's `near_range_mask_m: 0.75` (its decision 6.5) blanks the same span in the
+      detector input, making the two equal; its default stays 0.0 until a detector
+      comparison decides (Perception `PREPROCESSING_STUDY.md` §6.5).
+- [ ] **Bin convention: the GCS and the simulator differ by 0.08 %** (found 2026-10-16
+      by BlueBoat-Perception's dataset labels).
+      - `models/sonar.native_from_profile` puts sample i at `start + i·L/(N − 1)`.
+      - The simulator renders bin k over `[k·L/N, (k + 1)·L/N)`, centre `(k + 0.5)·L/N`
+        (`sss_sim_node._watercolumn_mask`).
+      - The seabed pictures' georeferencing therefore scales slant by `N/(N − 1)`: 1.7 cm
+        at 20 m with 1200 bins, under one bin.
+      - Which convention the real Omniscan follows is not documented here.
+      - Perception's labels use the simulator's. Not changed: not ordered.
+- [ ] **`t_start_s` is the newest row's time** (row 0 = newest). Correct and documented
+      now, but the name reads as "start"; consumers must not take it as the oldest.
+
+---
+
 ## Code/doc drift found in the tree
+
+- [ ] **`docs/SCIENTIFIC_BACKGROUND.md` §2 says the simulator runs `tvg_compensation: 0`**;
+      it is 0.30 since 2026-09-18 (the simulator's `docs/sonar_model.md` §3), and §4's
+      "causally smoothed altitude" is not in the code. Found 2026-10-16, not changed.
+- [x] **Stale statements fixed 2026-10-16:** the transducer constants "all 0.0"
+      (`CLAUDE.md`, HANDOVER §4: 0.285 / 0.15 since `994a74b`); the live display model
+      "freezes after the warm-up" (GCS `CLAUDE.md`: re-published every 300 rows since
+      2026-09-19); the analysis payload "schema 1" (GCS `CLAUDE.md`, HANDOVER §3.1bis: it
+      follows the picture metadata, 4 then 5).
 
 - [x] **`with_acquisition:=True` can never start the acquisition node.** **Fixed
       2026-09-15:** nested launch-time groups (`sl.group(unless_arg='will_use_rosbag')`

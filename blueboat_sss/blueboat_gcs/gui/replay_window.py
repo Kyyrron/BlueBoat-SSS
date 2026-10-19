@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (QDockWidget, QHBoxLayout, QLabel, QMainWindow,
 from ..config.settings import AppConfig
 from ..core.geo_service import GeoService
 from ..core.mosaic_service import MosaicService
-from ..core.seabed_imager import (generate_from_pings,
+from ..core.seabed_imager import (LEVER_ARM_M, generate_from_pings,
                                   waterfall_pixel_to_world)
 from ..utils.geodesy import format_latlon
 from ..core.signals import AppSignals
@@ -210,8 +210,9 @@ class ReplayWindow(QMainWindow):
         self._ai_btn = QPushButton("Run AI")
         self._ai_btn.setToolTip(
             "Recreate every seabed picture from this log (256-row windows,\n"
-            "50 % overlap, plus the truncated tail) and run the detection\n"
-            "function on each; detections appear on the map and in the\n"
+            "50 % overlap, plus the truncated tail) and run\n"
+            "BlueBoat-Perception's detector on each (in-process, the same\n"
+            "core as live); detections appear on the map and in the\n"
             "waterfall view, exactly as in the live window.")
         self._save_btn = QPushButton("Save pictures from the log")
         self._save_btn.setToolTip(
@@ -360,10 +361,11 @@ class ReplayWindow(QMainWindow):
                 "No position for that waterfall point (session gap row).",
                 6000)
             return
-        _t, rx, ry, yaw, depth = meta
+        # Georef convention 2, as the seabed pictures (row_georef).
+        rx, ry, yaw, bottom = self.waterfall_service.row_georef(row)
         wx, wy = waterfall_pixel_to_world(
-            rx, ry, yaw, depth, self.waterfall_service.pitch_m,
-            float(col), self.waterfall_service.columns)
+            rx, ry, yaw, bottom, self.waterfall_service.pitch_m,
+            float(col), self.waterfall_service.columns, *LEVER_ARM_M)
         wx, wy = float(wx), float(wy)
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(
@@ -462,14 +464,21 @@ class ReplayWindow(QMainWindow):
 
     # ------------------------------------------------------------- Run AI --
     def _run_ai(self) -> None:
-        """Recreate every seabed picture from the log, run the detection
-        function on each, and display the results exactly as live: markers
-        on the map's DetectionLayer and on the waterfall overlay. The
-        window is blocked by a modal progress bar while it runs."""
+        """Recreate every seabed picture from the log, run
+        BlueBoat-Perception's core on each (the station's one detection
+        source, in-process: ``core/perception_core.py``), and display the
+        results exactly as live: markers on the map's DetectionLayer and on
+        the waterfall overlay. The window is blocked by a modal progress
+        bar while it runs."""
+        from ..core import perception_core
         from ..core.seabed_imager import SeabedImager, feed_pings
         from ..models.detection import Detection
 
-        imager = SeabedImager(self._config, model=self.display_model)  # dummy analyzer
+        core, source = perception_core.load()
+        if core is None:
+            self.statusBar().showMessage(f"Run AI: {source}.", 15000)
+            return
+        imager = SeabedImager(self._config, model=self.display_model)
         results: list = []
         imager.image_ready.connect(results.append)
 
@@ -491,17 +500,17 @@ class ReplayWindow(QMainWindow):
         self.detection_layer.clear()
         self.waterfall_service.clear_detections()
         n_det = 0
-        for image in results:
-            for k, det in enumerate(image.detections):
-                t_row = float(det.get("t_s", image.row_t[-1]))
+        for _image, _record, dets in perception_core.detect(results, core):
+            for det in dets or []:
+                x, y = (float(v) for v in det["world_xy"])
+                t_row = float(det["t_row_s"])
                 self.detection_layer.upsert(Detection(
-                    uid=1_000_000 + image.image_id * 16 + k, t=t_row,
-                    x=float(det["world"][0]), y=float(det["world"][1]),
+                    uid=int(det["uid"]), t=t_row, x=x, y=y,
                     class_name=det["class_name"],
-                    confidence=float(det["confidence"]), extent_m=1.0))
-                self.waterfall_service.add_detection(
-                    t_row, float(det["world"][0]), float(det["world"][1]),
-                    det["class_name"])
+                    confidence=float(det["confidence"]),
+                    extent_m=max(float(det["extent_m"][0]), 0.5)))
+                self.waterfall_service.add_detection(t_row, x, y,
+                                                     det["class_name"])
                 n_det += 1
         self.detection_layer.set_visible(True)
         # Refresh the waterfall overlay against the freshly rendered buffer.
