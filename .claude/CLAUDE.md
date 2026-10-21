@@ -145,11 +145,13 @@ Sonar and odom subscriptions use `BEST_EFFORT`, `KEEP_LAST`, **depth 10**. **VER
 
 `ProcessedSSSPing` fields: `BlueBoat-Control/blueboat_interfaces/msg/ProcessedSSSPing.msg`.
 
-The sign of `*_y` encodes the side: **+y = port, −y = starboard**, and it is the sign
-that is authoritative, not the field name — the `port_*` fields carry whichever message
-arrived on the port topic, whose own `channel_number` may say starboard, in which case
-its `port_y` is negative. Consumers merge on the sign (the GCS concatenates both fields
-and reads only that). Samples are already slant-range corrected and the water column is
+The sign of `*_y` encodes the side: **+y = port, −y = starboard**. Rows are keyed by the
+side resolved from the packet (`_accept` → `_channel_of`, NC #1; the arrival topic only when
+the packet resolves nothing), so the `port_*` fields carry the packet's port ping and
+`port_y` is never negative, whichever topic delivered it (`_side_geometry`; verified
+2026-10-19). The topic-routed behaviour this paragraph once described predates the
+packet-based routing. Consumers still merge on the sign (the GCS concatenates both fields
+and reads only that), which stays correct either way. Samples are already slant-range corrected and the water column is
 already removed.
 
 **One-sided rows.** A row carries whichever sides arrived. The absent side has
