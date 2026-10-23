@@ -7,7 +7,7 @@ Captured sources (the operator never needs an external terminal):
   shows everything), and each completed line is also emitted on
   ``signals.log_line``;
 * the Python ``logging`` module (root handler);
-* ROS 2 log messages from **all** nodes — captured via a ``/rosout``
+* ROS 2 log messages from the SSS nodes only (sonar driver, processor) — via a ``/rosout``
   subscription in ``ros/ros_manager.py`` (this is how messages from
   ``sss_processor_node`` reach the console even though it is a separate
   process);

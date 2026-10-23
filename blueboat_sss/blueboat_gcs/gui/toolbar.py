@@ -92,8 +92,9 @@ class AcquisitionToolbar(QToolBar):
         self._console_btn = QPushButton("Console")
         self._console_btn.setCheckable(True)
         self._console_btn.setToolTip(
-            "Embedded application console: Python prints, app logs,\n"
-            "ROS 2 /rosout, and the sss_processor_node output.")
+            "Embedded SSS console: sonar driver and sss_processor output,\n"
+            "connection state, acquisition parameters and GCS warnings.\n"
+            "Control / navigation nodes are in the Mission Control Station.")
         self._console_btn.toggled.connect(self.console_toggled)
         self.addWidget(self._console_btn)
 

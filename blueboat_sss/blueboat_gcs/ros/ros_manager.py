@@ -31,6 +31,16 @@ except ImportError:  # pragma: no cover
     ROS_AVAILABLE = False
 
 
+#: /rosout logger names (and their dotted sub-loggers) shown in the console.
+SSS_LOGGERS = ("side_scan_sonar", "sss_processor")
+
+
+def is_sss_logger(name: str) -> bool:
+    """True for a /rosout logger that belongs to the SSS module."""
+    name = (name or "").lstrip("/")
+    return any(name == n or name.startswith(n + ".") for n in SSS_LOGGERS)
+
+
 class RosManager:
     """Starts/stops rclpy, hosts the app node, exposes control publishers."""
 
@@ -115,12 +125,13 @@ class RosManager:
             self._node.create_publisher(String, t.seabed_image_meta, qos))
 
     def _subscribe_rosout(self) -> None:
-        """ROS 2 log messages from ALL nodes -> embedded console.
+        """ROS 2 log messages of the SSS module -> embedded console.
 
-        /rosout (rcl_interfaces/Log) carries every node's logger output,
-        including sss_processor_node's — so the operator sees ROS logs
-        without an external terminal. Our own node is filtered out to
-        avoid duplicating lines already captured by the logging bus.
+        /rosout (rcl_interfaces/Log) carries every node's logger output;
+        only the sonar driver (``side_scan_sonar``, real or simulated) and
+        ``sss_processor`` — with their sub-loggers — are forwarded. Control
+        and navigation nodes (master_control, robot_interface, mavros, …)
+        belong to the Mission Control Station, never to this console.
         """
         try:
             from rcl_interfaces.msg import Log
@@ -130,7 +141,7 @@ class RosManager:
                    40: "ERROR", 50: "FATAL"}
 
         def on_log(msg: "Log") -> None:
-            if msg.name == "blueboat_gcs":
+            if not is_sss_logger(msg.name):
                 return
             level = _LEVELS.get(int(msg.level), str(msg.level))
             self._signals.log_line.emit(

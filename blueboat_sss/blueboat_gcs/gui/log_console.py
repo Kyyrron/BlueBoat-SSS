@@ -1,7 +1,7 @@
 """Embedded application console (bottom dock).
 
 One place for everything textual: Python prints, application logging,
-/rosout messages from every ROS 2 node (including ``sss_processor_node``)
+/rosout messages of the SSS nodes only (``side_scan_sonar``, ``sss_processor``)
 and the raw output of the launch subprocess. The dock starts collapsed
 to a one-line status strip; the toolbar "Console" button (or dragging
 the dock splitter) expands it.

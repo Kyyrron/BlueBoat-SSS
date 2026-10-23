@@ -529,10 +529,6 @@ class MainWindow(QMainWindow):
             ros.publish_seabed_analysis(payload)
             self._perception_pool.start(
                 _PerceptionPublishJob(ros, image, png_path, meta_path))
-        self.console.append_line(
-            "app", f"seabed image {image.stream_id}/{image.image_id} "
-                   + ("published for Perception" if ros is not None
-                      else "(no ROS: not published)"))
 
     def _on_open_svlog(self) -> None:
         from .replay_window import open_svlog_dialog

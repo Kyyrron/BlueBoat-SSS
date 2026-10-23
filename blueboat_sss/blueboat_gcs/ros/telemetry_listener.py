@@ -62,7 +62,6 @@ class TelemetryListener:
         self._lock = threading.Lock()
         self._lat: Optional[float] = None
         self._lon: Optional[float] = None
-        self._navsat_accept_logged = False
         self._navsat_reject_logged = False
         self._compass_deg: Optional[float] = None
         self._speed: Optional[float] = None
@@ -113,11 +112,6 @@ class TelemetryListener:
                     "app", f"GPS: NavSatFix rejected ({reason}) — fixes are "
                            "arriving but do not pass the acceptance gate.")
             return
-        if not self._navsat_accept_logged:
-            self._navsat_accept_logged = True
-            self._signals.log_line.emit(
-                "app", f"GPS: first fix accepted at {msg.latitude:.6f}, "
-                       f"{msg.longitude:.6f} (status {msg.status.status}).")
         with self._lock:
             self._lat, self._lon = float(msg.latitude), float(msg.longitude)
         # GeoService pairing stream: GPS rate, wall-clocked (sim time or
