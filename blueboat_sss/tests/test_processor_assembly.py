@@ -26,8 +26,11 @@ data (NC #6 / CM-7).
 from __future__ import annotations
 
 import importlib.util
+import json
+import math
 import struct
 import sys
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -673,3 +676,223 @@ def test_odom_buffer_prunes_stale_samples_at_lookup():
     buf.push(make_odom(60_000_000_000, x=7.0))
     odom = buf.nearest(60_100_000_000)
     assert odom is not None and odom.pose.pose.position.x == 7.0
+
+
+def test_odom_buffer_keys_a_zero_stamp_on_arrival():
+    """Real-robot launch: mavros has use_sim_time and no /clock, so
+    /blueboat/odom is stamped 0 while the profiles carry wall time. Keyed
+    on 0 the sample was pruned by the first lookup and every ping dropped."""
+    wall = 1_793_080_445_000_000_000
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(0, x=4.0), arrival_ns=wall)
+    assert buf.zero_stamped == 1 and buf.pushed == 1
+    odom = buf.nearest(wall + 200_000_000)
+    assert odom is not None and odom.pose.pose.position.x == 4.0
+
+
+def test_odom_buffer_zero_stamp_without_arrival_is_unchanged():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(0))
+    assert buf.nearest(1_793_080_445_000_000_000) is None
+    assert not buf.has_data() and buf.pushed == 1
+
+
+def test_zero_stamped_odom_places_pings_on_the_node(node):
+    """End to end: a zero-stamped odom stream must not drop wall-stamped pings."""
+    t0 = 1_793_080_445_000_000_000
+    node._odom_buf = proc._OdomBuffer(int(5e9))
+    for i in range(70):
+        node._odom_buf.push(make_odom(0, x=float(i)), arrival_ns=t0 + i * PING_PERIOD_NS)
+    node._on_port(make_profile(0, 1, t0 + 10 * PING_PERIOD_NS))
+    node._on_starboard(make_profile(1, 1, t0 + 10 * PING_PERIOD_NS))
+    node._flush_pending(drain_all=True)
+    assert node._dropped_no_odom == 0
+    assert len(node.published) == 1
+
+
+# ---------------------------------------------------------------------------
+# Pose interpolation (odom at 4 Hz / ~13 Hz under 20 Hz pings)
+# ---------------------------------------------------------------------------
+def _odom_yaw(stamp_ns, x, yaw):
+    o = make_odom(stamp_ns, x=x)
+    o.pose.pose.orientation.z = math.sin(yaw / 2)
+    o.pose.pose.orientation.w = math.cos(yaw / 2)
+    return o
+
+
+def test_pose_at_interpolates_between_the_bracketing_samples():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(_odom_yaw(10_000_000_000, 0.0, 0.0))
+    buf.push(_odom_yaw(10_250_000_000, 1.0, math.pi / 2))
+    p = buf.pose_at(10_062_500_000)                    # a quarter of the way
+    assert p.pose.pose.position.x == pytest.approx(0.25)
+    q = p.pose.pose.orientation
+    assert 2 * math.atan2(q.z, q.w) == pytest.approx(math.pi / 8, abs=0.02)
+    # nearest() is untouched: it still snaps.
+    assert buf.nearest(10_062_500_000).pose.pose.position.x == 0.0
+
+
+def test_pose_at_crosses_the_yaw_wrap_on_the_short_arc():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(_odom_yaw(0, 0.0, math.radians(179)))
+    buf.push(_odom_yaw(100_000_000, 0.0, math.radians(-179)))
+    q = buf.pose_at(50_000_000).pose.pose.orientation
+    yaw = math.degrees(2 * math.atan2(q.z, q.w))
+    assert abs(abs(yaw) - 180.0) < 0.5                 # not through 0
+
+
+def test_pose_at_falls_back_to_nearest_and_keeps_the_refusal():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000, x=3.0))
+    assert buf.pose_at(10_400_000_000).pose.pose.position.x == 3.0
+    assert buf.pose_at(12_000_000_000) is None
+    assert buf.last_refused_dt_ns == 2_000_000_000
+
+
+# ---------------------------------------------------------------------------
+# SonarView parity: time_boot_ms, mavlink envelopes, header, rates
+# ---------------------------------------------------------------------------
+def test_burst_clock_groups_arrivals_like_one_autopilot_burst():
+    clock = proc._BurstClock(window_ns=5_000_000)
+    a = clock.burst_ns(1_000_000_000)
+    assert clock.burst_ns(1_003_000_000) == a          # same burst
+    b = clock.burst_ns(1_080_000_000)                  # next burst, ~13 Hz later
+    assert b == 1_080_000_000 and b != a
+
+
+def test_zero_stamped_mavros_no_longer_freezes_time_boot_ms(node):
+    """Every 2026-10-27 field .svlog carried one time_boot_ms (4288904828)
+    on all its poses: mavros stamps 0 on the real launch."""
+    zero = proc.TimeMsg()
+    first = node._time_boot_ms(zero)
+    assert node._time_boot_ms(zero) == first           # same burst
+    time.sleep(0.02)
+    assert node._time_boot_ms(zero) != first           # time moves on
+    stamped = proc.TimeMsg(sec=1_793_080_000, nanosec=0)
+    assert node._time_boot_ms(stamped) == node._time_boot_ms(stamped)
+
+
+def test_heartbeat_and_statustext_take_sonarviews_shape(node):
+    from mavros_msgs.msg import State, StatusText
+    s = State(connected=True, armed=True, guided=False, manual_input=True,
+              mode="AUTO", system_status=4)
+    hb = node._build_heartbeat_envelope(s)["message"]
+    assert hb["type"] == "HEARTBEAT" and hb["custom_mode"] == 10
+    assert hb["base_mode"] == {"bits": 1 | 64 | 128}
+    assert hb["system_status"] == {"type": "MAV_STATE_ACTIVE"}
+    assert hb["mavtype"] == {"type": "MAV_TYPE_SURFACE_BOAT"}
+    st = node._build_statustext_envelope(
+        StatusText(severity=4, text="LinkGuard: no laptop 3 s"))["message"]
+    assert st["severity"] == {"type": "MAV_SEVERITY_WARNING"}
+    assert len(st["text"]) == 50 and "".join(st["text"]).startswith("LinkGuard")
+
+
+def test_svlog_header_is_session_metadata_then_view_config(node):
+    from blueboat_gcs.core.svlog import walk_packets
+    header = node._build_metadata()
+    frames = list(walk_packets(header))
+    assert [f[4] | (f[5] << 8) for f in frames] == [10, 12]
+    assert all((f[6], f[7]) == (0, 0xFF) for f in frames)
+    meta = json.loads(frames[0][8:-2])
+    assert all(d["options"]["doppler_enable"] for d in meta["session_devices"])
+
+
+def test_mavlink_wrapper_is_tagged_and_serialised_as_sonarview_does():
+    from svlog_helper import build_mavlink_wrapper
+    pkt = build_mavlink_wrapper({"message": {"type": "ATTITUDE", "yaw": 1.0},
+                                 "header": {"system_id": 1}})
+    assert (pkt[6], pkt[7]) == (0xFF, 0)
+    body = pkt[8:-2].decode()
+    assert body.startswith('{\n  "header"')            # sorted keys, indent 2
+
+
+class _FakeFuture:
+    def __init__(self):
+        self.callbacks = []
+
+    def add_done_callback(self, cb):
+        self.callbacks.append(cb)
+
+
+class _FakeRateClient:
+    def __init__(self, ready=True):
+        self.ready = ready
+        self.requests = []
+
+    def service_is_ready(self):
+        return self.ready
+
+    def call_async(self, req):
+        self.requests.append((req.message_id, req.message_rate))
+        return _FakeFuture()
+
+
+def test_sonarviews_message_rates_are_requested_while_the_sonar_streams(node):
+    from svlog_helper import DEFAULT_PERIODIC_MESSAGES
+    client = _FakeRateClient()
+    node._rate_client = client
+    node._assert_mavlink_rates()
+    assert client.requests == [], "no sonar stream yet: nothing requested"
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    node._assert_mavlink_rates()
+    assert client.requests == [
+        (e["message_id"], pytest.approx(e["frequency_hz"]))
+        for e in DEFAULT_PERIODIC_MESSAGES]
+    assert (30, 30.0) in client.requests and (33, 30.0) in client.requests
+    node._assert_mavlink_rates()                       # within 30 s: not repeated
+    assert len(client.requests) == len(DEFAULT_PERIODIC_MESSAGES)
+    node._rate_request_mono -= proc.MAVLINK_RATE_REASSERT_S + 1
+    node._assert_mavlink_rates()                       # re-asserted
+    assert len(client.requests) == 2 * len(DEFAULT_PERIODIC_MESSAGES)
+
+
+def test_missing_rate_service_is_skipped_quietly(node):
+    node._rate_client = _FakeRateClient(ready=False)
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    node._assert_mavlink_rates()
+    assert node._rate_client.requests == [] and node._rate_service_missing_logged
+
+
+class _LogCapture:
+    def __init__(self):
+        self.warnings, self.infos = [], []
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+    def info(self, msg):
+        self.infos.append(msg)
+
+
+def test_rate_watchdog_flags_a_4hz_pose_and_a_free_running_sonar(node, monkeypatch):
+    """The 2026-10-27 field logs: 4 Hz pose, 34.5 pings/s at 20 m."""
+    from types import SimpleNamespace
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=True))
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {"ATTITUDE": 40, "GLOBAL_POSITION_INT": 130,
+                          "LOCAL_POSITION_NED": 130}
+    node._watch_pings, node._watch_range_m = [345, 200], 20.0
+    node._check_rates()
+    assert len(log.warnings) == 1
+    assert "ATTITUDE 4.0 Hz" in log.warnings[0] and "port sonar 34.5" in log.warnings[0]
+    assert "starboard" not in log.warnings[0]          # 20 pings/s is SonarView's
+    # Same condition next window: not repeated. Recovery is announced.
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {"ATTITUDE": 40, "GLOBAL_POSITION_INT": 130,
+                          "LOCAL_POSITION_NED": 130}
+    node._watch_pings = [345, 200]
+    node._check_rates()
+    assert len(log.warnings) == 1
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {k: 128 for k in node._watch_counts}
+    node._watch_pings = [200, 200]
+    node._check_rates()
+    assert len(log.warnings) == 1 and "back at SonarView's rates" in log.infos[-1]
+
+
+def test_sonarview_ping_rate_law():
+    assert proc.sonarview_ping_hz(20.0) == pytest.approx(20.0)
+    assert proc.sonarview_ping_hz(35.0) == pytest.approx(20.0, abs=0.1)
+    assert proc.sonarview_ping_hz(95.6) == pytest.approx(1000 / (2000 * 95.6 / 1500 + 3))

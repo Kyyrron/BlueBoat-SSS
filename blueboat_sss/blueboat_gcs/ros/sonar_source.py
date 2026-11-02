@@ -5,7 +5,13 @@ chooses what ``/side_scan_sonar`` will be:
 
 * **Simulation** — the pipeline launch starts ``sss_processor_node`` only;
   ``/side_scan_sonar`` is the simulator's ``sss_sim_node``, started with the
-  Gazebo world (by the Mission Control Station, or by hand).
+  Gazebo world (by the Mission Control Station, or by hand). **A bag replay**
+  (MCS "From a ros2bag", BlueBoat-Control ``bag_replay.py``) starts no sonar
+  by design (owner, 2026-10-27): since 2026-11-02 START starts the simulator
+  itself over the replay's world folder (:func:`find_replay`,
+  :func:`replay_simulator_plan`), so the recorded real motion images the
+  simulated seabed — the documented manual ``sss_sim_launch.py
+  with_mavros_shim:=false auto_ping:=false``, done by the station.
 * **Real** — the same launch with ``with_acquisition:=True`` also starts
   ``sss_node.py``, which drives the two Omniscan 450 SS units over the
   BlueBoat Base Station WiFi.
@@ -40,6 +46,8 @@ OWNER_ENV = "BLUEBOAT_GCS_PIPELINE"
 #: Script names of the two nodes that can be /side_scan_sonar.
 DRIVER_PATTERN = "sss_node.py"
 SIMULATOR_PATTERN = "sss_sim_node"
+#: BlueBoat-Control's bag-replay node (MCS "From a ros2bag").
+REPLAY_PATTERN = "bag_replay.py"
 
 _SETTINGS_KEY = "pipeline/sonar_source"
 
@@ -110,6 +118,84 @@ def driver_conflict(source: str, processes: Sequence[SonarProcess]
     return None
 
 
+def world_dir_from_argv(argv: Sequence[str]) -> Optional[str]:
+    """The simulator world folder a Gazebo command line runs, or None.
+
+    ``gz sim <folder>/world.sdf …`` (Replay_launch, full_mission_launch); a
+    folder counts only when it holds the acoustic scene the simulator renders
+    (``scene.npz`` + ``scene_manifest.yaml``), so BlueBoat-Control's stock
+    worlds never qualify."""
+    # Measured 2026-11-02: Gazebo runs as `/bin/sh -c "ruby …/gz sim
+    # <folder>/world.sdf -r -s …"` and the ruby process rewrites its own
+    # command line to the single string `gz sim <folder>/world.sdf -r -s`, so
+    # the path sits INSIDE one argv element: every element is split.
+    for a in (t for arg in argv for t in arg.split()):
+        if os.path.basename(a) != "world.sdf":
+            continue
+        d = Path(a).expanduser().parent
+        if (d / "scene.npz").is_file() and (d / "scene_manifest.yaml").is_file():
+            return str(d)
+    return None
+
+
+def find_replay(proc_root: Path = Path("/proc")
+                ) -> Tuple[Optional[int], Optional[str]]:
+    """``(pid of a running bag_replay.py, world folder Gazebo runs)`` from the
+    process table; either may be None. Immediate, like :func:`scan_processes`
+    (a ROS graph query would race discovery)."""
+    replay: Optional[int] = None
+    world: Optional[str] = None
+    try:
+        entries = [e for e in os.listdir(proc_root) if e.isdigit()]
+    except OSError:
+        return None, None
+    for e in entries:
+        argv = _read_cmdline(proc_root, int(e))
+        if not argv:
+            continue
+        if (os.path.basename(argv[0]).startswith("python")
+                and any(os.path.basename(a) == REPLAY_PATTERN for a in argv[1:])):
+            replay = int(e)
+        w = world_dir_from_argv(argv)
+        if w is not None:
+            world = w
+    return replay, world
+
+
+def replay_simulator_plan(source: str, processes: Sequence[SonarProcess],
+                          replay_pid: Optional[int], world_dir: Optional[str],
+                          enabled: bool = True) -> Tuple[Optional[str], str]:
+    """Whether START must start the simulator for a bag replay.
+
+    Returns ``(world folder to start sss_sim_node over, or None, console
+    message or "")``. Only for **Simulation**, only while a bag replay runs,
+    and never beside an existing ``/side_scan_sonar`` (a simulator — ours from
+    an earlier START included — or a driver)."""
+    if not enabled or normalise(source) != SIMULATION or replay_pid is None:
+        return None, ""
+    for p in processes:
+        if p.kind == "simulator":
+            return None, ""
+        if p.kind == "driver":
+            return None, (f"Bag replay: sss_node.py (pid {p.pid}) is already "
+                          "/side_scan_sonar — no simulator started.")
+    if world_dir is None:
+        return None, ("Bag replay without a simulator world folder (the stock "
+                      "Gazebo world has no acoustic scene): there is no seabed "
+                      "to image. Launch the replay on a world folder (MCS world "
+                      "dialog) to record a simulated sonar.")
+    return world_dir, ("Sonar: Simulation — a bag replay is running on "
+                       f"{world_dir} with no sonar: starting sss_sim_node over "
+                       "that world (the replayed real pose, no MAVROS shim; "
+                       "this START pings it).")
+
+
+def simulator_command(launch: Sequence[str], world_dir: str) -> List[str]:
+    """The simulator launch for ``world_dir`` (``launch`` = the configured
+    ``replay_simulator_launch``)."""
+    return list(launch) + [f"world_dir:={world_dir}"]
+
+
 def no_subscriber_advice(source: str) -> str:
     """What START says when nothing subscribes to ``ping/enable``."""
     if normalise(source) == REAL:
@@ -119,7 +205,8 @@ def no_subscriber_advice(source: str) -> str:
                 "Base Station WiFi). Enable sent anyway.")
     return ("START: no /side_scan_sonar node subscribes to ping/enable — in "
             "Simulation the simulator provides it: is the Gazebo world "
-            "running? For the real sonars select Sonar: Real. Enable sent "
+            "running (a bag replay needs a world folder; the stock world has "
+            "no sonar)? For the real sonars select Sonar: Real. Enable sent "
             "anyway.")
 
 

@@ -79,6 +79,14 @@ Turning the raw publication off would produce empty log files. The GCS itself do
 subscribe to `~/raw` at all — verified: its only sonar subscription is
 `/sss_processor/processed`.
 
+> **Update 2026-10-27 — the loss is not in ROS** (§11). In every one of our 2026-10-27
+> sessions the GCS's depth-200 `~/profile` records miss exactly the pings the
+> processor's depth-10 `~/raw` misses: two independent subscriptions, one loss set, so
+> the pings never reached ROS. The causes are the brping receive path (one receive
+> buffer shared by both devices) and the WiFi link SonarLink never crosses; QoS (item 1
+> below) is not one of them and stays as it is (CM-2, CM-4). Items 2 and 3 are done in
+> the new driver. The list below is kept as it was written.
+
 So the loss must be attacked without removing the topic:
 
 1. **QoS.** Both hops use `BEST_EFFORT` with `depth=10`. BEST_EFFORT never
@@ -506,3 +514,76 @@ corpus log.
   mis-tagging is gone — my current assumption is that the residual gap was mostly the
   fixed 0.25 m mosaic grid (now adaptive) plus the mis-tagged 19.8 %, but that needs a
   clean paired comparison to confirm rather than assume.
+
+## 11. 2026-10-27: our recordings against SonarView's, same boat, same day
+
+The first field recordings of the current stack, set against two SonarView recordings
+of the same boat and sonars that morning (all in `~/ros2_ws/data/SSS_data/sessions/`,
+opened read-only; `svlog_forensics --compare` reproduces every sonar number):
+
+| | SonarView `pool_…01-44` / `01-49` | ours, pool `10_30_25` | ours, harbour `15_07_31` | `15_54_50` | `16_07_16` |
+|---|---|---|---|---|---|
+| Recorder | SonarLink 1.14.50-dev **on BlueOS** (arm64, the boat's Pi) | `sss_processor_node`, laptop | same | same | same |
+| Range / bins / pulse / sos | 20 m / 1200 / 44.3 µs / 1500 | same | same | same | same |
+| Gain | auto (4, a few 5–6) | auto (4) | auto (4–7) | auto (4–7) | auto (4–7) |
+| **Ping interval** | **50 ms** | **29 ms** | 29 ms | 29 ms | 29 ms |
+| **Missing ping numbers** | **0 %** | **5.2 %** | **30.9 %** (stalls to 7.1 s) | **60.6 %** | **4.0 %** |
+| `channel_number` | 0 / 1 | **255** | 0 / 1 | 0 / 1 | 0 / 1 |
+| Status frames (2194) | ~0.9 Hz per device | none | none | none | none |
+| ATTITUDE / GPI / LPN | 12.8 Hz each | 4 Hz | 4 Hz | ~2 Hz | 4 Hz |
+| `time_boot_ms` | advancing | **frozen** | frozen | frozen | frozen (4288904828) |
+| HEARTBEAT, STATUSTEXT, VFR_HUD | yes | no | no | no | no |
+| Mavlink wrapper `src` / JSON | 0xFF / sorted keys | 3 / unsorted | same | same | same |
+| Out-of-order profiles in file | 6 % | 48 % | 37 % | — | 44 % |
+
+**How each records.** SonarLink runs on the boat's Pi: it talks to both Omniscans over
+the boat's wired network, asks the autopilot (mavlink2rest) for ATTITUDE /
+LOCAL_POSITION_NED / GLOBAL_POSITION_INT at 30 Hz, HEARTBEAT 1 Hz, VFR_HUD and
+SCALED_PRESSURE2 3 Hz, GPS_GLOBAL_ORIGIN 1 Hz and AUTOPILOT_VERSION 1/60 Hz (its id-10
+header), commands 50 ms per ping, and writes the file locally — nothing crosses the WiFi.
+The autopilot delivers ~12.8 Hz of each pose message for that request, even on the boat.
+Our stack runs on the laptop (root `CLAUDE.md` §1.1 — nothing of ours runs on the boat):
+`sss_node.py` pulls both TCP streams over the Base Station WiFi, publishes them on ROS,
+and the processor writes the file from `~/raw` plus mavros topics.
+
+**What the data shows.**
+
+1. *The loss is before ROS.* In all four sessions the pings missing from the `.svlog`
+   (processor, `~/raw`, depth 10) are exactly those missing from the GCS's seabed-image
+   rows (its own `~/profile` subscription, depth 200): 0 GCS pings absent from the
+   `.svlog` out of 0 / 5044 / 1315 / 3380 compared per side.
+2. *brping shared one receive buffer between the two devices.*
+   `brping.device.PingDevice._input_buffer = deque()` is a class attribute that
+   `Omniscan450.__init__` never replaces. The 15:07 driver log holds
+   `[starboard] connection lost: pop from an empty deque` — only two threads popping one
+   deque raise that — and a forced reconnect mid-survey; the 15:07 process also exited
+   with code 1 at stop. An in-memory replay did not reproduce silent corruption (the race
+   depends on timing), so its share of the loss is not quantified; the field log proves
+   the race is real. brping's TCP `read_io` also busy-spins a core per idle thread, its
+   parser runs byte by byte in Python, and it drops message ids it has no template for —
+   the status frames SonarView records.
+3. *The WiFi link.* During the 60.6 % run the autopilot's pose stream fell to 2.0 Hz
+   (1.4 Hz at 15:32) against 4 Hz nominal: the link itself was failing.
+4. *The ping interval.* With `msec_per_ping = 0` the device free-runs at 2R/c + 2.3 ms —
+   **29.0 ms at 20 m** — so the "max(50 ms, 2R/c + 3 ms) device law" measured on the
+   corpus (§4, and the simulator) was **SonarView's 50 ms command**, every corpus file
+   being SonarView's. Free run costs 1.7× the link bandwidth.
+5. *The pose rate and stamps.* Nothing in our stack asked for message rates (ArduPilot's
+   default on the mavros link is 4 Hz); run bags show `/mavros/local_position/odom` at
+   10.7–13 Hz exactly in the runs where SonarView was open. mavros stamps 0 on the real
+   launch (`use_sim_time`, no `/clock`), so every pose had
+   `time_boot_ms = (0 − node boot) mod 2³²`.
+6. *`channel_number` 255* only on the run before SonarLink first connected that day:
+   apparently device state SonarLink sets (hypothesis, `TODO.md`). Harmless under NC #1.
+
+**Fixed in the module (2026-10-27).** A per-device `OmniscanLink` replaces brping
+(own socket/buffer/framer, blocking receive, every frame forwarded — status frames to
+`~/raw`, health line per side); `msec_per_ping` 50 in the driver, both launches and the
+simulator (CM-2); SonarView's message-interval request from the processor, re-asserted
+every 30 s; burst-coherent `time_boot_ms`; HEARTBEAT, STATUSTEXT, `time_usec`; the id-12
+view config after id 10, `doppler_enable: true`, mavlink wrappers `src=0xFF` with sorted
+JSON; pose interpolated between odom samples; a rate watchdog against SonarView's rates.
+**Not fixable here:** the WiFi hop itself. **Not acquisition:** bottom tracking fails in
+the harbour on a bright 0.3–1 m near-surface band (deferred by the owner; SonarView does
+no bottom tracking in these files, `altitude_m: 0`). The field re-test checklist is in
+`.claude/TODO.md`.

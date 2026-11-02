@@ -23,6 +23,7 @@ from blueboat_gcs.core.svlog import (TRANSDUCER_SUBMERSION_M,
 from blueboat_gcs.models.sonar import native_from_profile, side_bins_from_ground
 
 N, LENGTH_MM, ALTITUDE = 1200, 20000, 1.2
+OLD_SUBMERSION_M = 0.15      # the processor's constant when the bug was measured
 
 
 def processed_row(seed=1):
@@ -51,7 +52,10 @@ def test_row_position_before_and_after_the_fix():
     # BEFORE (the call attach_native made until 2026-10-16): water_depth as
     # the altitude, no lever arm. The row lands 11 bins (0.18 m) too far out
     # and its pitch is off, so the far end sits at 20.16 m instead of 20.0.
-    b0, bv, bd = side_bins_from_ground(np.abs(f.port_y), f.port_db, f.water_depth)
+    # Measured at the submersion of the time (0.15 m; 0.22 since 2026-11-02,
+    # which the AFTER half below exercises): the old bug's numbers stay fixed.
+    b0, bv, bd = side_bins_from_ground(np.abs(f.port_y), f.port_db,
+                                       ALTITUDE + OLD_SUBMERSION_M)
     assert b0 == 83 and b0 - first_kept == 11
     assert b0 * bd == pytest.approx(1.383, abs=1e-3)
     assert (b0 + bv.size - 1) * bd == pytest.approx(20.163, abs=1e-3)

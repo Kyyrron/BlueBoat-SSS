@@ -9,6 +9,36 @@ marked with why.
 
 ---
 
+## From the pool corpus (SSS-Sim field-calibration pass 3; plan `~/calib/pass3/GCS_PLAN.md`)
+
+Done 2026-11-02 (operator's order):
+- **Bag replay records nothing in Simulation** — MCS's replay starts no sonar (owner,
+  2026-10-27); START now starts the simulator over the replay's world folder
+  (`ros/sonar_source.py`, `ros/pipeline_launcher.py`, `pipeline.replay_simulator*`), and the
+  replay window's "no usable pings" dialog tells "no sonar profile" from "no pose". Verified
+  end to end on `pool_1w` + the 12:13:18 pool bag (727 two-sided pings / 39 s, all placed).
+- **Submersion 0.22 m** (measured) in `sss_processor_node` and `core/svlog.py`.
+- **Late pings reordered picture rows** — inserted at their time order (`SeabedImager._late_index`).
+
+Open:
+- [ ] **Replay pose rate**: during the replay the processor received `/mavros/*` at 3–4 Hz
+  although the bag holds 10.7–13 Hz (`recording below SonarView's rates`), so a
+  replay svlog's pose is coarse (the simulator itself renders from the 100 Hz replay pose).
+  Find where the rate is lost (bag_replay republish, QoS, CPU).
+- [ ] **Square rows repeat pings at pivot turns** (30–65 % on `weight_1time`): the
+  navigation point (GPS near the bow) outruns the transducers. Needs along-track from the
+  transducers' own track, i.e. a settled fore/aft arm (−0.345 m drawing vs −0.60 m from the
+  pool's navigation fix) as a per-session setting, and a georef convention with that arm
+  (Perception's contract).
+- [ ] **Display fit ignores seabed nearer than 1 m** (`mosaic.water_column_min_m`): at 0.6 m
+  altitude the 0.6–1 m band never enters the curve. An acquisition-derived bound
+  (`max(0.15 m, 11 bins)`, the measured ringing) was tried on 2026-11-02 and reverted: it
+  moves the Perception golden's display model, so it needs a deliberate golden rebaseline
+  (owner's call).
+- Not done, by design: freezing the display model per session (plan item 2) reverts the
+  2026-09-19 decision "re-published, never frozen"; a fixed waterfall vertical scale (item
+  3) reverts the 2026-09-18 true-scale decision. Both need the owner to reopen them.
+
 ## Node-side work (`blueboat_sss` ROS nodes) — still open
 
 Every item below is in `blueboat_sss` and is required before live/recorded data is
@@ -24,25 +54,65 @@ correct at the source. All were re-confirmed present in the current code.
   CPU and RSS stay flat (`top`), the waterfall follows without lag, the mosaic
   cell size reads ~0.026 m at 15 m / 600 bins, no "display N pings behind" status
   appears at rest, and Contrast-slider drags do not freeze the window.
-- [ ] **Investigate the ~8 % ping loss.** Root cause unconfirmed. Candidates, in order:
-      (a) `BEST_EFFORT` depth 10 on both hops — try `RELIABLE` depth 50 on *both* ends
-      together; (b) confirmed still present — `msg.data = list(raw)` at
-      `src/sss_node.py:328` and `list(data.pwr_results)` at `:320` build ~3700 Python
-      objects per ping-pair inside the thread that must return to `wait_message` — try
-      `array.array('B', …)` / `array.array('H', …)`; (c) enlarge `SO_RCVBUF`.
-      *Root-causing needs a running system:* **NOT VERIFIABLE ON THIS MACHINE
-      (Windows, no ROS2/colcon).**
-- [ ] **Find out why the port device emits `channel_number=1` at all.** Whether both
-      `OmniscanWorker`s can reach the same device/multiplexer, or `brping` shares
-      parser state across instances, was never established. The processor now routes
-      both the `.svlog` tag and the projection off the packet, so the symptom is
-      masked at the consumer; this is still the actual defect. Two field logs
-      (`No_sonarVNotOK_usOK_SimpleCurve`, `reflectionEvidenceFullharbour`, ~30 000
-      profiles) are a second variant: `channel_number` is `255` on every packet and
-      only `transducer_heading_deg` identifies the side. **BLOCKED: needs the two
-      Omniscan units.**
+- [ ] **Field re-test of the SonarView-parity driver (2026-10-27 change set).** The
+      2026-10-27 logs lost 5.2 % (pool) and 30.9 / 60.6 / 4.0 % (harbour) of pings,
+      free-running at 34.5 Hz with 4 Hz frozen-stamp pose; SonarView lost 0 % at 20 Hz
+      with 12.8 Hz pose (`blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md` §11). The loss is
+      **before ROS** (the GCS's depth-200 `~/profile` records miss exactly the pings the
+      processor's depth-10 `~/raw` misses, all four sessions), so ROS QoS was never the
+      cause. Fixed here: own `OmniscanLink` per device (no brping, NC #3a), 50 ms per
+      ping, every device frame to `~/raw`, burst-coherent `time_boot_ms`, SonarView's
+      mavlink rate request, HEARTBEAT/STATUSTEXT, id-12, pose interpolation. On the boat,
+      pool run then harbour run, check: (1) `svlog_forensics` PRI median **50.0 ms**,
+      missing **< 0.5 %** near the base station; (2) the driver's per-side health lines
+      agree with the forensics (a loss there = device/WiFi, none = ROS); (3) ATTITUDE /
+      GPI / LPN at **12–13 Hz** in the `.svlog` and `/mavros/local_position/odom` at the
+      same rate in the run bag, no rate-watchdog warning; (4) `time_boot_ms` advances;
+      (5) the `.svlog` census against a SonarView recording of the same water. What is
+      left after that is the WiFi link itself, which SonarLink (recording on the boat's
+      Pi) never crosses and nothing of ours may run on the boat (root CLAUDE.md §1.1).
+      **Needs the boat.**
+- [ ] **Does the device send status frames (id 2194) to our client unsolicited?**
+      SonarView's logs carry them at ~0.9 Hz per device; brping dropped any it got. The
+      driver now forwards them and logs the first of each id
+      (`device sends message id 2194`). If none arrive, SonarView requests them and the
+      request is unknown: capture it (the SonarLink↔Omniscan traffic is on the boat's
+      wired network, not visible from the laptop) or ask Cerulean. If they do arrive,
+      the simulator should emit them too (BlueBoat-SSS-Sim `TODO.md`, CM-2).
+      **Needs the boat.**
+- [ ] **`channel_number = 255` on every packet of our 2026-10-27 10:30 run**, 0/1 on
+      every later run that day, after SonarLink had run (10:44). Hypothesis: SonarLink
+      configures it on the device and it holds until power-off; our driver sends no such
+      command. Harmless — the side falls back to the transducer bearing (NC #1, CM-5) —
+      but it is acquisition state SonarView sets and we do not. Check: power-cycle the
+      sonars, run our stack first, read byte 34. The older "port emits
+      `channel_number=1`" item is closed by NC #3a: brping's shared receive buffer let
+      one worker parse the other device's frames. **Needs the boat.**
+- [ ] **`filter_duration_percent`: ours 0.0015 (pinned), SonarView's unknown** — it is a
+      command parameter and appears in no recorded packet. Same capture as above.
+- [ ] **The 15:07 driver process exited with code 1 at stop** (launch log of
+      2026-10-27, `sss_node.py-1: process has died`), after the brping
+      `pop from an empty deque` reconnect. The rewritten worker closes its own socket
+      and joins; confirm a clean exit on the next real stop.
+- [ ] **FBR fails in deep water** (deferred by the owner, 2026-10-27). Every harbour log
+      of 2026-10-27 has a bright near-surface band at 0.3–1 m slant (50–57 dB, the
+      median profile decaying to ~23 dB by 8 m, the seabed rise at ~10–15 m);
+      `find_noise_window_start` / `detect_fbr_slant_m` take it for the bottom
+      (detections 30–46 %, lock 33–59 %, p50 0.6–1.0 m in water several metres deep).
+      SonarView does no bottom tracking in its view (`altitude_m: 0`). Cause of the band
+      (surface reverberation and wake at roll ±10°, auto-gain 5–7) not established; a
+      lag-1 correlation test found no range-wrap echo. Study it against these four logs
+      before changing the detector (and its mirrors, NC #1-style).
 - [ ] **Fix `/blueboat/odom`** so it is non-zero and stamped on the same clock as the
-      sonar profiles. The GCS pose-alignment fallbacks are mitigations, not a fix. Note
+      sonar profiles. **Cause found live 2026-10-27:** `BlueBoat_launch.py` builds
+      `SimpleLauncher(use_sim_time=True)`, mavros inherits it and, with no `/clock`, stamps
+      `/mavros/local_position/odom` (hence `/blueboat/odom`) with sec 0 while the profiles carry
+      wall time; the processor's stamp-based buffer pruned every pose and dropped every ping
+      (4000+ in one session). **Processor side worked around** (`_OdomBuffer.push` keys a zero
+      stamp on arrival time, warns once; tests `test_odom_buffer_keys_a_zero_stamp_on_arrival`,
+      `test_zero_stamped_odom_places_pings_on_the_node`); the source fix (mavros
+      `use_sim_time: False`, or restamping in `robot_interface`) stays a Control item.
+      The GCS pose-alignment fallbacks are mitigations, not a fix. Note
       the processor-side consequence is severe: the processor treats pose as a hard gate
       and drops every ping that has no odom (`src/sss_processor_node.py`, `_emit_group`,
       `_dropped_no_odom`). Since assembly now emits one-sided rows and no longer

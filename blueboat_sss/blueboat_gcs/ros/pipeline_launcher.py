@@ -40,6 +40,12 @@ simulator or a driver this application did not start, in which case the
 launch falls back to the processor alone and says why. Every launched
 process carries ``sonar_source.OWNER_ENV``; the sweep kills drivers that
 carry it and never one an operator started by hand.
+
+Bag replay (2026-11-02): with **Simulation**, START also starts the simulated
+sonar over the world folder a running bag replay uses, when nothing is
+``/side_scan_sonar`` (``sonar_source.replay_simulator_plan``). It is a second
+launch tree of ours (own session group, ``OWNER_ENV``), signalled with the
+pipeline's on STOP and swept the same way.
 """
 
 from __future__ import annotations
@@ -86,6 +92,7 @@ class PipelineLauncher(QObject):
         self._ros = ros
         self._signals = signals
         self._proc: Optional[subprocess.Popen] = None
+        self._sim_proc: Optional[subprocess.Popen] = None   # replay simulator
         self._state = PipelineState.IDLE
         self._sigterm_at: Optional[float] = None
         self._sigkill_at: Optional[float] = None
@@ -194,7 +201,7 @@ class PipelineLauncher(QObject):
         return ss.launch_command(base, self._source,
                                  self._config.real_sonar_launch_args)
 
-    def _pump_output(self, proc: subprocess.Popen) -> None:
+    def _pump_output(self, proc: subprocess.Popen, tag: str = "processor") -> None:
         """Forward the launch tree's stdout/stderr to the console — this
         is how raw prints from sss_processor_node reach the operator
         without an external terminal (ROS-logger messages additionally
@@ -203,7 +210,7 @@ class PipelineLauncher(QObject):
             for line in proc.stdout:            # ends when the pipe closes
                 line = line.rstrip()
                 if line:
-                    self._signals.log_line.emit("processor", line)
+                    self._signals.log_line.emit(tag, line)
         except (ValueError, OSError):            # pragma: no cover
             pass
 
@@ -228,7 +235,10 @@ class PipelineLauncher(QObject):
         if not self._config.publish_ping_enable:
             return
         self._ping_wanted = True
-        self._ping_deadline = time.monotonic() + self._config.ping_enable_wait_s
+        wait = self._config.ping_enable_wait_s
+        if self._maybe_start_replay_simulator():
+            wait = max(wait, self._config.replay_simulator_wait_s)
+        self._ping_deadline = time.monotonic() + wait
         self._poll_ping_enable()
         if self._ping_wanted:
             self._ping_timer.start()
@@ -254,6 +264,51 @@ class PipelineLauncher(QObject):
             advice = ss.no_subscriber_advice(self._source)
             self._signals.status_message.emit(advice)
             self._signals.log_line.emit("app", advice)
+
+    def _maybe_start_replay_simulator(self) -> bool:
+        """Start the simulator for a bag replay when the plan says so;
+        True when a simulator launch is (now) ours and still coming up."""
+        if self._source != ss.SIMULATION or not self._config.replay_simulator:
+            return False
+        if self._sim_proc is not None and self._sim_proc.poll() is None:
+            return False                         # already ours, already up
+        replay_pid, world = ss.find_replay()
+        world_dir, message = ss.replay_simulator_plan(
+            self._source, ss.scan_processes(), replay_pid, world,
+            self._config.replay_simulator)
+        if message:
+            self._signals.status_message.emit(message)
+            self._signals.log_line.emit("app", message)
+        if world_dir is None:
+            return False
+        cmd = ss.simulator_command(self._config.replay_simulator_launch,
+                                   world_dir)
+        env = dict(os.environ)
+        env[ss.OWNER_ENV] = "1"
+        try:
+            self._sim_proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, start_new_session=True, env=env)
+        except (OSError, FileNotFoundError) as exc:
+            self._sim_proc = None
+            text = f"Could not start the replay simulator ({' '.join(cmd)}): {exc}"
+            self._signals.status_message.emit(text)
+            self._signals.log_line.emit("app", text)
+            return False
+        threading.Thread(target=self._pump_output,
+                         args=(self._sim_proc, "simulator"), daemon=True).start()
+        return True
+
+    def _stop_replay_simulator(self, sig: signal.Signals = signal.SIGINT) -> None:
+        if self._sim_proc is None:
+            return
+        if self._sim_proc.poll() is not None:
+            self._sim_proc = None
+            return
+        try:
+            os.killpg(os.getpgid(self._sim_proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            self._sim_proc = None
 
     def disable_pinging(self) -> None:
         self._ping_wanted = False
@@ -335,6 +390,7 @@ class PipelineLauncher(QObject):
         if self._config.publish_ping_enable:
             self._ros.publish_ping_enable(False)
         self._ros.publish_svlog_enable(False)
+        self._stop_replay_simulator()
         if not self._alive():
             self._proc = None
             self._sweep_leftovers()
@@ -358,6 +414,9 @@ class PipelineLauncher(QObject):
             self._proc = None
             self._sigterm_at = self._sigkill_at = None
             self._poll.stop()
+            # The replay simulator never outlives the pipeline.
+            self._stop_replay_simulator(signal.SIGTERM)
+            self._sim_proc = None
             # THE invariant: after the launch tree is gone, nothing
             # matching the pipeline patterns may survive.
             self._sweep_leftovers()
@@ -393,6 +452,8 @@ class PipelineLauncher(QObject):
             QTimer.singleShot(0, self.start)
 
     def _signal_group(self, sig: signal.Signals) -> None:
+        if sig is not signal.SIGINT:
+            self._stop_replay_simulator(sig)     # the escalation ladder too
         if self._proc is None:
             return
         try:

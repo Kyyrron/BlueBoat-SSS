@@ -10,7 +10,8 @@ Nodes started by this launch file:
   `side_scan_sonar`; pinging is OFF at startup.
 
 Defaults are the device's best acquisition (20 m, auto-gain, 1200 bins, pulse
-0.00125 -- sss_node.py's own declared defaults since 2026-09-28).
+0.00125 -- sss_node.py's own declared defaults since 2026-09-28) at
+SonarView's ping interval (50 ms, 20 pings/s -- since 2026-10-27).
 
 For the processing/logging node as well, use SSS_processing_launch.py -- that is
 the launch file the GCS starts; with its "Sonar: Real" selector it also starts
@@ -27,7 +28,7 @@ def generate_launch_description():
     # ---- sss_node : Acquisition (re-read on every ping enable) ----------------------
     sl_range_start_mm    = sl.declare_arg('range_start_mm',    default_value=0)
     sl_range_length_mm   = sl.declare_arg('range_length_mm',   default_value=20000)
-    sl_msec_per_ping     = sl.declare_arg('msec_per_ping',     default_value=0)
+    sl_msec_per_ping     = sl.declare_arg('msec_per_ping',     default_value=50)
     sl_gain_index        = sl.declare_arg('gain_index',        default_value=-1)
     sl_num_results       = sl.declare_arg('num_results',       default_value=1200)
     sl_pulse_len_percent = sl.declare_arg('pulse_len_percent', default_value=0.00125)

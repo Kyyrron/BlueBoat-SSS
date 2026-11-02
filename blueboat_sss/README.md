@@ -86,15 +86,17 @@ every ping enable:
 | ------------------- | ------- | ------------------------------------------ |
 | `range_start_mm`    | 0       | start of the sampled window |
 | `range_length_mm`   | 20000   | swath per side, in mm |
-| `msec_per_ping`     | 0       | 0 = as fast as the hardware manages |
+| `msec_per_ping`     | 50      | ping interval lower bound — SonarView's; 0 = free run |
 | `gain_index`        | -1      | -1 = device auto |
-| `num_results`       | 600     | samples per ping |
-| `pulse_len_percent` | 0.002   | transmit pulse as a fraction of range |
+| `num_results`       | 1200    | samples per ping (the device maximum) |
+| `pulse_len_percent` | 0.00125 | transmit pulse as a fraction of 2R/c (44.3 µs floor to ~27 m) |
 
-**Set the range from the water depth (~4x the deepest expected), not from the
-area you hope to cover.** The 80 m used in the sea trials pushed the bottom
-return to sample 49/600 and broke bottom detection outright. The 20 m default
-gives 33.3 mm range sampling at 600 samples.
+These are SonarView's acquisition settings (2026-10-27): only the range may
+differ from what SonarView records. **Set the range from the water depth (~4x
+the deepest expected), not from the area you hope to cover.** The 80 m used in
+the sea trials pushed the bottom return to sample 49/600 and broke bottom
+detection outright. The 20 m default gives 16.7 mm range sampling at 1200
+samples.
 
 To change a parameter without restarting, toggle pinging off, set it, toggle
 back on:
@@ -113,13 +115,19 @@ fallback.
 
 ### Publishing rate
 
-One ROS message per ping packet received — no batching. `msec_per_ping = 0`
-pings as fast as the hardware manages, which depends on range: two-way travel
-time at ~1500 m/s sets the ceiling, roughly **20–25 Hz at 30 m**, **10 Hz at
-75 m**, **~7 Hz at 100 m**. `msec_per_ping = N > 0` lower-bounds the period at
-N ms — set `50` for a steady 20 Hz per side. Note that `pulse_len_percent`
-scales the transmit pulse with the range, so a long range costs range
-resolution as well as rate.
+One ROS message per ping packet received — no batching. The period is
+`max(msec_per_ping, 2R/c + ~3 ms)`: the default 50 gives a steady **20 Hz per
+side up to ~35 m**, then range-limited (**~7.6 Hz at 95.6 m**) — exactly what
+SonarView records. `msec_per_ping = 0` free-runs the device at 2R/c + ~2.3 ms,
+**measured 34.5 Hz at 20 m** (2026-10-27), which costs 1.7× the WiFi bandwidth
+and lost 4–61 % of pings in the field; use it only as a diagnostic. Note that
+`pulse_len_percent` scales the transmit pulse with the range, so a long range
+costs range resolution as well as rate.
+
+Every frame the devices send reaches `~/raw` (status frames, id 2194, included,
+as SonarView records them); only profiles reach `~/profile`. Each side logs a
+health line every 10 s while pinging (rate, missing ping numbers, longest gap,
+checksum errors): a loss there happened before ROS.
 
 ## Transducer geometry
 
@@ -167,10 +175,13 @@ colcon build --packages-select blueboat_sss
 source install/setup.bash
 ```
 
-`CMakeLists.txt` installs `launch/` plus the five `src/` scripts flat into
-`lib/blueboat_sss/`; the flat layout is what lets `sss_processor_node.py` import
-`sss_helper` / `svlog_helper` / `math_helper` without a package prefix.
+`CMakeLists.txt` installs `launch/` plus the six `src/` scripts flat into
+`lib/blueboat_sss/`; the flat layout is what lets the two nodes import
+`sss_helper` / `svlog_helper` / `math_helper` / `omniscan_link` without a
+package prefix.
 
-Node dependencies: `bluerobotics-ping` (`brping`), `simple_launch`,
-`scipy`, `mavros_msgs`, `geographic_msgs`, and `blueboat_interfaces` (supplied
-by BlueBoat-Control).
+Node dependencies: `simple_launch`, `scipy`, `mavros_msgs`, `geographic_msgs`,
+and `blueboat_interfaces` (supplied by BlueBoat-Control). The driver speaks the
+Ping Protocol itself (`omniscan_link.py`); `bluerobotics-ping` (`brping`) is
+only the test oracle for its command bytes since 2026-10-27 — its two device
+instances shared one receive buffer.

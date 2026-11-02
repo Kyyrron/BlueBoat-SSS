@@ -85,7 +85,7 @@ BOOTSTRAP_PINGS = 10
 ALTITUDE_AGREEMENT_TOL_M = 0.30
 OUTLIER_TOL_M = 1.0
 RELOCK_AFTER = 15
-TRANSDUCER_SUBMERSION_M = 0.15   # estimate, = sim sensor_depth_m
+TRANSDUCER_SUBMERSION_M = 0.22   # measured 2026-11-02 (= sss_processor_node, = sim sensor_depth_m); was 0.15
 TRANSDUCER_Y_OFFSET_PORT_M = 0.285  # BR-101447 hull spacing 570 mm / 2
 TRANSDUCER_Y_OFFSET_STBD_M = 0.285
 PAIR_TOLERANCE_NS = 50_000_000    # 50 ms processor tolerance

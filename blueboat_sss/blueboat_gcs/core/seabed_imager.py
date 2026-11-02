@@ -96,6 +96,7 @@ grids stay valid as written.
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import secrets
@@ -517,16 +518,30 @@ class SeabedImager(QObject):
                             float(ping.robot_y))
         self._along = self._track.advance(float(ping.t))
         speed = self._track.speed_mps
-        self._buf_rows.append(row)
-        self._buf_meta.append((ping.t, ping.robot_x, ping.robot_y, ping.yaw,
-                               self._half * self._pitch, ping.water_depth,
-                               speed, h, self._along, gains[0], gains[1],
-                               getattr(ping, "roll", math.nan),
-                               getattr(ping, "pitch", math.nan),
-                               getattr(ping, "yaw_rate", math.nan),
-                               getattr(ping, "attitude_age_s", math.nan),
-                               getattr(ping, "port_ping_number", 0),
-                               getattr(ping, "stbd_ping_number", 0)))
+        meta = (ping.t, ping.robot_x, ping.robot_y, ping.yaw,
+                self._half * self._pitch, ping.water_depth,
+                speed, h, self._along, gains[0], gains[1],
+                getattr(ping, "roll", math.nan),
+                getattr(ping, "pitch", math.nan),
+                getattr(ping, "yaw_rate", math.nan),
+                getattr(ping, "attitude_age_s", math.nan),
+                getattr(ping, "port_ping_number", 0),
+                getattr(ping, "stbd_ping_number", 0))
+        late = self._late_index(float(ping.t))
+        if late is None:
+            self._buf_rows.append(row)
+            self._buf_meta.append(meta)
+        else:
+            # A ping delivered after newer ones (a late burst over the WiFi
+            # hop, measured 2026-11-02 on the 10-28 pool sessions: ~20 pings
+            # ~1 s late). Appended, it took the NEWEST along-track position
+            # and the nearest-ping pick mixed it into the newest rows (ping
+            # numbers ran ~21 back inside a picture). It goes in at its time
+            # order, its along-track position interpolated in time between
+            # its neighbours, so rows stay chronological.
+            i, s_late = late
+            self._buf_rows.insert(i, row)
+            self._buf_meta.insert(i, meta[:8] + (s_late,) + meta[9:])
         self._since_last += 1
         if self._geometry == "ping":
             # Bound memory to one window.
@@ -624,6 +639,20 @@ class SeabedImager(QObject):
         pns = np.array([m[15:17] for m in meta], np.int64).reshape(n, 2)
         self._finish(np.vstack(rows), t, pose, rng, depth, speed, bottoms,
                      np.arange(n), along, gains, att, pns)
+
+    def _late_index(self, t: float) -> Optional[Tuple[int, float]]:
+        """``(insert index, along-track position)`` for a ping older than the
+        newest buffered one, else None (the normal, in-order case)."""
+        if not self._buf_meta or not math.isfinite(t) or t >= self._buf_meta[-1][0]:
+            return None
+        ts = [m[0] for m in self._buf_meta]
+        i = bisect.bisect_right(ts, t)
+        if i == 0:
+            return 0, float(self._buf_meta[0][8])
+        t0, s0 = self._buf_meta[i - 1][0], self._buf_meta[i - 1][8]
+        t1, s1 = self._buf_meta[i][0], self._buf_meta[i][8]
+        f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+        return i, float(s0 + f * (s1 - s0))
 
     def _emit_square(self, s_top: float, n_rows: int) -> None:
         """"square" geometry: picture row k (0 = newest) sits at along-track

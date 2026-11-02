@@ -40,7 +40,8 @@ N_BINS = 600                 # device bins per side
 RANGE_A_M = 20.0             # first range setting
 RANGE_B_M = 15.0             # after the mid-run range change
 DT_S = 0.05                  # 20 Hz
-SUBMERSION_M = 0.15          # water_depth = altitude + submersion (processor convention)
+SUBMERSION_M = 0.15          # water_depth = altitude + submersion: the convention these golden
+                             # pings were captured with (frozen; the processor moved to 0.22 on 2026-11-02)
 GAIN_REF = 74.55             # analog gain at index 4
 GAIN_UP = 142.8              # one index up: +5.65 dB on the wire
 

@@ -137,7 +137,8 @@ class MainWindow(QMainWindow):
                     else config.map.osm_url)
         self._tile_fetcher = TileFetcher(
             tile_url, Path(config.map.tile_cache_dir).expanduser(),
-            config.map.max_concurrent_tile_requests, parent=self)
+            config.map.max_concurrent_tile_requests, parent=self,
+            detect_placeholders=config.map.use_satellite)
         # Tiles are pinned to (lat0, lon0), never to the translation —
         # imagery must not slide when the anchor refits.
         self.tile_layer = TileLayer(scene, self._tile_fetcher,

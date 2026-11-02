@@ -183,3 +183,122 @@ def test_owned_patterns_match_the_launch_file(pattern):
               / cfg.launch_command[-1]).read_text(encoding="utf-8")
     assert f"'{pattern}'" in launch, (
         f"owned_process_patterns has {pattern!r}, absent from the launch file")
+
+
+# ---- bag replay: START starts the simulator over the replay's world (2026-11-02)
+GZ = ["ruby", "/opt/ros/jazzy/opt/gz_tools_vendor/bin/gz", "sim"]
+REPLAY = "/home/op/ros2_ws/install/blueboat_control/lib/blueboat_control/bag_replay.py"
+
+
+def _world(root: Path, name: str, acoustic: bool = True) -> Path:
+    d = root / name
+    d.mkdir(parents=True)
+    (d / "world.sdf").write_text("<sdf/>")
+    if acoustic:
+        (d / "scene.npz").write_bytes(b"")
+        (d / "scene_manifest.yaml").write_text("version: 1\n")
+    return d
+
+
+def test_world_dir_from_a_gazebo_command_line(tmp_path):
+    w = _world(tmp_path, "pool_1w")
+    stock = _world(tmp_path, "ocean", acoustic=False)
+    assert ss.world_dir_from_argv(GZ + [str(w / "world.sdf"), "-r"]) == str(w)
+    assert ss.world_dir_from_argv(GZ + [str(stock / "world.sdf")]) is None
+    # the two shapes the process table really shows (measured 2026-11-02)
+    assert ss.world_dir_from_argv(["/bin/sh", "-c", " ".join(
+        GZ + [str(w / "world.sdf"), "-r", "-s", "--force-version", "8"])]) == str(w)
+    assert ss.world_dir_from_argv([f"gz sim {w / 'world.sdf'} -r -s"]) == str(w)
+    assert ss.world_dir_from_argv([PY, DRIVER]) is None
+
+
+def test_find_replay_reads_the_process_table(tmp_path):
+    w = _world(tmp_path / "worlds", "pool_2w")
+    proc = tmp_path / "proc"
+    _proc(proc, 300, [PY, REPLAY, "--ros-args"], {})
+    _proc(proc, 301, GZ + [str(w / "world.sdf"), "-r"], {})
+    _proc(proc, 302, ["vim", REPLAY], {})
+    assert ss.find_replay(proc) == (300, str(w))
+    empty = tmp_path / "proc2"
+    _proc(empty, 400, GZ + [str(w / "world.sdf")], {})       # a world, no replay
+    assert ss.find_replay(empty) == (None, str(w))
+
+
+def test_replay_simulator_plan_rules():
+    sim = ss.SonarProcess(pid=5, kind="simulator", owned=False)
+    drv = ss.SonarProcess(pid=6, kind="driver", owned=True)
+    w = "/home/op/worlds/p/pool_1w"
+    world, msg = ss.replay_simulator_plan(ss.SIMULATION, [], 300, w)
+    assert world == w and "starting sss_sim_node" in msg
+    assert ss.replay_simulator_plan(ss.REAL, [], 300, w) == (None, "")
+    assert ss.replay_simulator_plan(ss.SIMULATION, [], None, w) == (None, "")
+    assert ss.replay_simulator_plan(ss.SIMULATION, [sim], 300, w) == (None, "")
+    assert ss.replay_simulator_plan(ss.SIMULATION, [], 300, w, enabled=False) == (None, "")
+    world, msg = ss.replay_simulator_plan(ss.SIMULATION, [drv], 300, w)
+    assert world is None and "pid 6" in msg
+    world, msg = ss.replay_simulator_plan(ss.SIMULATION, [], 300, None)
+    assert world is None and "world folder" in msg
+    assert ss.simulator_command(PipelineConfig().replay_simulator_launch, w)[-1] \
+        == f"world_dir:={w}"
+
+
+class FakeProc:
+    def __init__(self, cmd, **kw) -> None:
+        self.cmd, self.env, self.pid = cmd, kw.get("env", {}), 4242
+        self.stdout = iter(())
+        self.code = None
+
+    def poll(self):
+        return self.code
+
+
+def test_start_starts_the_replay_simulator_and_stop_signals_it(qapp, monkeypatch):
+    from blueboat_gcs.ros import pipeline_launcher as pl
+    w = "/home/op/worlds/p/pool_1w"
+    monkeypatch.setattr(ss, "find_replay", lambda: (300, w))
+    monkeypatch.setattr(ss, "scan_processes", lambda: [])
+    spawned: list = []
+    monkeypatch.setattr(pl.subprocess, "Popen",
+                        lambda cmd, **kw: spawned.append(FakeProc(cmd, **kw)) or spawned[-1])
+    sent: list = []
+    monkeypatch.setattr(pl.os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(pl.os, "killpg", lambda pg, sig: sent.append((pg, sig)))
+    ros = StubRos(subscribers=0)
+    lch, signals = _launcher(ros, ss.SIMULATION, ping_enable_wait_s=0.0,
+                             replay_simulator_wait_s=60.0)
+    messages: list = []
+    signals.status_message.connect(messages.append)
+    lch._set_state(PipelineState.RUNNING)
+    lch.enable_pinging()
+    assert len(spawned) == 1 and spawned[0].cmd[-1] == f"world_dir:={w}"
+    assert "sss_sim_launch.py" in spawned[0].cmd
+    assert spawned[0].env.get(ss.OWNER_ENV) == "1"
+    assert ros.enables == [], "did not wait for the simulator to load"
+    ros.subscribers = 1
+    lch._poll_ping_enable()
+    assert ros.enables == [True]
+    lch.enable_pinging()                       # a second START: no second simulator
+    assert len(spawned) == 1
+    lch.stop()
+    assert sent and sent[0][0] == 4242
+
+
+def test_real_or_no_replay_starts_no_simulator(qapp, monkeypatch):
+    from blueboat_gcs.ros import pipeline_launcher as pl
+    monkeypatch.setattr(ss, "find_replay", lambda: (None, "/w"))
+    monkeypatch.setattr(ss, "scan_processes", lambda: [])
+    spawned: list = []
+    monkeypatch.setattr(pl.subprocess, "Popen",
+                        lambda cmd, **kw: spawned.append(cmd) or FakeProc(cmd, **kw))
+    for source in (ss.SIMULATION, ss.REAL):
+        lch, _ = _launcher(StubRos(subscribers=1), source)
+        lch._set_state(PipelineState.RUNNING)
+        lch.enable_pinging()
+    assert spawned == []
+
+
+def test_replay_open_dialog_tells_no_profiles_from_no_poses():
+    from types import SimpleNamespace
+    from blueboat_gcs.gui.replay_window import no_pings_message
+    assert "no sonar profile" in no_pings_message(SimpleNamespace(dropped_no_pose=0))
+    assert "lacked a pose" in no_pings_message(SimpleNamespace(dropped_no_pose=12))

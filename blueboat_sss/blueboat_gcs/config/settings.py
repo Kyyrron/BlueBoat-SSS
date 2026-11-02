@@ -100,8 +100,21 @@ class PipelineConfig:
     # (sonar_source.OWNER_ENV in their environment): the real driver, which
     # an operator may also have started by hand in a terminal.
     owned_process_patterns: List[str] = field(default_factory=lambda: [
-        "sss_node.py",
+        "sss_node.py", "sss_sim_node",
     ])
+    # Bag replay (MCS "From a ros2bag"; 2026-11-02): with Sonar: Simulation,
+    # START starts the simulated sonar over the world folder Gazebo replays
+    # in, when none runs (the replay starts no sonar by design). The launch
+    # gets `world_dir:=<folder>`; the replay feeds it the recorded pose and
+    # the recorded /mavros/*, hence no shim; START pings it.
+    replay_simulator: bool = True
+    replay_simulator_launch: List[str] = field(default_factory=lambda: [
+        "ros2", "launch", "blueboat_sss_sim", "sss_sim_launch.py",
+        "with_mavros_shim:=false", "auto_ping:=false",
+    ])
+    # The simulator loads its scene before it subscribes to ping/enable:
+    # START waits up to this long for it (instead of ping_enable_wait_s).
+    replay_simulator_wait_s: float = 30.0
 
 
 @dataclass
@@ -504,7 +517,7 @@ class SimConfig:
 
     origin_lat: float = 43.6961
     origin_lon: float = 7.3080
-    ping_hz: float = 15.0
+    ping_hz: float = 20.0          # SonarView's / the driver's 50 ms per ping
     speed_mps: float = 0.8
 
 

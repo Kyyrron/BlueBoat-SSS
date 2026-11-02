@@ -13,7 +13,7 @@ rclpy node name `blueboat_gcs`. Subscribes (**VERIFIED**; topic names configurab
 | Topic | Type | Notes |
 |---|---|---|
 | `/sss_processor/processed` | `ProcessedSSSPing` | `BEST_EFFORT`, depth **200** |
-| `/side_scan_sonar/{port,starboard}/profile` | `OmniscanProfile` | `BEST_EFFORT`, depth **200** (`sonar_stream.profile_queue_depth`). **Since 2026-09-05**: the raw per-side profiles, cached by device `ping_number` and attached verbatim to the matching processed row (`core/live_native.py`), so the live waterfall and the AI pictures draw the same native bins the replay path decodes from the `.svlog` — water column, ringing and all. A profile missing after `profile_wait_ms` (60 ms) falls back to the re-projection for that side; the console warns once when more than 5 % of recent rows had to. **Bug fix 2026-10-16:** that re-projection now inverts the processor's own geometry (the 0.285 m lever arm and its altitude = `water_depth − 0.15`); since `994a74b` it had put a missed side on the wrong bins (20 m / 1200 bins at 1.2 m: bin 83 instead of 72) — `tests/test_fallback_lever_arm.py`. |
+| `/side_scan_sonar/{port,starboard}/profile` | `OmniscanProfile` | `BEST_EFFORT`, depth **200** (`sonar_stream.profile_queue_depth`). **Since 2026-09-05**: the raw per-side profiles, cached by device `ping_number` and attached verbatim to the matching processed row (`core/live_native.py`), so the live waterfall and the AI pictures draw the same native bins the replay path decodes from the `.svlog` — water column, ringing and all. A profile missing after `profile_wait_ms` (60 ms) falls back to the re-projection for that side; the console warns once when more than 5 % of recent rows had to. **Bug fix 2026-10-16:** that re-projection now inverts the processor's own geometry (the 0.285 m lever arm and its altitude = `water_depth − TRANSDUCER_SUBMERSION_M`, 0.22 m since 2026-11-02, was 0.15); since `994a74b` it had put a missed side on the wrong bins (20 m / 1200 bins at 1.2 m: bin 83 instead of 72) — `tests/test_fallback_lever_arm.py`. |
 | `/blueboat/odom` | `nav_msgs/Odometry` | `BEST_EFFORT`, depth 10 |
 | `/mavros/global_position/global` | `sensor_msgs/NavSatFix` | `BEST_EFFORT`, depth 10. Gated by the pure `utils/geodesy.navsat_fix_ok`: **only** an explicit `STATUS_NO_FIX` (-1), non-finite coordinates, or the `(0, 0)` no-fix sentinel are rejected; `STATUS_UNKNOWN` (-2) is **accepted** — it is the ROS 2 Iron+ message *default*, and exactly what the MCS bridge's simulated GPS sends for Gazebo runs of GPS-anchored missions (MCS is the only GPS publisher in a sim graph; it fills lat/lon only). Rejecting all negative statuses silently discarded that whole feed — the "GCS says no GPS while MCS anchors" field bug. First accepted and first rejected fix are logged to the console |
 | `/mavros/global_position/compass_hdg` | `std_msgs/Float64` | depth 10 |
@@ -379,7 +379,20 @@ operator started in a terminal. Switching while the pipeline is up asks, runs ST
 (saving an open session) and relaunches. START's `ping/enable` is volatile, so it is sent
 once `/side_scan_sonar` subscribes to it (`ping_enable_wait_s`, 10 s, then anyway with
 the likely cause for the selected source) — a relaunch, or a real driver still coming
-up, used to swallow it.
+up, used to swallow it. **Bag replay (2026-11-02):** an MCS "From a ros2bag" replay starts
+no sonar (MCS owner decision, 2026-10-27), so a simulated session recorded during one held
+only the replayed MAVLink — "no usable pings". With *Simulation*, START now reads the
+process table (`sonar_source.find_replay`: a running `bag_replay.py` and the `gz sim
+<folder>/world.sdf` a world folder with `scene.npz` runs) and, when nothing is
+`/side_scan_sonar`, starts `ros2 launch blueboat_sss_sim sss_sim_launch.py
+with_mavros_shim:=false auto_ping:=false world_dir:=<folder>`
+(`pipeline.replay_simulator*`) as a second launch tree of ours (`OWNER_ENV`, stopped
+with the pipeline, `sss_sim_node` swept owned-only), waiting up to
+`replay_simulator_wait_s` (30 s) for it to load. The replay feeds it the recorded pose
+(`/sim/sea_state/boat_pose`, 100 Hz) and the recorded `/mavros/*`. Verified end to end
+2026-11-02 on `pool_1w` + the 12:13:18 pool bag: 727 two-sided pings in 39 s, all
+placed (`tests/test_sonar_source.py`). The replay window's "no usable pings" dialog now
+tells "no sonar profile at all" from "profiles without a pose" (`no_pings_message`).
 
 **Recording lifecycle guards** (the "only the first session gets a .svlog" field
 bug): `PipelineLauncher.start()` and `set_recording()` return bool, and the GUI
@@ -470,6 +483,16 @@ with the one line `seabed.row_geometry: ping` in `config/default.yaml`** — tha
 previous contract (one row per ping, `rows`/`stride` in pings), kept in the code and in
 `tests/test_seabed_pictures.py`; nothing else changes.
 
+**Late pings (2026-11-02).** A ping older than the newest buffered one (a burst
+delivered ~1 s late over the WiFi hop: ~20 pings, measured on the 10-28 pool sessions,
+where picture rows ran ~21 pings back in time) is inserted at its time order with its
+along-track position interpolated in time, in both geometries
+(`SeabedImager._late_index`; `test_late_pings_keep_picture_rows_chronological`).
+Still open: at pivot turns the navigation point (GPS near the bow on the pool corpus)
+outruns the transducers, so square rows repeat pings (30–65 % on `weight_1time`); the
+fix needs the transducers' own track, whose fore/aft arm is not settled (−0.345 m drawing
+vs −0.60 m measured from the pool's navigation fix). Each row carries `yaw_rate_rad_s`.
+
 Windowing: a range change ends the window so every image is one homogeneous grid; the
 50 % overlap is the standard tiling guarantee that an object smaller than the stride
 appears whole in at least one image. **The overlap is deliberate**: consecutive images
@@ -513,7 +536,9 @@ set, i.e. after START — a harness that calls `enable_pinging()` directly sees 
 the bus and an empty mosaic.
 
 **`--sim` end-to-end, as measured by the suite** (Linux, offscreen Qt): a 3 s
-START/STOP cycle produces ~44 pings at the 15 Hz sim rate, each split evenly 220 `+y`
+START/STOP cycle produces ~44 pings at the 15 Hz sim rate of the time (20 Hz since
+2026-10-27, `SimConfig.ping_hz` = SonarView's / the driver's 50 ms; the test scales its
+bound with the rate), each split evenly 220 `+y`
 port / 220 `−y` starboard; the mosaic auto-tunes its cell size from the 0.10 m default
 to 0.0753 m on the first ping; the waterfall buffer fills to `(44, 800)`; and STOP with
 no active session exports nothing, as NC #9 requires. The simulator leaves

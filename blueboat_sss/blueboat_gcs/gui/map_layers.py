@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsItem,
 
 from ..mapping.geo import latlon_to_local_en, local_en_to_latlon
 from ..mapping.tiles import (TILE_SIZE_PX, TileFetcher, TileKey,
-                             latlon_to_tile, tile_to_latlon,
+                             MIN_ZOOM, latlon_to_tile, tile_to_latlon,
                              zoom_for_resolution)
 from ..models.detection import Detection, PingerFix
 from . import theme
@@ -519,6 +519,11 @@ class TileLayer:
     the anchor refits (the MCS rule). Only active once the anchor
     exists. Tiles for the current zoom level replace tiles of the
     previous one as they arrive, which keeps zoom transitions smooth.
+
+    Where the provider has no imagery at the wanted zoom (HTTP 4xx or its
+    grey placeholder, flagged by the fetcher), the layer falls back to the
+    finest coarser zoom and magnifies it; coarser tiles also stay underneath
+    the current zoom while it loads.
     """
 
     MAX_TILES_PER_UPDATE = 96
@@ -532,7 +537,9 @@ class TileLayer:
         self._items: Dict[TileKey, QGraphicsPixmapItem] = {}
         self._zoom: Optional[int] = None
         self._visible = True
+        self._last_view: Optional[Tuple[QRectF, float]] = None
         fetcher.tile_ready.connect(self._on_tile_ready)
+        fetcher.tile_missing.connect(self._on_tile_missing)
 
     # -- viewport driven update ------------------------------------------------
     def update_viewport(self, en_rect: QRectF, metres_per_px: float) -> None:
@@ -540,42 +547,64 @@ class TileLayer:
         origin = self._origin()
         if not (self._visible and origin is not None):
             return
+        self._last_view = (en_rect, metres_per_px)
         lat0, lon0 = origin
         z = zoom_for_resolution(lat0, metres_per_px)
 
+        def needed(zoom: int) -> list:
+            # EN rect corners -> lat/lon -> tile index range.
+            corners = [(en_rect.left(), en_rect.top()),
+                       (en_rect.right(), en_rect.bottom())]
+            txs, tys = [], []
+            for east, north in corners:
+                lat, lon = local_en_to_latlon(east, north, lat0, lon0)
+                tx, ty = latlon_to_tile(lat, lon, zoom)
+                txs.append(tx)
+                tys.append(ty)
+            x0, x1 = int(math.floor(min(txs))), int(math.floor(max(txs)))
+            y0, y1 = int(math.floor(min(tys))), int(math.floor(max(tys)))
+            n = 2 ** zoom
+            return [(zoom, tx, ty)
+                    for tx in range(max(0, x0), min(n - 1, x1) + 1)
+                    for ty in range(max(0, y0), min(n - 1, y1) + 1)
+                    ][:self.MAX_TILES_PER_UPDATE]
+
+        # Every tile of this view known to be missing: use the next coarser
+        # zoom, whose loaded tiles are simply magnified.
+        keys = needed(z)
+        while z > MIN_ZOOM and keys and all(
+                self._fetcher.is_missing(k) for k in keys):
+            z -= 1
+            keys = needed(z)
+
         if z != self._zoom:
-            self._drop_other_zooms(z)
             self._zoom = z
+            self._drop_far_zooms()
+            for key, item in self._items.items():
+                item.setVisible(self._visible and self._shown(key[0]))
 
-        # EN rect corners -> lat/lon -> tile index range.
-        corners = [(en_rect.left(), en_rect.top()),
-                   (en_rect.right(), en_rect.bottom())]
-        txs, tys = [], []
-        for east, north in corners:
-            lat, lon = local_en_to_latlon(east, north, lat0, lon0)
-            tx, ty = latlon_to_tile(lat, lon, z)
-            txs.append(tx)
-            tys.append(ty)
-        x0, x1 = int(math.floor(min(txs))), int(math.floor(max(txs)))
-        y0, y1 = int(math.floor(min(tys))), int(math.floor(max(tys)))
-        n = 2 ** z
+        for key in keys:
+            if key in self._items or self._fetcher.is_missing(key):
+                continue
+            img = self._fetcher.request(key)
+            if img is not None:
+                self._place_tile(key, img)
 
-        count = 0
-        for tx in range(max(0, x0), min(n - 1, x1) + 1):
-            for ty in range(max(0, y0), min(n - 1, y1) + 1):
-                if count >= self.MAX_TILES_PER_UPDATE:
-                    return
-                count += 1
-                key = (z, tx, ty)
-                if key in self._items:
-                    continue
-                img = self._fetcher.request(key)
-                if img is not None:
-                    self._place_tile(key, img)
+    def _shown(self, z: int) -> bool:
+        # Coarser tiles stay underneath (finer ones cover them), so the view
+        # is never blank while a finer zoom loads or has no imagery.
+        return self._zoom is not None and self._zoom - 3 <= z <= self._zoom
 
     def _on_tile_ready(self, z: int, x: int, y: int, img: QImage) -> None:
-        if z == self._zoom and (z, x, y) not in self._items:
+        if self._shown(z) and (z, x, y) not in self._items:
             self._place_tile((z, x, y), img)
+
+    def _on_tile_missing(self, z: int, x: int, y: int) -> None:
+        item = self._items.pop((z, x, y), None)      # a placeholder drawn early
+        if item is not None:
+            self._scene.removeItem(item)
+        if self._last_view is not None:
+            self.update_viewport(*self._last_view)
 
     def _place_tile(self, key: TileKey, img: QImage) -> None:
         origin = self._origin()
@@ -587,18 +616,18 @@ class TileLayer:
         se = latlon_to_local_en(*tile_to_latlon(tx + 1, ty + 1, z),
                                 lat0, lon0)
         item = QGraphicsPixmapItem(QPixmap.fromImage(img))
-        item.setZValue(Z_TILES)
+        item.setZValue(Z_TILES + 0.01 * z)       # finer tiles over coarser
         item.setTransformationMode(Qt.SmoothTransformation)
         item.setPos(w2s(nw[0], nw[1]))  # NW corner; north decreases southward
         sx = (se[0] - nw[0]) / TILE_SIZE_PX
         sy = (nw[1] - se[1]) / TILE_SIZE_PX  # scene y grows downward
         item.setTransform(QTransform.fromScale(sx, sy))
-        item.setVisible(self._visible)
+        item.setVisible(self._visible and self._shown(z))
         self._scene.addItem(item)
         self._items[key] = item
 
-    def _drop_other_zooms(self, keep_zoom: int) -> None:
-        for key in [k for k in self._items if k[0] != keep_zoom]:
+    def _drop_far_zooms(self) -> None:
+        for key in [k for k in self._items if not self._shown(k[0])]:
             self._scene.removeItem(self._items.pop(key))
 
     def set_visible(self, visible: bool) -> None:

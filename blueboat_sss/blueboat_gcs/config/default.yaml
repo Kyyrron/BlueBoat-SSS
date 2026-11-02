@@ -34,7 +34,11 @@ pipeline:
   stop_grace_s: 5.0            # SIGINT -> SIGTERM after this grace
   stop_term_grace_s: 3.0       # SIGTERM -> SIGKILL after this grace
   leftover_process_patterns: ["sss_processor_node"]
-  owned_process_patterns: ["sss_node.py"]   # swept only if this app launched it
+  owned_process_patterns: ["sss_node.py", "sss_sim_node"]   # swept only if this app launched it
+  replay_simulator: true       # bag replay + Sonar: Simulation -> START starts sss_sim_node
+  replay_simulator_launch: ["ros2", "launch", "blueboat_sss_sim", "sss_sim_launch.py",
+                            "with_mavros_shim:=false", "auto_ping:=false"]
+  replay_simulator_wait_s: 30.0  # scene load before it subscribes to ping/enable
 
 mosaic:
   auto_cell_size: true     # derive resolution from the log (range/num_results)

@@ -31,14 +31,15 @@ package; both are installed by ``install(DIRECTORY launch ...)`` in
 CMakeLists.txt.
 
 Note on acquisition settings (see docs/SONARVIEW_SVLOG_ANALYSIS.md): the
-defaults below are sss_node.py's own — 20 m, device auto-gain, 1200 bins
-(16.7 mm range sampling, the device maximum) and pulse 0.00125, which keeps
-the transmit pulse on the device's 44.3 us floor up to ~27 m (measured law
+defaults below are sss_node.py's own and SonarView's — 20 m, 50 ms per ping
+(20 pings/s, SonarView's command; 0 would free-run the device at 2R/c +
+~2.3 ms, 34.5 Hz at 20 m), device auto-gain, 1200 bins (16.7 mm range
+sampling, the device maximum) and pulse 0.00125, which keeps the transmit
+pulse on the device's 44.3 us floor up to ~27 m (measured law
 pulse = max(44.3 us, pulse_len_percent x 2R/c); 33 mm true range
 resolution). The range is sized from water depth (~4x the deepest expected)
-rather than from the area to cover. project_synthesis.md 8.5 reserves
-30 m per side for coverage passes and 15 m for revisit passes; pass those
-explicitly per run.
+rather than from the area to cover; project_synthesis.md 8.5 sets 20 m per
+side for every survey condition (owner, 2026-10-20).
 """
 
 from simple_launch import SimpleLauncher
@@ -56,7 +57,7 @@ def generate_launch_description():
     # ---- sss_node parameters (only used when with_acquisition:=True) --------
     sl_range_start_mm    = sl.declare_arg('range_start_mm',    default_value=0)
     sl_range_length_mm   = sl.declare_arg('range_length_mm',   default_value=20000)
-    sl_msec_per_ping     = sl.declare_arg('msec_per_ping',     default_value=0)
+    sl_msec_per_ping     = sl.declare_arg('msec_per_ping',     default_value=50)
     sl_gain_index        = sl.declare_arg('gain_index',        default_value=-1)
     sl_num_results       = sl.declare_arg('num_results',       default_value=1200)
     sl_pulse_len_percent = sl.declare_arg('pulse_len_percent', default_value=0.00125)

@@ -258,3 +258,36 @@ def test_pictures_carry_the_gain_columns_and_still_invert(qapp, tmp_path):
     _png, json_path = img.save(tmp_path)
     with np.load(json_path.with_name(json_path.stem + "_world.npz")) as z:
         assert z["row_gain_db"].shape == (16, 2)
+
+
+def _source_ping_numbers(img):
+    return np.array([r["port_ping_number"] for r in img.metadata()["rows_data"]])
+
+
+@pytest.mark.parametrize("geometry", ["square", "ping"])
+def test_late_pings_keep_picture_rows_chronological(qapp, monkeypatch, geometry):
+    """2026-11-02: on the 10-28 pool sessions ~20 pings arrived ~1 s late (a
+    burst over the WiFi hop); appended in arrival order, they took the newest
+    along-track position and picture rows ran ~21 pings back in time. A late
+    ping now goes in at its time order."""
+    import dataclasses
+    cfg = AppConfig()
+    cfg.seabed.rows, cfg.seabed.stride = 40, 20
+    cfg.seabed.row_geometry = geometry
+    pings = [dataclasses.replace(p, port_ping_number=1000 + i, stbd_ping_number=1000 + i)
+             for i, p in enumerate(make_pings(240, step_m=PITCH * 0.8))]
+    arrival = pings[:120] + pings[140:160] + pings[120:140] + pings[160:]   # 20 late
+    model = DisplayModel.fit(cfg, pings)
+
+    def backwards(images):
+        # row 0 = newest: source ping numbers must never increase down the picture
+        return sum(int(np.sum(np.diff(_source_ping_numbers(im)) > 0)) for im in images)
+
+    images = run(cfg, arrival, model)
+    assert len(images) >= 5
+    assert backwards(images) == 0
+    # The guard is real: without the time-ordered insertion the burst
+    # reorders rows exactly as measured on the pool sessions.
+    from blueboat_gcs.core.seabed_imager import SeabedImager as _SI
+    monkeypatch.setattr(_SI, "_late_index", lambda self, t: None)
+    assert backwards(run(cfg, arrival, model)) > 0

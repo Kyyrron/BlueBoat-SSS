@@ -128,7 +128,8 @@ class ReplayWindow(QMainWindow):
                     else config.map.osm_url)
         self._tile_fetcher = TileFetcher(
             tile_url, Path(config.map.tile_cache_dir).expanduser(),
-            config.map.max_concurrent_tile_requests, parent=self)
+            config.map.max_concurrent_tile_requests, parent=self,
+            detect_placeholders=config.map.use_satellite)
         self.tile_layer = TileLayer(scene, self._tile_fetcher,
                                     lambda: self.geo.origin)
         self.world_root = WorldRoot(scene)
@@ -785,6 +786,24 @@ class ReplayWindow(QMainWindow):
 
 
 # ---------------------------------------------------------------------------
+def no_pings_message(mission) -> str:
+    """Why a log yields no usable ping (2026-11-02). Until then the dialog
+    always blamed missing poses -- also for a log holding no sonar profile
+    at all (a simulated session recorded while no sonar node ran: the
+    processor still logs the autopilot's MAVLink), which sent the operator
+    after the wrong cause."""
+    if getattr(mission, "dropped_no_pose", 0) > 0:
+        return ("No usable pings found in this log.\n\n"
+                f"Every profile ({mission.dropped_no_pose} pings) lacked a pose "
+                "(no LOCAL_POSITION_NED before the sonar data). Single-sided "
+                "logs and logs without a bottom lock load normally.")
+    return ("No sonar data in this log: it holds no sonar profile at all, only "
+            "other packets (autopilot MAVLink, session headers).\n\n"
+            "Nothing was pinging while it recorded. In Simulation the simulator "
+            "is /side_scan_sonar: check that it was running (a bag replay needs "
+            "a world folder; the GCS starts the simulator for it at START).")
+
+
 def open_svlog_dialog(parent, config: AppConfig) -> Optional[ReplayWindow]:
     """File dialog + progress-loaded ReplayWindow (used by main_window)."""
     from PySide6.QtWidgets import QFileDialog
@@ -812,12 +831,7 @@ def open_svlog_dialog(parent, config: AppConfig) -> Optional[ReplayWindow]:
         return None
     progress.close()
     if mission.ping_count == 0:
-        QMessageBox.warning(
-            parent, "Open SVLOG",
-            "No usable pings found in this log.\n\n"
-            "Every profile lacked a pose (no LOCAL_POSITION_NED before the "
-            "sonar data). Single-sided logs and logs without a bottom lock "
-            "now load normally.")
+        QMessageBox.warning(parent, "Open SVLOG", no_pings_message(mission))
         return None
     win = ReplayWindow(mission, config, parent=parent)
     win.show()

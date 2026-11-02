@@ -78,10 +78,18 @@ interface or framing mismatch. Types prefixed `blueboat_interfaces/` come from t
 external interfaces package.
 
 ### `sss_node.py` — node name `side_scan_sonar`
-Drives **two** Cerulean Omniscan 450 SS units over TCP via `brping.Omniscan450`
-(one `OmniscanWorker` thread each, with a reconnect loop). Port is
-`192.168.2.92:51200`, starboard `192.168.2.93:51200`, hard-coded in the node.
-**VERIFIED.**
+Drives **two** Cerulean Omniscan 450 SS units over TCP, one `OmniscanWorker` thread
+each with a reconnect loop, each owning one `OmniscanLink`
+(`src/_custom_libraries/omniscan_link.py`, ROS-free: its own socket, receive buffer
+and framer — blocking `recv_into`, checksum-verified frames, resync past corruption).
+Port is `192.168.2.92:51200`, starboard `192.168.2.93:51200`, hard-coded in the node.
+**VERIFIED.** `brping` is no longer used at runtime (2026-10-27): its
+`PingDevice._input_buffer` is a **class** attribute, so the two devices of one process
+read both TCP streams into one deque from two threads (the 15:07 field log of
+2026-10-27: `[starboard] connection lost: pop from an empty deque`, a forced reconnect
+mid-survey); its TCP `read_io` busy-spins a core per idle thread; it parses byte by byte
+and drops message ids it has no template for. It stays the test oracle for the command
+bytes (`tests/test_omniscan_link.py`).
 
 | Direction | Topic | Type | Other end |
 |---|---|---|---|
@@ -94,18 +102,35 @@ Drives **two** Cerulean Omniscan 450 SS units over TCP via `brping.Omniscan450`
 All four publishers use `BEST_EFFORT`, `KEEP_LAST`, depth 10. Pinging is **OFF at
 startup**; acquisition parameters are re-read on every enable. **VERIFIED.**
 
-`~/raw` carries the **already-framed Cerulean Ping Protocol packet** republished
-verbatim from `brping` (`data.msg_data`). `OmniscanProfile` mirrors the decoded
-header (fields: `BlueBoat-Control/blueboat_interfaces/msg/OmniscanProfile.msg`;
-`pwr_results` is `uint16[]`, normalised per ping onto `[min_pwr_db, max_pwr_db]`).
+`~/raw` carries the **already-framed Cerulean Ping Protocol packet**, verbatim as the
+device sent it — **every** device frame, not only profiles: the Omniscan status frames
+(id 2194, ~0.9 Hz per device in SonarView logs) and any id newer firmware adds go to
+`~/raw` only (into the `.svlog`, as SonarView records them); replies to our own
+commands (ack, nack, device_information) are not forwarded, and a NACK is logged as a
+warning. `OmniscanProfile` mirrors the decoded header (fields:
+`BlueBoat-Control/blueboat_interfaces/msg/OmniscanProfile.msg`; `pwr_results` is
+`uint16[]`, normalised per ping onto `[min_pwr_db, max_pwr_db]`), filled from one C
+array (`array('H')`), no per-sample Python objects.
+
+**Health line** every 10 s per side while pinging: profiles and rate, missing ping
+numbers, longest gap, checksum errors, resync bytes, other ids seen (warning level when
+anything was lost). A ping missing *there* was lost before ROS (device, WiFi, TCP);
+the processor's and GCS's own counts can only add DDS losses — the split the
+2026-10-27 analysis needed and did not have.
 
 Parameters, declared identically in `sss_node.py` and both launch files
-(**VERIFIED**): `range_start_mm` (0), `range_length_mm` (20000), `msec_per_ping` (0),
-`gain_index` (−1 = device auto), `num_results` (1200), `pulse_len_percent` (0.00125).
-`FILTER_DURATION_PERCENT` is pinned at 0.0015 and is not a parameter. 1200 / 0.00125 =
-the device's best range resolution (owner's decision 2026-09-28; the transmit pulse stays
-on its **MEASURED** 44.3 µs floor up to ~27 m). The simulator's `sss_sim_node` declares the
-same six defaults (its smoke test asserts the equality).
+(**VERIFIED**): `range_start_mm` (0), `range_length_mm` (20000), `msec_per_ping`
+(**50**, SonarView's command since 2026-10-27), `gain_index` (−1 = device auto),
+`num_results` (1200), `pulse_len_percent` (0.00125) — SonarView's acquisition exactly
+(only the range may differ by the owner's order). `msec_per_ping` is a lower bound:
+period = max(it, 2R/c + ~3 ms), so 20 pings/s up to ~35 m; `0` free-runs the device at
+2R/c + 2.3 ms, **MEASURED** 29.0 ms (34.5 Hz) at 20 m on every 2026-10-27 recording,
+1.7× the link bandwidth and a 2.3 ms range-ambiguity margin. A stop repeats the last
+configuration with `enable=0`. `FILTER_DURATION_PERCENT` is pinned at 0.0015 and is not
+a parameter (SonarView's value is not observable in any log: UNVERIFIABLE HERE). 1200 /
+0.00125 = the device's best range resolution (owner's decision 2026-09-28; the transmit
+pulse stays on its **MEASURED** 44.3 µs floor up to ~27 m). The simulator's
+`sss_sim_node` declares the same six defaults (its smoke test asserts the equality).
 
 ### `sss_processor_node.py` — node name `sss_processor`
 Slant-range correction, bottom tracking, port/starboard merge, and `.svlog` writing.
@@ -115,12 +140,33 @@ The two responsibilities are independent: processing runs whether or not logging
 |---|---|---|---|
 | Sub | `/side_scan_sonar/{port,starboard}/raw` | `std_msgs/UInt8MultiArray` | feeds `.svlog` |
 | Sub | `/side_scan_sonar/{port,starboard}/profile` | `OmniscanProfile` | feeds processing |
-| Sub | `/blueboat/odom` | `nav_msgs/Odometry` | pose snapped per ping, 5 s buffer |
+| Sub | `/blueboat/odom` | `nav_msgs/Odometry` | pose interpolated to each ping, 5 s buffer |
 | Sub | `/sss_processor/log/enable` | `std_msgs/Bool` | GCS Record ON/OFF |
 | Pub | `/sss_processor/processed` | `blueboat_interfaces/ProcessedSSSPing` | GCS |
+| Cli | `/mavros/set_message_interval` | `mavros_msgs/MessageInterval` | SonarView's mavlink rates, below |
 
 All of the above are **VERIFIED** against the source, and the three externally-visible
 names match `blueboat_gcs/config/default.yaml` exactly.
+
+**SonarView's mavlink rates (2026-10-27, owner's order: "as close to SonarView as
+possible").** While profiles arrive (one within 5 s), the processor requests from the
+autopilot exactly the message intervals SonarView writes in its id-10 header
+(`svlog_helper.DEFAULT_PERIODIC_MESSAGES`: HEARTBEAT 1 Hz; ATTITUDE, LOCAL_POSITION_NED,
+GLOBAL_POSITION_INT 30 Hz; SCALED_PRESSURE2, VFR_HUD 3 Hz; GPS_GLOBAL_ORIGIN 1 Hz;
+AUTOPILOT_VERSION 1/60 Hz), asynchronously, and repeats it every 30 s (an autopilot
+reboot resets intervals). Absent the service (simulation) it logs once and carries on.
+Without the request the autopilot streams **4 Hz** on the mavros link; with it,
+SonarView's own recordings carry **12.8 Hz** per message (the autopilot's delivered
+ceiling, measured on the boat; cause UNVERIFIABLE HERE), and run bags made while
+SonarView was open show `/mavros/local_position/odom` at 10.7–13 Hz. **The request is
+autopilot-wide — `/blueboat/odom` and BlueBoat-Control's 20 Hz loop get the faster pose
+too** (owner accepted, 2026-10-27: fresher pose, a smooth PID derivative instead of a
+5× spike every fifth tick, gains may need a retune, `/mavros/*` in run bags ~3×; root
+`CLAUDE.md` §4.4).
+
+**Rate watchdog.** While recording, every 10 s, it warns once when ATTITUDE, GPI or LPN
+arrive below 10 Hz, or when a side's ping rate is more than 10 % off SonarView's law
+(`sonarview_ping_hz`: max(50 ms, 2R/c + 3 ms)), and says when the rates recover.
 
 Mavros telemetry, wrapped into `.svlog` packet-id-150 mavlink envelopes
 (**VERIFIED** — these are the ROS topic names, not the mavlink message names):
@@ -136,10 +182,24 @@ Mavros telemetry, wrapped into `.svlog` packet-id-150 mavlink envelopes
 | `/mavros/home_position/home` | `mavros_msgs/HomePosition` | `HOME_POSITION` |
 | `/mavros/global_position/gp_origin` | `geographic_msgs/GeoPointStamped` | `GPS_GLOBAL_ORIGIN` |
 | `/mavros/vfr_hud` | `mavros_msgs/VfrHud` | `VFR_HUD` |
+| `/mavros/state` | `mavros_msgs/State` | `HEARTBEAT` (SonarView's shape: Rover `custom_mode`, `base_mode` bits, `MAV_TYPE_SURFACE_BOAT`) |
+| `/mavros/statustext/recv` | `mavros_msgs/StatusText` | `STATUSTEXT` (50-char array, as SonarView records it — the link guardian's messages land in the `.svlog`) |
 
 `time_boot_ms` is derived from each message `header.stamp` so messages from one source
 burst keep an identical value — SonarView pairs ATTITUDE / GLOBAL_POSITION_INT /
-LOCAL_POSITION_NED on it to compute heading-corrected position.
+LOCAL_POSITION_NED on it to compute heading-corrected position. **A zero stamp** (a
+real-robot launch: mavros on `use_sim_time` with no `/clock`) uses the arrival time
+instead, grouped by `_BurstClock` (arrivals within 5 ms share one value). Before
+2026-10-27 every pose of every field `.svlog` carried one frozen value,
+4288904828 = (0 − node boot) mod 2³². `HOME_POSITION` / `GPS_GLOBAL_ORIGIN` carry
+`time_usec` on the same clock.
+
+**Wire format as SonarView writes it** (`svlog_helper`, both copies, NC #7): the mavlink
+wrapper is tagged `src=0xFF`, `dst=0` (it was `src=3` until 2026-10-27; no reader here
+routes mavlink by `src`), its mavlink2rest JSON has sorted keys and a 2-space indent;
+the file header is the id-10 session metadata followed by SonarView's id-12 view config
+(`DEFAULT_VIEW_CONFIG`), and `doppler_enable` is `true` as SonarView writes it (its
+meaning is UNVERIFIABLE HERE).
 
 Sonar and odom subscriptions use `BEST_EFFORT`, `KEEP_LAST`, **depth 10**. **VERIFIED.**
 
@@ -170,8 +230,13 @@ recovers it by voting each ping against the opposite side's temporally nearest o
 pings of a mission are keyed correctly. What signals a torn row is the gap
 *changing*, never the gap being non-zero. **MEASURED.**
 
+**Pose is interpolated** (2026-10-27): `_OdomBuffer.pose_at` places each ping between
+the two odom samples that bracket its stamp (position linear, orientation a normalised
+lerp on the short arc), falling back to `nearest()` with the same tolerance; at 4 Hz
+odom the nearest-sample snap stepped the track by up to 25 cm at 1 m/s.
+
 **Pose is a hard gate.** `_emit_group` drops the ping outright if the odom buffer
-is empty, and again if the nearest-stamp lookup returns nothing; both increment
+is empty, and again if the pose lookup returns nothing; both increment
 `_dropped_no_odom`. The lookup refuses a sample farther than
 `ODOM_NEAREST_TOLERANCE_S` (1 s) from the profile stamp and prunes stale entries at
 lookup time too — previously a dead or clock-mismatched `/blueboat/odom` left the
@@ -191,10 +256,17 @@ while unlocked; nothing is dropped for it. **VERIFIED.**
 
 The four transducer-geometry constants: since `994a74b` (2026-10-13)
 `TRANSDUCER_Y_OFFSET_PORT_M` / `_STBD_M` = **0.285** (BR-101447 hull spacing 570 mm / 2)
-and `TRANSDUCER_SUBMERSION_M` = **0.15** (an estimate, = the simulator's `sensor_depth_m`),
-mirrored in the GCS's `core/svlog.py`; `TRANSDUCER_X_OFFSET_M` is still 0.0 (fore/aft,
-unmeasured, `TODO`). So `water_depth = altitude + 0.15` and
-`y = ±(0.285 + sqrt(s² − altitude²))`. **VERIFIED** (`sss_processor_node.py:122-125`).
+and `TRANSDUCER_SUBMERSION_M` = **0.22** since 2026-11-02 (**measured**, SSS-Sim
+field-calibration pass 3: the rear-most hull holes 0.030 m above the keel, the waterline
+0.216–0.241 m at 16–22 kg, and the 0.90 m pool reproduces every run's FBR altitude to
+±0.03 m; = the simulator's `sensor_depth_m`; was 0.15, an estimate), mirrored in the
+GCS's `core/svlog.py`; `TRANSDUCER_X_OFFSET_M` is still 0.0: the drawing says −0.345 m
+from the hull centre, the pool walls −0.60 m from the navigation fix (GPS near the bow),
+and it only rides in `ProcessedSSSPing.transducer_x_offset` — no georeference uses a
+fore/aft arm yet (a georef convention change, Perception's contract; planned). So
+`water_depth = altitude + 0.22` and `y = ±(0.285 + sqrt(s² − altitude²))`. **VERIFIED**
+(`sss_processor_node.py:136-139`). The golden pings keep their frozen 0.15 convention
+(`tests/golden_pings.py`).
 
 `.svlog` files are written to `../../../../data/SSS_data`, resolved relative to the
 launch working directory — the same root the GCS uses as `data_root`. The node resolves
@@ -288,6 +360,21 @@ Violating any of these breaks another module, the hardware integration, or the t
 3. **`~/raw` must keep being published.** The processor writes `.svlog` from it;
    disabling it produces empty logs.
 
+3a. **One receive buffer per device; never share parser or socket state between the
+   two Omniscan links** (2026-10-27). `brping`'s class-level `_input_buffer` made the
+   port and starboard threads pop one deque: frames parsed by the wrong worker, lost to
+   bad checksums, and a forced reconnect in the field (`pop from an empty deque`, the
+   15:07 run). `OmniscanLink` owns everything per instance, and
+   `tests/test_omniscan_link.py` pins it (two threads, two real sockets, zero loss, no
+   crossing). Do not reintroduce `brping` at runtime.
+
+3b. **Acquire as SonarView does** (owner, 2026-10-27): its acquisition parameters
+   (`msec_per_ping` 50, auto gain, 1200 bins, pulse 0.00125; only the range may vary),
+   its mavlink message rates, and its `.svlog` content — identically in this module and
+   in BlueBoat-SSS-Sim (CM-2). SonarView's recordings are the reference: 0 % ping loss at
+   20 pings/s against our 4–61 % free-running at 34.5 pings/s
+   (`blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md` §11).
+
 4. **Do not set the GCS sonar subscriber to `RELIABLE` on its own.** The publisher is
    `BEST_EFFORT`; a `RELIABLE` subscriber is QoS-incompatible and receives *nothing*.
    Change both ends together or not at all.
@@ -380,13 +467,34 @@ Gain is auto on both stacks and changes on <1 % of pings — it is **not** a sig
 contributor to banding. Transmit pulse length scales with range
 (`max(44.3 µs, pulse_len_percent × 2R/c)`), so a long range degrades range resolution too.
 
+**2026-10-27, same boat, same day, same 20 m / 1200 bins / 44.3 µs / auto gain**
+(**MEASURED** on files local to this machine, `~/ros2_ws/data/SSS_data/sessions/`;
+`blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md` §11):
+
+| | SonarView pool ×2 | ours, pool 10:30 | ours, harbour 15:07 / 15:54 / 16:07 |
+|---|---|---|---|
+| Recorder | SonarLink on BlueOS (the boat's Pi) | `sss_processor_node`, laptop over WiFi | same |
+| Ping interval | **50 ms** (20 Hz) | 29 ms (34.5 Hz, free run) | 29 ms |
+| Missing ping numbers | **0 %** | 5.2 % | 30.9 / 60.6 / 4.0 % (stalls to 7.1 s) |
+| Pose (ATTITUDE/GPI/LPN) | 12.8 Hz each | 4 Hz | 4 Hz (2 Hz during the 60.6 % run) |
+| `time_boot_ms` | advancing | frozen | frozen |
+| Status frames (2194) | ~0.9 Hz/device | none | none |
+| `channel_number` | 0/1 | 255 | 0/1 |
+
+The pings missing from our `.svlog` (processor, `~/raw` depth 10) are exactly the ones
+missing from the GCS's records (`~/profile` depth 200) in all four sessions: lost before
+ROS — the brping receive path (NC #3a) and the WiFi link, which SonarLink never crosses.
+Everything in that table except the recorder location is fixed in this module since
+2026-10-27; the field re-test is `TODO.md`'s.
+
 **The default range is 20 m.** `range_length_mm` defaults to `20000` in all three
 places that declare it: `src/sss_node.py`, `launch/SSS_processing_launch.py` and
 `launch/SSS_simple_launch.py`, giving **16.7 mm range sampling** at the default 1200
 samples (since 2026-09-28; 33.3 mm at the former 600). This is the no-argument default,
-sized from water depth per NC #5. `project_synthesis.md` §8.5's 30 m coverage pass and
-15 m revisit pass remain the experiment settings and must be passed explicitly per run;
-`terminals.txt`'s Live section shows the 30 m override.
+sized from water depth per NC #5, and `project_synthesis.md` §8.5's setting for every
+survey condition (owner, 2026-10-20; the old 30 m coverage / 15 m revisit passes are
+gone). `msec_per_ping` defaults to **50** in the same three places (SonarView's
+interval, 2026-10-27).
 
 ---
 
@@ -398,8 +506,10 @@ id, byte 6 = `src_device_id`, byte 7 = `dst_device_id`, payload, u16 checksum =
 `sum(bytes[0 .. 7+N]) & 0xFFFF`. Packet ids: 10 (session JSON), 12 (view config), 150
 (mavlink wrapper), 2194 (Omniscan status: 16-byte `<ffI3xB`, ~0.9 Hz per device, no
 imagery — `decode_omniscan_status`; the two floats are housekeeping telemetry of
-unestablished meaning), 2198 (`OS_MONO_PROFILE`). Device ids: port 1, starboard 2, platform
-3. Session-metadata packets use `src=0`, `dst=0xFF`. Written by the processor; readable
+unestablished meaning; forwarded by our driver since 2026-10-27 whenever the device sends
+them), 2198 (`OS_MONO_PROFILE`). Device ids: port 1, starboard 2, platform 3 (declared in
+the session JSON). Session-metadata packets (10, then 12) use `src=0`, `dst=0xFF`; mavlink
+wrappers `src=0xFF`, `dst=0`, as SonarView writes them. Written by the processor; readable
 by SonarView and by the GCS replay window. Files roll at 500 MB
 (`MAX_LOG_SIZE_BYTES = 500 * 1000 * 1000`).
 
@@ -428,7 +538,7 @@ the `svlog-forensics` skill (`.claude/skills/svlog-forensics/`); which tool answ
 
 **ROS 2 nodes** — `ros2 launch blueboat_sss SSS_processing_launch.py` (processor only;
 `with_acquisition:=True` adds `sss_node.py`, `will_use_rosbag:=True` overrides;
-`range_length_mm:=30000` for the §8.5 coverage pass). `SSS_simple_launch.py` = acquisition
+`msec_per_ping:=0` free-runs the device, a diagnostic only). `SSS_simple_launch.py` = acquisition
 only. `SSS_processing_launch.py` is what the GCS launches; its **Sonar: Real sonars**
 selector appends `with_acquisition:=True`. The two flags are launch-time conditions
 (nested `sl.group(unless_arg=…)` / `sl.group(if_arg=…)`) — a Python truthiness test on
@@ -446,8 +556,10 @@ QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m pytest -p no:cacheprovider
 - Do not `source ~/ros2_ws/install/setup.bash` first: it switches `python3` to the
   workspace venv, which lacks pytest. The system python has pytest, rclpy, PySide6 and
   `blueboat_interfaces`.
-- **353 pass / 50 skip on 2026-10-16** with the workspace's `blueboat_interfaces` on
-  `PYTHONPATH` / `LD_LIBRARY_PATH` (351 / 50 before the along-track window tests;
+- **387 pass / 51 skip on 2026-10-27** with the workspace's `blueboat_interfaces` on
+  `PYTHONPATH` / `LD_LIBRARY_PATH` (356 / 50 before the SonarView-parity work; the new
+  skip is the brping oracle, `bluerobotics-ping` being absent from the system python;
+  353 / 50 on 2026-10-16; 351 / 50 before the along-track window tests;
   297 / 50 on 2026-09-28; the gate was **red, 298 /
   4 fail / 50**, on 2026-10-16 before any edit: four stale expectations after
   `994a74b`'s constants, repaired as a labelled baseline repair, `TODO.md`); the skips
@@ -457,15 +569,27 @@ QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m pytest -p no:cacheprovider
   *Measured acquisition settings* still hold.
 - What each test file covers: read `tests/` (names are descriptive).
 
-The **node-side half** (`test_processor_assembly.py`, 31 tests) drives the real
+The **node-side half** (`test_processor_assembly.py`, 48 tests) drives the real
 `sss_processor_node` for NC #2 — row assembly, one-sided emission, the bounded flush,
 the pre-roll, the counter restart re-base, the wall-vs-stream clock separation of the
 flush timer, the torn-row warning, the counter-offset estimator against the field
 `.svlog` corpus, and the
 odom buffer's nearest-stamp tolerance (fresh sample served, far sample refused with
-the measured skew recorded, stale samples pruned at lookup). It needs a sourced ROS 2
+the measured skew recorded, stale samples pruned at lookup) — and since 2026-10-27 the
+SonarView parity: pose interpolation (yaw wrap included), the zero-stamp burst clock,
+HEARTBEAT/STATUSTEXT shapes, the id-10 + id-12 header, the wrapper tag, the
+message-interval request (sent while streaming, re-asserted, skipped without the
+service) and the rate watchdog. It needs a sourced ROS 2
 workspace and skips cleanly without one, so the suite stays laptop-runnable. It never
 enables logging and opens the corpus read-only (NC #6).
+
+The **driver** is covered by `test_omniscan_link.py` (ROS-free: framer under random
+chunking, corruption and false syncs; command bytes = brping's; decode = the GCS
+decoder; two links share nothing; two real sockets in two threads lose nothing and
+never cross; a SonarView recording re-framed frame for frame when the local pool logs
+exist) and `test_sss_node_driver.py` (two real `OmniscanWorker` threads against two
+`tests/fake_omniscan.py` TCP devices: every ping on its own side, status frames on
+`~/raw` only, 50 ms commanded, silent after stop, declared defaults = SonarView's).
 
 Availability is probed with `importlib.util.find_spec`, **not**
 `pytest.importorskip`: a module-level `importorskip` raises `Skipped` during
@@ -488,6 +612,8 @@ No linter or type-checker is configured.
 
 **Dependencies.** `requirements-dev.txt` pins `numpy<2` and `opencv-python<5`: ROS 2
 Jazzy's Python packages and `scipy` 1.11 are built against the numpy 1.x ABI, and an
-unpinned install resolves numpy 2.x. Node side additionally needs `bluerobotics-ping`
-(`brping`), `simple_launch`, `scipy`, `mavros_msgs`, `geographic_msgs`; `rosbag2_py` for
-`svlog_to_rosbag.py`. `pip` in some environments needs `--break-system-packages`.
+unpinned install resolves numpy 2.x. Node side additionally needs `simple_launch`,
+`scipy`, `mavros_msgs`, `geographic_msgs`; `rosbag2_py` for `svlog_to_rosbag.py`.
+`bluerobotics-ping` (`brping`) is **test-only** since 2026-10-27 (the oracle for the
+command bytes; the driver speaks the protocol itself, NC #3a). `pip` in some
+environments needs `--break-system-packages`.
