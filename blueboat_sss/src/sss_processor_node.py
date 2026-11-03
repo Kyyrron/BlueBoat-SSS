@@ -49,7 +49,10 @@ Cli  /mavros/set_message_interval          mavros_msgs/MessageInterval
 Mavlink rates (2026-10-27). While the sonar streams, the node asks the
 autopilot for SonarView's exact message-interval set (DEFAULT_PERIODIC_MESSAGES:
 ATTITUDE, LOCAL_POSITION_NED, GLOBAL_POSITION_INT at 30 Hz, ...) and repeats
-the request every 30 s, because an autopilot reboot resets intervals. The
+the request every 30 s, because an autopilot reboot resets intervals. Since
+2026-11-03 it is also renewed as soon as the measured pose rate falls below
+POSE_RATE_WARN_HZ: on the 2026-10-28 water run the 30 Hz held only ~9 s of
+every 30 s period (something resets the intervals; not identified). The
 request is autopilot-wide: every /mavros/* consumer, BlueBoat-Control's
 /blueboat/odom included, gets the higher rate (about 13 Hz delivered,
 measured with SonarView). Absent the service (simulation) it is skipped.
@@ -222,9 +225,25 @@ SONAR_ACTIVE_WINDOW_S:     float = 5.0    # "the sonar is streaming" = a profile
 # GLOBAL_POSITION_INT / LOCAL_POSITION_NED on equal values.
 MAVLINK_BURST_WINDOW_NS:   int   = 5_000_000
 RATE_WATCH_PERIOD_S:       float = 10.0
+# A watchdog window shorter than this (the first one after Record ON, which
+# opens at the first logged envelope) is carried into the next tick instead
+# of being judged: one message in 0.3 s is no rate.
+RATE_WATCH_MIN_S:          float = 5.0
 # SonarView's recordings carry ~12.8 Hz of each pose message for its 30 Hz
 # request; the autopilot default without a request is 4 Hz.
 POSE_RATE_WARN_HZ:         float = 10.0
+# Renewal of the rate request (2026-11-03): on the 2026-10-28 water run the
+# autopilot delivered 30 Hz for ~9 s of every 30 s re-assert period and 4 Hz
+# for the rest -- something resets the intervals (cause not identified,
+# TODO.md). The slowest of ATTITUDE / GPI / LPN is measured over a trailing
+# POSE_RENEW_WINDOW_S, recording or not, and the request is renewed when it
+# is below POSE_RATE_WARN_HZ, at most once per POSE_RENEW_HOLDOFF_S (longer
+# than the window, so the rate judged was measured after the last request).
+# MAVLINK_RATE_REASSERT_S stays the fallback.
+POSE_RENEW_WINDOW_S:       float = 3.0
+POSE_RENEW_HOLDOFF_S:      float = 5.0
+POSE_MESSAGES:             Tuple[str, ...] = (
+    "ATTITUDE", "GLOBAL_POSITION_INT", "LOCAL_POSITION_NED")
 # Ping period SonarView commands: max(50 ms, 2R/c + ~3 ms).
 SONARVIEW_MSEC_PER_PING:   float = 50.0
 DEVICE_PROCESSING_MS:      float = 3.0
@@ -253,6 +272,9 @@ class _OdomBuffer:
         #: caller tell "never received" from "received, then pruned".
         self.pushed = 0
         self.zero_stamped = 0
+        #: samples discarded because the clock went back by more than the
+        #: window (a new time epoch; see push()).
+        self.epoch_dropped = 0
 
     def push(self, msg: Odometry, arrival_ns: Optional[int] = None) -> None:
         """Buffer one sample under its header stamp.
@@ -262,6 +284,15 @@ class _OdomBuffer:
         so ``/blueboat/odom`` is stamped 0 while the sonar profiles carry
         the node's wall clock. Keyed on 0, the sample was pruned by the
         first lookup and every ping was dropped.
+
+        A sample more than the window *behind* the newest one opens a new
+        time epoch, and the samples outside the window around it are
+        discarded. Seen in a replay (2026-10-28): one zero-stamped odom
+        before /clock was keyed on wall time (~1.79e18 ns), every later one
+        on sim time; the wall sample sat at the head of the deque, the
+        head-only pruning here and in nearest() never got past it, and the
+        buffer grew without bound. The keying rules above are unchanged:
+        only a sample that can no longer be compared with the new clock goes.
         """
         ts = stamp_to_ns(msg.header.stamp)
         with self._lock:
@@ -270,6 +301,11 @@ class _OdomBuffer:
                 self.zero_stamped += 1
                 if arrival_ns is not None:
                     ts = arrival_ns
+            if self._samples and ts < self._samples[-1][0] - self._max_age_ns:
+                kept = deque(s for s in self._samples
+                             if abs(s[0] - ts) <= self._max_age_ns)
+                self.epoch_dropped += len(self._samples) - len(kept)
+                self._samples = kept
             self._samples.append((ts, msg))
             cutoff = ts - self._max_age_ns
             while self._samples and self._samples[0][0] < cutoff:
@@ -355,6 +391,32 @@ class _OdomBuffer:
             q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm)
         out.twist = m1.twist if w >= 0.5 else m0.twist
         return out
+
+
+class _PoseRateMeter:
+    """Arrival rate of the slowest pose message over a trailing window.
+
+    ``count(name)`` on every arrival (recording or not); ``sample(now)`` once
+    per timer tick returns the slowest of POSE_MESSAGES in Hz over the last
+    ``window_s``, or None until the ticks span a whole window. ROS-free.
+    """
+
+    def __init__(self, window_s: float = POSE_RENEW_WINDOW_S) -> None:
+        self._window_s = window_s
+        self._counts = {name: 0 for name in POSE_MESSAGES}
+        self._snaps: Deque[Tuple[float, dict]] = deque()
+
+    def count(self, name: str) -> None:
+        self._counts[name] += 1
+
+    def sample(self, now: float) -> Optional[float]:
+        self._snaps.append((now, dict(self._counts)))
+        while len(self._snaps) > 1 and now - self._snaps[1][0] >= self._window_s:
+            self._snaps.popleft()
+        t0, c0 = self._snaps[0]
+        if now - t0 < self._window_s:
+            return None
+        return min((self._counts[k] - c0[k]) / (now - t0) for k in self._counts)
 
 
 class _BurstClock:
@@ -509,19 +571,25 @@ class SSSProcessorNode(Node):
         self._node_boot_ns = time.monotonic_ns()
         self._burst_clock = _BurstClock()
         self._zero_stamp_warned = False
+        self._zero_odom_warned = False
 
         # SonarView's mavlink rate request (see the module docstring).
         self._rate_request_mono: Optional[float] = None
         self._rate_service_missing_logged = False
         self._rates_announced = False
         self._rate_failures_logged: set = set()
+        # Pose arrivals, recording or not: renews the request when the
+        # autopilot falls back below POSE_RATE_WARN_HZ.
+        self._pose_rate = _PoseRateMeter()
+        self._rate_renewals = 0
         # Rate watchdog: arrivals per RATE_WATCH_PERIOD_S window while
-        # recording; a warned condition is re-armed once it recovers.
-        self._watch_counts = {"ATTITUDE": 0, "GLOBAL_POSITION_INT": 0,
-                              "LOCAL_POSITION_NED": 0}
+        # recording; a warned condition is re-armed once it recovers. The
+        # window opens at the first logged pose envelope (None = not open),
+        # so the time before the .svlog opened does not dilute the rate.
+        self._watch_counts = {name: 0 for name in POSE_MESSAGES}
         self._watch_pings = [0, 0]
         self._watch_range_m: Optional[float] = None
-        self._watch_t0 = time.monotonic()
+        self._watch_t0: Optional[float] = None
         self._watch_warned: set = set()
 
         # ---- QoS -----------------------------------------------------------
@@ -604,6 +672,11 @@ class SSSProcessorNode(Node):
             f"({self._offset.confidence * 100:.0f}% of {self._offset.votes} votes), "
             f"{self._counter_restarts} counter restart(s) re-based"
         )
+        if self._rate_renewals or self._odom_buf.epoch_dropped:
+            self.get_logger().info(
+                f"mavlink rate request renewed {self._rate_renewals} time(s) "
+                f"on a low pose rate; {self._odom_buf.epoch_dropped} odom "
+                f"sample(s) dropped on a clock epoch change")
         self._svlog.stop()
 
     # ----- sonar subscribers ------------------------------------------------
@@ -616,15 +689,26 @@ class SSSProcessorNode(Node):
         self._accept(msg, topic_side=1)
 
     def _watch_ping(self, msg: OmniscanProfile, side: int) -> None:
-        self._watch_pings[side] += 1
+        if self._watch_t0 is not None:          # counted only in an open window
+            self._watch_pings[side] += 1
         self._watch_range_m = (msg.start_mm + msg.length_mm) / 1000.0
+
+    def _watch_pose(self, name: str) -> None:
+        """Count one logged pose envelope; the first opens the window."""
+        if self._watch_t0 is None:
+            self._watch_t0 = time.monotonic()
+        self._watch_counts[name] += 1
 
     def _on_odom(self, msg: Odometry) -> None:
         self._odom_buf.push(msg, self.get_clock().now().nanoseconds)
-        if self._odom_buf.zero_stamped == 1:
+        # Once: `zero_stamped` stays at 1 after a single zero stamp, so the
+        # old `== 1` test warned on every later odom (1339 times in one
+        # replay where one odom arrived before /clock).
+        if self._odom_buf.zero_stamped and not self._zero_odom_warned:
+            self._zero_odom_warned = True
             self.get_logger().warn(
                 "/blueboat/odom is stamped 0 (mavros on sim time without "
-                "/clock): placing poses by arrival time instead")
+                "/clock): placing poses by arrival time instead (warned once)")
 
     # The device id passed here is only the fallback: _write_raw_with_src_tag
     # tags each frame from the packet's own channel_number (NON-NEGOTIABLE #1).
@@ -640,6 +724,10 @@ class SSSProcessorNode(Node):
             # GCS has no feedback topic, so this error line on /rosout is what
             # tells the operator the Record button is lying.
             path = self._svlog.start()
+            # The watchdog's window restarts with the recording.
+            self._watch_t0 = None
+            self._watch_counts = {name: 0 for name in POSE_MESSAGES}
+            self._watch_pings = [0, 0]
             if path is None:
                 self.get_logger().error(
                     f"RECORDING FAILED: nothing is being written to "
@@ -672,9 +760,10 @@ class SSSProcessorNode(Node):
             self._latest_compass_hdg_cdeg = cdeg
 
     def _on_mavros_imu(self, msg: Imu) -> None:
+        self._pose_rate.count("ATTITUDE")
         if not self._svlog.active:
             return
-        self._watch_counts["ATTITUDE"] += 1
+        self._watch_pose("ATTITUDE")
         envelope = self._build_attitude_envelope(msg)
         if envelope is None:
             return
@@ -684,9 +773,10 @@ class SSSProcessorNode(Node):
             self.get_logger().warn(f"mavlink ATTITUDE write failed: {exc}")
 
     def _on_mavros_navsat(self, msg: NavSatFix) -> None:
+        self._pose_rate.count("GLOBAL_POSITION_INT")
         if not self._svlog.active:
             return
-        self._watch_counts["GLOBAL_POSITION_INT"] += 1
+        self._watch_pose("GLOBAL_POSITION_INT")
         envelope = self._build_global_position_envelope(msg)
         if envelope is None:
             return
@@ -702,9 +792,10 @@ class SSSProcessorNode(Node):
             self._latest_local_twist = msg
 
     def _on_mavros_local_pose(self, msg: PoseStamped) -> None:
+        self._pose_rate.count("LOCAL_POSITION_NED")
         if not self._svlog.active:
             return
-        self._watch_counts["LOCAL_POSITION_NED"] += 1
+        self._watch_pose("LOCAL_POSITION_NED")
         with self._aux_lock:
             twist = self._latest_local_twist
         try:
@@ -767,16 +858,24 @@ class SSSProcessorNode(Node):
     def _assert_mavlink_rates(self) -> None:
         """Ask the autopilot for SonarView's message intervals.
 
-        Sent as soon as the sonar streams (checked every second) and again
-        every MAVLINK_RATE_REASSERT_S while it does. Asynchronous: the
+        Sent as soon as the sonar streams (checked every second), again
+        every MAVLINK_RATE_REASSERT_S while it does, and earlier -- at most
+        once per POSE_RENEW_HOLDOFF_S -- when the pose rate measured over the
+        last POSE_RENEW_WINDOW_S is below POSE_RATE_WARN_HZ (the intervals
+        did not hold on the 2026-10-28 water run). Asynchronous: the
         executor is never blocked waiting for mavros.
         """
+        now = time.monotonic()
+        pose_hz = self._pose_rate.sample(now)   # every tick, streaming or not
         if not self._sonar_streaming():
             return
-        now = time.monotonic()
-        if (self._rate_request_mono is not None
-                and now - self._rate_request_mono < MAVLINK_RATE_REASSERT_S):
-            return
+        renew = False
+        if self._rate_request_mono is not None:
+            since = now - self._rate_request_mono
+            renew = (since >= POSE_RENEW_HOLDOFF_S and pose_hz is not None
+                     and pose_hz < POSE_RATE_WARN_HZ)
+            if since < MAVLINK_RATE_REASSERT_S and not renew:
+                return
         self._rate_request_mono = now
         if not self._rate_client.service_is_ready():
             if not self._rate_service_missing_logged:
@@ -792,6 +891,13 @@ class SSSProcessorNode(Node):
             future = self._rate_client.call_async(req)
             future.add_done_callback(
                 lambda f, mid=req.message_id: self._on_rate_answer(mid, f))
+        if renew:
+            self._rate_renewals += 1
+            if self._rate_renewals == 1:
+                self.get_logger().info(
+                    f"pose at {pose_hz:.1f} Hz (< {POSE_RATE_WARN_HZ:g} Hz) "
+                    "after the rate request: renewed it; renewing whenever "
+                    "the pose rate drops again (announced once)")
         if not self._rates_announced:
             self._rates_announced = True
             self.get_logger().info(
@@ -812,16 +918,31 @@ class SSSProcessorNode(Node):
                 f"id {message_id}")
 
     def _check_rates(self) -> None:
-        """Warn when a recording falls short of SonarView's rates."""
-        elapsed = time.monotonic() - self._watch_t0
+        """Warn when a recording falls short of SonarView's rates.
+
+        The window opens at the first logged pose envelope (`_watch_pose`),
+        not at the previous tick: the time before the .svlog opened diluted
+        the first window (2.8 Hz reported, 2026-10-28). If a whole tick
+        passes while recording with nothing logged, the window opens at that
+        tick, so a pose that never arrives is still reported (0 Hz). A
+        window shorter than RATE_WATCH_MIN_S is carried into the next tick.
+        """
+        now = time.monotonic()
+        if not self._svlog.active or self._watch_t0 is None:
+            for k in self._watch_counts:
+                self._watch_counts[k] = 0
+            self._watch_pings = [0, 0]
+            self._watch_t0 = now if self._svlog.active else None
+            return
+        elapsed = now - self._watch_t0
+        if elapsed < RATE_WATCH_MIN_S:
+            return
         counts, pings, range_m = (dict(self._watch_counts),
                                   list(self._watch_pings), self._watch_range_m)
         for k in self._watch_counts:
             self._watch_counts[k] = 0
         self._watch_pings = [0, 0]
-        self._watch_t0 = time.monotonic()
-        if not self._svlog.active or elapsed <= 0:
-            return
+        self._watch_t0 = now
         problems = {}
         for name, n in counts.items():
             hz = n / elapsed

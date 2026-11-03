@@ -39,6 +39,49 @@ Open:
   2026-09-19 decision "re-published, never frozen"; a fixed waterfall vertical scale (item
   3) reverts the 2026-09-18 true-scale decision. Both need the owner to reopen them.
 
+## From SSS-Sim calibration pass 4 (2026-11-02; report `~/calib/pass4/step1/D5b/REPORT.md`, owner's machine)
+
+Evidence: the 2026-10-28 water run (`fragmentation_evidence_8`) and a replay of it. The
+report is not readable from this repository; its numbers are carried, not re-derived.
+
+Done 2026-11-03 (`src/sss_processor_node.py`, tests in `tests/test_processor_assembly.py`):
+- **The 30 Hz rate request did not hold**: 30 Hz for ~9 s of every 30 s re-assert period,
+  4 Hz for the other ~21 s. The request is now also renewed when the slowest of ATTITUDE /
+  GPI / LPN, measured on arrival over the last 3 s (`_PoseRateMeter`, recording or not),
+  is below `POSE_RATE_WARN_HZ`, at most once per 5 s (`POSE_RENEW_HOLDOFF_S`); the 30 s
+  re-assert stays the fallback, and without the service (simulation) nothing is requested.
+  `MAVLINK_RATE_REASSERT_S` was left at 30 s: the trigger already renews within ~3–5 s of
+  a drop, so a shorter fixed period would only add requests while the rate holds. No
+  topic, type or QoS changed.
+- **Rate watchdog's first window diluted** (2.8 Hz reported): it started at the previous
+  tick, before the `.svlog` opened. It now opens at the first logged pose envelope (or at
+  the first tick of a recording with none, so a missing pose still reports 0 Hz); a window
+  under 5 s is carried into the next tick.
+- **1339 zero-stamp warnings in one replay**: `_on_odom` tested `zero_stamped == 1`, which
+  stays true after one zero stamp, so every later odom warned. Now warned once.
+- **Odom buffer never pruned after a zero-stamped first sample** (keyed on wall time
+  ~1.79e18 ns, later samples on sim time, so the head blocked both pruning loops).
+  `_OdomBuffer.push` now treats a sample more than the window behind the newest as a new
+  clock epoch and drops what lies outside the window around it (`epoch_dropped`); the
+  zero-stamp keying rule is unchanged.
+- Gates: the new node tests skip without ROS. In the cloud session that made the change
+  they were run against stubbed ROS modules only (21 pass; the 8 new ones fail on the old
+  code). **Re-run `tests/test_processor_assembly.py` with a sourced workspace.**
+
+Open:
+- [ ] **What resets the autopilot's message intervals ~9 s after each request?** Not
+      identified. Candidates, none checked: another MAVLink client on the boat (BlueOS
+      services, SonarLink or a ground station sending its own interval or stream-rate
+      requests), mavros itself, or the laptop side (`robot_interface`, MCS). Check with
+      the BlueOS MAVLink inspector on the boat: watch `SET_MESSAGE_INTERVAL` /
+      `REQUEST_DATA_STREAM` / `COMMAND_LONG` traffic and their source sys/comp ids around
+      the drop. **Needs the boat.**
+- [ ] **Does the renewal hold the pose rate on water?** Unverified. On the next real run:
+      `/mavros/local_position/odom` rate over time in the run bag, the processor's
+      "renewed" log line and its shutdown count, and the `.svlog`'s ATTITUDE / GPI / LPN
+      rates. If the rate still saws, the reset follows our own request and renewing cannot
+      outrun it; the cause above must be fixed instead. **Needs the boat.**
+
 ## Node-side work (`blueboat_sss` ROS nodes) — still open
 
 Every item below is in `blueboat_sss` and is required before live/recorded data is
@@ -67,7 +110,8 @@ correct at the source. All were re-confirmed present in the current code.
       missing **< 0.5 %** near the base station; (2) the driver's per-side health lines
       agree with the forensics (a loss there = device/WiFi, none = ROS); (3) ATTITUDE /
       GPI / LPN at **12–13 Hz** in the `.svlog` and `/mavros/local_position/odom` at the
-      same rate in the run bag, no rate-watchdog warning; (4) `time_boot_ms` advances;
+      same rate in the run bag, no rate-watchdog warning (the 2026-10-28 run did not hold
+      it: see *calibration pass 4* above); (4) `time_boot_ms` advances;
       (5) the `.svlog` census against a SonarView recording of the same water. What is
       left after that is the WiFi link itself, which SonarLink (recording on the boat's
       Pi) never crosses and nothing of ours may run on the boat (root CLAUDE.md §1.1).

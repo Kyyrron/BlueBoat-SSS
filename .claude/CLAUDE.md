@@ -154,19 +154,32 @@ autopilot exactly the message intervals SonarView writes in its id-10 header
 (`svlog_helper.DEFAULT_PERIODIC_MESSAGES`: HEARTBEAT 1 Hz; ATTITUDE, LOCAL_POSITION_NED,
 GLOBAL_POSITION_INT 30 Hz; SCALED_PRESSURE2, VFR_HUD 3 Hz; GPS_GLOBAL_ORIGIN 1 Hz;
 AUTOPILOT_VERSION 1/60 Hz), asynchronously, and repeats it every 30 s (an autopilot
-reboot resets intervals). Absent the service (simulation) it logs once and carries on.
+reboot resets intervals). Since 2026-11-03 it also renews the request whenever the
+slowest of ATTITUDE / GPI / LPN, measured on arrival over the last 3 s (recording or
+not), is below `POSE_RATE_WARN_HZ` (10), at most once per 5 s; the 30 s re-assert stays
+the fallback (`_PoseRateMeter`, `_assert_mavlink_rates`). Reason: on the 2026-10-28 water
+run the 30 Hz held for only ~9 s of every 30 s period, 4 Hz otherwise (calibration pass 4
+report, owner's machine; UNVERIFIABLE HERE). Something resets the intervals; what is
+`TODO.md`'s, and the renewal is unverified on water. Absent the service (simulation) it
+logs once and carries on; nothing is requested.
 Without the request the autopilot streams **4 Hz** on the mavros link; with it,
 SonarView's own recordings carry **12.8 Hz** per message (the autopilot's delivered
 ceiling, measured on the boat; cause UNVERIFIABLE HERE), and run bags made while
-SonarView was open show `/mavros/local_position/odom` at 10.7–13 Hz. **The request is
+SonarView was open show `/mavros/local_position/odom` at 10.7–13 Hz. Our own request did
+not hold steadily on the 2026-10-28 run (above), so "~13 Hz while the sonar streams" is
+the intent, not a measured result. **The request is
 autopilot-wide — `/blueboat/odom` and BlueBoat-Control's 20 Hz loop get the faster pose
-too** (owner accepted, 2026-10-27: fresher pose, a smooth PID derivative instead of a
+too, for as long as it holds** (owner accepted, 2026-10-27: fresher pose, a smooth PID derivative instead of a
 5× spike every fifth tick, gains may need a retune, `/mavros/*` in run bags ~3×; root
 `CLAUDE.md` §4.4).
 
 **Rate watchdog.** While recording, every 10 s, it warns once when ATTITUDE, GPI or LPN
 arrive below 10 Hz, or when a side's ping rate is more than 10 % off SonarView's law
-(`sonarview_ping_hz`: max(50 ms, 2R/c + 3 ms)), and says when the rates recover.
+(`sonarview_ping_hz`: max(50 ms, 2R/c + 3 ms)), and says when the rates recover. Its
+window opens at the first logged pose envelope after Record ON (or at the first tick if
+none was logged), and a window under 5 s is carried into the next tick: before
+2026-11-03 the first window included the time before the `.svlog` opened (2.8 Hz
+reported on 2026-10-28).
 
 Mavros telemetry, wrapped into `.svlog` packet-id-150 mavlink envelopes
 (**VERIFIED** — these are the ROS topic names, not the mavlink message names):
@@ -578,8 +591,9 @@ odom buffer's nearest-stamp tolerance (fresh sample served, far sample refused w
 the measured skew recorded, stale samples pruned at lookup) — and since 2026-10-27 the
 SonarView parity: pose interpolation (yaw wrap included), the zero-stamp burst clock,
 HEARTBEAT/STATUSTEXT shapes, the id-10 + id-12 header, the wrapper tag, the
-message-interval request (sent while streaming, re-asserted, skipped without the
-service) and the rate watchdog. It needs a sourced ROS 2
+message-interval request (sent while streaming, re-asserted, renewed on a low pose rate,
+skipped without the service), the rate watchdog (window opened by the first logged
+envelope), the odom buffer's clock-epoch drop and the once-only zero-stamp warning. It needs a sourced ROS 2
 workspace and skips cleanly without one, so the suite stays laptop-runnable. It never
 enables logging and opens the corpus read-only (NC #6).
 

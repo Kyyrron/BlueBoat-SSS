@@ -697,6 +697,46 @@ def test_odom_buffer_zero_stamp_without_arrival_is_unchanged():
     assert not buf.has_data() and buf.pushed == 1
 
 
+def test_odom_buffer_drops_an_out_of_epoch_head():
+    """Replay, 2026-10-28: one zero-stamped odom before /clock was keyed on
+    wall time (~1.79e18 ns), every later one on sim time. The wall sample sat
+    at the head of the deque, head-only pruning never got past it, and the
+    buffer grew for the whole run."""
+    wall = 1_793_080_445_000_000_000
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(0, x=-1.0), arrival_ns=wall)
+    for i in range(400):                               # 20 s of sim time at 20 Hz
+        buf.push(make_odom(100_000_000_000 + i * 50_000_000, x=float(i)))
+    assert buf.epoch_dropped == 1 and buf.zero_stamped == 1 and buf.pushed == 401
+    assert len(buf._samples) <= 101, "pruning is stuck behind the wall-time head"
+    assert all(ts < wall for ts, _ in buf._samples)
+    odom = buf.pose_at(100_000_000_000 + 399 * 50_000_000)
+    assert odom is not None and odom.pose.pose.position.x == pytest.approx(399.0)
+    # The lookup-side pruning works again too.
+    assert buf.nearest(200_000_000_000) is None and not buf.has_data()
+
+
+def test_odom_buffer_keeps_small_reorderings():
+    """Only a jump back by more than the window is an epoch change."""
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000, x=1.0))
+    buf.push(make_odom(10_100_000_000, x=2.0))
+    buf.push(make_odom(10_050_000_000, x=3.0))         # late by 50 ms
+    assert buf.epoch_dropped == 0 and len(buf._samples) == 3
+
+
+def test_zero_stamped_odom_is_warned_once(node, monkeypatch):
+    """`zero_stamped` stays at 1 after one zero stamp: the old `== 1` test
+    warned on every later odom (1339 warnings in one replay)."""
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    node._on_odom(make_odom(0))
+    for i in range(50):
+        node._on_odom(make_odom(100_000_000_000 + i * 50_000_000))
+    node._on_odom(make_odom(0))
+    assert len(log.warnings) == 1 and "stamped 0" in log.warnings[0]
+
+
 def test_zero_stamped_odom_places_pings_on_the_node(node):
     """End to end: a zero-stamped odom stream must not drop wall-stamped pings."""
     t0 = 1_793_080_445_000_000_000
@@ -853,6 +893,77 @@ def test_missing_rate_service_is_skipped_quietly(node):
     assert node._rate_client.requests == [] and node._rate_service_missing_logged
 
 
+class _FixedRate:
+    """Stands in for _PoseRateMeter: sample() returns ``hz``."""
+    def __init__(self, hz=None):
+        self.hz = hz
+
+    def sample(self, now):
+        return self.hz
+
+    def count(self, name):
+        pass
+
+
+def test_rate_request_is_renewed_when_the_pose_rate_drops(node):
+    """2026-10-28 water run: 30 Hz held ~9 s of every 30 s, then 4 Hz. A
+    measured pose rate below POSE_RATE_WARN_HZ renews the request, at most
+    once per POSE_RENEW_HOLDOFF_S; the 30 s re-assert stays the fallback."""
+    from svlog_helper import DEFAULT_PERIODIC_MESSAGES
+    n = len(DEFAULT_PERIODIC_MESSAGES)
+    client = _FakeRateClient()
+    node._rate_client = client
+    node._pose_rate = _FixedRate(4.0)
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    node._assert_mavlink_rates()                       # first request
+    assert len(client.requests) == n
+    node._assert_mavlink_rates()                       # 4 Hz, inside the hold-off
+    assert len(client.requests) == n
+    node._rate_request_mono -= proc.POSE_RENEW_HOLDOFF_S + 0.1
+    node._pose_rate.hz = 25.0                          # rate holds: nothing sent
+    node._assert_mavlink_rates()
+    assert len(client.requests) == n
+    node._pose_rate.hz = None                          # no full window yet
+    node._assert_mavlink_rates()
+    assert len(client.requests) == n
+    node._pose_rate.hz = 4.0                           # rate fell back: renewed
+    node._assert_mavlink_rates()
+    assert len(client.requests) == 2 * n and node._rate_renewals == 1
+    assert client.requests[n:] == client.requests[:n]
+
+
+def test_rate_renewal_requests_nothing_without_the_service(node):
+    """Simulation: the service is absent, nothing is ever requested."""
+    node._rate_client = _FakeRateClient(ready=False)
+    node._pose_rate = _FixedRate(0.0)
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    for _ in range(3):
+        node._assert_mavlink_rates()
+        if node._rate_request_mono is not None:
+            node._rate_request_mono -= proc.POSE_RENEW_HOLDOFF_S + 0.1
+    assert node._rate_client.requests == [] and node._rate_renewals == 0
+
+
+def test_pose_rate_meter_reports_the_slowest_message_over_the_window():
+    meter = proc._PoseRateMeter(window_s=3.0)
+    assert meter.sample(100.0) is None
+    for tick in range(1, 4):
+        for _ in range(30):
+            meter.count("ATTITUDE")
+            meter.count("LOCAL_POSITION_NED")
+        for _ in range(4):
+            meter.count("GLOBAL_POSITION_INT")
+        hz = meter.sample(100.0 + tick)
+    assert hz == pytest.approx(4.0)                    # the slowest of the three
+    for _ in range(3):                                 # GPI recovers
+        for name in proc.POSE_MESSAGES:
+            for _ in range(30):
+                meter.count(name)
+        tick += 1
+        hz = meter.sample(100.0 + tick)
+    assert hz == pytest.approx(30.0)
+
+
 class _LogCapture:
     def __init__(self):
         self.warnings, self.infos = [], []
@@ -890,6 +1001,45 @@ def test_rate_watchdog_flags_a_4hz_pose_and_a_free_running_sonar(node, monkeypat
     node._watch_pings = [200, 200]
     node._check_rates()
     assert len(log.warnings) == 1 and "back at SonarView's rates" in log.infos[-1]
+
+
+def test_rate_watchdog_window_opens_at_the_first_logged_envelope(node, monkeypatch):
+    """The first window used to start at the previous tick, before the .svlog
+    opened, which diluted its rate (2.8 Hz reported, 2026-10-28)."""
+    from types import SimpleNamespace
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=True))
+    profile = SimpleNamespace(start_mm=0, length_mm=20000)
+    assert node._watch_t0 is None
+    node._watch_ping(profile, 0)                       # no window yet: not counted
+    assert node._watch_pings == [0, 0]
+    node._watch_pose("ATTITUDE")                       # first logged envelope
+    assert node._watch_t0 is not None
+    node._check_rates()                                # window too short: carried
+    assert log.warnings == [] and node._watch_counts["ATTITUDE"] == 1
+    # A whole window at SonarView's rates after the first envelope: no warning,
+    # however long the node had been up before the recording started.
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {k: 128 for k in node._watch_counts}
+    node._watch_pings = [200, 200]
+    node._check_rates()
+    assert log.warnings == []
+
+
+def test_rate_watchdog_still_reports_a_pose_that_never_arrives(node, monkeypatch):
+    from types import SimpleNamespace
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=True))
+    node._check_rates()                                # recording, nothing logged
+    assert node._watch_t0 is not None and log.warnings == []
+    node._watch_t0 -= 10.0
+    node._check_rates()
+    assert len(log.warnings) == 1 and "ATTITUDE 0.0 Hz" in log.warnings[0]
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=False))
+    node._check_rates()                                # recording stopped: closed
+    assert node._watch_t0 is None
 
 
 def test_sonarview_ping_rate_law():
