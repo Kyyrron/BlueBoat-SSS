@@ -26,6 +26,14 @@ Usage
         range_length_mm:=30000
     ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True
 
+Clock (2026-11-07). ``SimpleLauncher(use_sim_time='auto')``: when a
+``/clock`` publisher exists at launch (a simulation graph -- Gazebo), every
+node here gets ``use_sim_time:=True``, so the processor judges "the stream
+stopped" and its rate watchdog on sim time and a simulation slowed below
+real time (the ray-cast sonar) neither tears rows nor warns at the wall
+pace. A real-robot graph has no ``/clock`` publisher (mavros runs on
+``use_sim_time`` with none), so nothing changes there.
+
 This file and ``SSS_simple_launch.py`` are the two launch files in the
 package; both are installed by ``install(DIRECTORY launch ...)`` in
 CMakeLists.txt.
@@ -46,7 +54,7 @@ from simple_launch import SimpleLauncher
 
 
 def generate_launch_description():
-    sl = SimpleLauncher()
+    sl = SimpleLauncher(use_sim_time='auto')
 
     # Skip live acquisition entirely when replaying a rosbag.
     sl.declare_arg('will_use_rosbag', default_value=False)

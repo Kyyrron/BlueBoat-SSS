@@ -6,8 +6,9 @@ the pairing policy from ``GPS_MAP_ARCHITECTURE.md``:
 * pair in the **GPS** callback, at GPS rate, with a freshness guard on
   the (faster) odom stream — pairing at odom rate re-uses one fix
   against several odom positions and biases the estimate;
-* both sides of the freshness guard use the **wall clock**
-  (``time.monotonic()``): message stamps may be sim time or replayed;
+* both sides of the freshness guard use the **reception clock**
+  (``core.stream_clock.now()``: wall monotonic, sim-paced under ``/clock``,
+  never a message stamp): message stamps may be sim time or replayed;
 * the ``(0, 0)`` no-fix sentinel is rejected inside ``add_pair``.
 
 Runs entirely in the GUI thread (fed by queued signals). Everything the
@@ -18,12 +19,12 @@ old ``CoordinateConverter`` they replace).
 
 from __future__ import annotations
 
-import time
 from typing import Optional, Tuple
 
 from PySide6.QtCore import QObject, Signal
 
 from ..config.settings import GeoConfig
+from .stream_clock import now as stream_now
 from ..mapping.geo import GeoFit, GeoReferencer
 
 #: An odom position older than this is not paired with a GPS fix.
@@ -55,7 +56,7 @@ class GeoService(QObject):
     # ---- ingestion (GUI thread, queued signals) ---------------------------
     def on_robot_state(self, state) -> None:
         """Record the freshest odom/world position for pairing."""
-        self._last_odom = (time.monotonic(), float(state.x), float(state.y))
+        self._last_odom = (stream_now(), float(state.x), float(state.y))
 
     def on_gps_fix(self, t_wall: float, lat: float, lon: float) -> None:
         """One accepted GPS fix, at GPS rate (see module docstring)."""

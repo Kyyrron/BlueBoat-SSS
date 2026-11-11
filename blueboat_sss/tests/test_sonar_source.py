@@ -86,15 +86,20 @@ class StubRos:
     def __init__(self, subscribers=None) -> None:
         self.enables: list = []
         self.subscribers = subscribers
+        self.log_enables: list = []
+        self.log_subscribers = None
 
     def publish_ping_enable(self, enable: bool) -> None:
         self.enables.append(enable)
 
     def publish_svlog_enable(self, enable: bool) -> None:
-        pass
+        self.log_enables.append(enable)
 
     def ping_enable_subscribers(self):
         return self.subscribers
+
+    def svlog_enable_subscribers(self):
+        return self.log_subscribers
 
 
 def _launcher(ros, source, **cfg):
@@ -165,6 +170,44 @@ def test_enable_waits_for_bring_up_and_stop_cancels_it(qapp):
     ros2.subscribers = 1
     lch2._poll_ping_enable()
     assert ros2.enables == [False], "a cancelled START still enabled pinging"
+
+
+def test_record_on_waits_for_the_processor_to_subscribe(qapp):
+    """The 2026-11-11 session without a .svlog: Record ON at "running",
+    5 ms before sss_processor subscribed, and the volatile enable was lost."""
+    ros = StubRos()
+    ros.log_subscribers = 0
+    lch, signals = _launcher(ros, ss.SIMULATION, ping_enable_wait_s=60.0)
+    lch._set_state(PipelineState.RUNNING)
+    assert lch.set_recording(True)
+    assert ros.log_enables == [], "sent before the processor could hear it"
+    ros.log_subscribers = 1
+    lch._poll_enables()
+    assert ros.log_enables == [True]
+    lch._poll_enables()
+    assert ros.log_enables == [True], "sent twice"
+
+    # Record OFF before the processor came up: the enable is cancelled.
+    ros2 = StubRos()
+    ros2.log_subscribers = 0
+    lch2, _ = _launcher(ros2, ss.SIMULATION, ping_enable_wait_s=60.0)
+    lch2._set_state(PipelineState.RUNNING)
+    lch2.set_recording(True)
+    lch2.set_recording(False)
+    ros2.log_subscribers = 1
+    lch2._poll_enables()
+    assert ros2.log_enables == [False]
+
+    # No processor after the wait: sent anyway, and said.
+    ros3 = StubRos()
+    ros3.log_subscribers = 0
+    lch3, signals3 = _launcher(ros3, ss.SIMULATION, ping_enable_wait_s=0.0)
+    messages: list = []
+    signals3.status_message.connect(messages.append)
+    lch3._set_state(PipelineState.RUNNING)
+    lch3.set_recording(True)
+    assert ros3.log_enables == [True]
+    assert any("no .svlog" in m for m in messages)
 
 
 def test_switching_source_while_down_only_selects(qapp, monkeypatch):

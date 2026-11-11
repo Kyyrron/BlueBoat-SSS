@@ -173,7 +173,7 @@ too, for as long as it holds** (owner accepted, 2026-10-27: fresher pose, a smoo
 5× spike every fifth tick, gains may need a retune, `/mavros/*` in run bags ~3×; root
 `CLAUDE.md` §4.4).
 
-**Rate watchdog.** While recording, every 10 s, it warns once when ATTITUDE, GPI or LPN
+**Rate watchdog.** While recording, every 10 s (sim seconds under `use_sim_time`), it warns once when ATTITUDE, GPI or LPN
 arrive below 10 Hz, or when a side's ping rate is more than 10 % off SonarView's law
 (`sonarview_ping_hz`: max(50 ms, 2R/c + 3 ms)), and says when the rates recover. Its
 window opens at the first logged pose envelope after Record ON (or at the first tick if
@@ -359,7 +359,19 @@ Violating any of these breaks another module, the hardware integration, or the t
    of the run; (b) the flush timer judges "the stream stopped" on the **wall clock
    against the last arrival only** — never wall time against a message stamp, which is
    sim time under Gazebo (and device time on replay) and made every group look 1.8e9 s
-   stale on every tick. Both the node and the GCS `SonarListener` now warn once when
+   stale on every tick. **2026-11-07:** in a simulation graph the "wall clock" is the
+   node clock: `SSS_processing_launch.py` uses `SimpleLauncher(use_sim_time='auto')`
+   (true when a `/clock` publisher exists at launch, never in a real-robot graph), and
+   `_arrival_ns()` then reads `/clock` for the arrival stamps, the stream-stopped check
+   and the rate watchdog — arrival against arrival still, never against a stamp — so
+   a simulation slowed below real time (the ray-cast sonar) does not tear rows.
+   **2026-11-09:** the GCS starts the processor before Gazebo, so `auto` resolved to wall
+   time and the first ray-cast harbour run reported wall-paced rates ("2.0 pings/s" for 20 Hz
+   of sim time). A processor launched without sim time now switches to it when a `/clock`
+   publisher appears (`_follow_clock`, a 1 Hz steady-clock timer; the arrival high-water mark
+   and the rate window restart) and back to wall time after `CLOCK_FOLLOW_LOST_S` (5 s) without
+   one; a real-robot graph has no `/clock`, so nothing changes there
+   (`test_a_clock_appearing_after_start_switches_to_sim_time_and_back`). Both the node and the GCS `SonarListener` now warn once when
    more than 25 % of the last 100 rows are one-sided.
 
    **The key is the offset-normalised counter, not the raw one.** The two units number
@@ -428,9 +440,9 @@ Violating any of these breaks another module, the hardware integration, or the t
     dataclasses so the GUI runs without ROS (rcl_interfaces for the runtime range
     change is imported inside `ros/ros_manager.py` only, and its result crosses the
     bus as `(bool, str)`). **VERIFIED**: `ros/` is the only place `rclpy` is
-    imported, and 64 of the 68 swept GCS modules import cleanly with no ROS at all
+    imported, and 66 of the 70 swept GCS modules import cleanly with no ROS at all
     (the four that do not are exactly the `ros/` listeners, which `main.py` imports
-    lazily and only outside `--sim`; `tests/test_sweeps.py`, 2026-10-16). The live
+    lazily and only outside `--sim`; `tests/test_sweeps.py`, 2026-11-07: +`core/stream_clock.py`, 2026-11-11: +`core/sim_run_info.py`). The live
     listener's logic that can be tested without ROS lives in `core/live_native.py` for
     exactly that reason. The sweep count excludes `tools/`, whose three files are
     checked by hash instead (NC #7). `core/perception_core.py` imports

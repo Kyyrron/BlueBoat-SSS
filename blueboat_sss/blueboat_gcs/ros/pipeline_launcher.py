@@ -89,6 +89,8 @@ class PipelineLauncher(QObject):
         self._restart_pending = False
         self._ping_wanted = False
         self._ping_deadline = 0.0
+        self._log_wanted = False
+        self._log_deadline = 0.0
         self._ros = ros
         self._signals = signals
         self._proc: Optional[subprocess.Popen] = None
@@ -105,7 +107,7 @@ class PipelineLauncher(QObject):
 
         self._ping_timer = QTimer(self)
         self._ping_timer.setInterval(200)
-        self._ping_timer.timeout.connect(self._poll_ping_enable)
+        self._ping_timer.timeout.connect(self._poll_enables)
 
         # Hygiene at construction: a previous crash of the *application*
         # may itself have orphaned nodes.
@@ -243,22 +245,47 @@ class PipelineLauncher(QObject):
         if self._ping_wanted:
             self._ping_timer.start()
 
-    def _poll_ping_enable(self) -> None:
-        if not self._ping_wanted:
+    def _poll_enables(self) -> None:
+        """Timer tick: the pending volatile enables (ping, log)."""
+        self._poll_ping_enable()
+        self._poll_log_enable()
+        if not (self._ping_wanted or self._log_wanted):
             self._ping_timer.stop()
+
+    def _poll_log_enable(self) -> None:
+        """Record ON. ``log/enable`` is volatile like ``ping/enable``: it
+        goes out once ``sss_processor`` subscribes, or after
+        ``ping_enable_wait_s`` anyway with a warning. (2026-11-11: the
+        pipeline is "running" on a timer, the processor came up 5 ms after a
+        Record ON, and that session had no ``.svlog``.)"""
+        if not self._log_wanted or self._state is PipelineState.STARTING:
             return
-        if self._state is PipelineState.STARTING:
-            return                              # bring-up not finished yet
+        if self._state is not PipelineState.RUNNING:
+            self._log_wanted = False            # the pipeline went away
+            return
+        count = getattr(self._ros, "svlog_enable_subscribers", None)
+        n = count() if count is not None else None
+        if n == 0 and time.monotonic() < self._log_deadline:
+            return
+        self._log_wanted = False
+        self._ros.publish_svlog_enable(True)
+        if n == 0:
+            text = ("WARNING: Record ON was sent but sss_processor is not "
+                    "listening on log/enable — no .svlog is being written.")
+            self._signals.status_message.emit(text)
+            self._signals.log_line.emit("app", text)
+
+    def _poll_ping_enable(self) -> None:
+        if not self._ping_wanted or self._state is PipelineState.STARTING:
+            return                              # nothing to send / bring-up
         if self._state is not PipelineState.RUNNING:
             self._ping_wanted = False           # the pipeline went away
-            self._ping_timer.stop()
             return
         count = getattr(self._ros, "ping_enable_subscribers", None)
         n = count() if count is not None else None
         if n == 0 and time.monotonic() < self._ping_deadline:
             return
         self._ping_wanted = False
-        self._ping_timer.stop()
         self._ros.publish_ping_enable(True)
         if n == 0:
             advice = ss.no_subscriber_advice(self._source)
@@ -311,8 +338,7 @@ class PipelineLauncher(QObject):
             self._sim_proc = None
 
     def disable_pinging(self) -> None:
-        self._ping_wanted = False
-        self._ping_timer.stop()
+        self._ping_wanted = False               # the timer stops by itself
         if self._config.publish_ping_enable:
             self._ros.publish_ping_enable(False)
 
@@ -380,12 +406,20 @@ class PipelineLauncher(QObject):
                 "Recording refused: pipeline is not running — "
                 "press START first.")
             return False
-        self._ros.publish_svlog_enable(on)
+        if not on:
+            self._log_wanted = False
+            self._ros.publish_svlog_enable(False)
+            return True
+        self._log_wanted = True
+        self._log_deadline = time.monotonic() + self._config.ping_enable_wait_s
+        self._poll_log_enable()
+        if self._log_wanted:
+            self._ping_timer.start()
         return True
 
     def stop(self) -> None:
         # Stop firing + close any .svlog immediately, in every state.
-        self._ping_wanted = False
+        self._ping_wanted = self._log_wanted = False
         self._ping_timer.stop()
         if self._config.publish_ping_enable:
             self._ros.publish_ping_enable(False)

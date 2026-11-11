@@ -39,6 +39,7 @@ from std_msgs.msg import Float64
 
 from ..config.settings import RosTopics
 from ..core.signals import AppSignals
+from ..core.stream_clock import now as stream_now
 from ..models.robot_state import RobotState
 from ..utils.attitude import quat_to_roll_pitch
 from ..utils.geodesy import navsat_fix_ok, quat_to_yaw, yaw_to_compass_deg
@@ -114,9 +115,10 @@ class TelemetryListener:
             return
         with self._lock:
             self._lat, self._lon = float(msg.latitude), float(msg.longitude)
-        # GeoService pairing stream: GPS rate, wall-clocked (sim time or
-        # replayed stamps must not break the odom-freshness pairing).
-        self._signals.gps_fix.emit(time.monotonic(), float(msg.latitude),
+        # GeoService pairing stream: GPS rate, on the reception clock (sim
+        # time or replayed stamps must not break the odom-freshness pairing;
+        # core/stream_clock.py).
+        self._signals.gps_fix.emit(stream_now(), float(msg.latitude),
                                    float(msg.longitude))
         if self._gps_fallback:
             # Passive tracking: keeps the dead-reckoning reference + last
@@ -129,7 +131,7 @@ class TelemetryListener:
         """5 Hz node timer: emit a GPS-dead-reckoned RobotState when the
         odom stream is dead (> 2 s silent) or zero-frozen while the GPS
         fix moves. Regular odom resumes normal emission automatically."""
-        now = time.monotonic()
+        now = stream_now()
         odom_dead = now - self._last_odom_wall > 2.0
         if not (odom_dead or self._odom_frozen_hint):
             return
@@ -162,7 +164,7 @@ class TelemetryListener:
             return
         with self._lock:
             self._compass_deg = float(msg.data) % 360.0
-        self._signals.compass_heading.emit(time.monotonic(),
+        self._signals.compass_heading.emit(stream_now(),
                                            float(msg.data) % 360.0)
 
     def _on_imu(self, msg: Imu) -> None:
@@ -174,7 +176,7 @@ class TelemetryListener:
             roll = pitch = math.nan
         else:
             roll, pitch = quat_to_roll_pitch(q.x, q.y, q.z, q.w)
-        self._signals.attitude.emit(time.monotonic(), roll, pitch,
+        self._signals.attitude.emit(stream_now(), roll, pitch,
                                     float(msg.angular_velocity.z))
 
     def _on_vfr_hud(self, msg: "VfrHud") -> None:
@@ -182,13 +184,14 @@ class TelemetryListener:
             self._speed = float(msg.groundspeed)
 
     def _on_odom(self, msg: Odometry) -> None:
-        # Throttle on the WALL clock, never on message stamps: replayed
+        # Throttle on the reception clock, never on message stamps: replayed
         # bags, sim time, or a restarted publisher can carry stamps that
         # jump backwards, and a stamp-based throttle would then silently
         # reject every message until the stamps caught up with the last
         # seen value (robot frozen until it "returns" to its previous
-        # time). monotonic() is immune to all of that.
-        now = time.monotonic()
+        # time). The stream clock (wall monotonic; sim-paced under /clock,
+        # core/stream_clock.py) never goes backwards either.
+        now = stream_now()
         self._last_odom_wall = now
         px = float(msg.pose.pose.position.x)
         py = float(msg.pose.pose.position.y)

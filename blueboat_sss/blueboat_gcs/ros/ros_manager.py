@@ -89,6 +89,8 @@ class RosManager:
             String, self._config.topics.seabed_analysis, 10)
         self._create_image_publishers()
         self._subscribe_rosout()
+        self._subscribe_clock()
+        self._subscribe_sim_run_info()
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
         self._thread = threading.Thread(
@@ -123,6 +125,54 @@ class RosManager:
             self._node.create_publisher(Image, t.seabed_image, qos),
             self._node.create_publisher(Image, t.seabed_image_png, qos),
             self._node.create_publisher(String, t.seabed_image_meta, qos))
+
+    def _subscribe_clock(self) -> None:
+        """``/clock`` -> ``core.stream_clock`` (2026-11-07).
+
+        Only a simulation graph has a ``/clock`` publisher (Gazebo, or a bag
+        replay's Gazebo); there every world-timing rule of the GCS --
+        attitude / compass freshness, telemetry staleness, the recording's
+        ``duration_s`` -- runs on sim seconds, so a simulation slowed below
+        real time (the ray-cast sonar) records what a real-speed one does.
+        A real-robot graph never feeds it: wall time, unchanged.
+        BEST_EFFORT matches the bridge's publisher whatever its reliability."""
+        try:
+            from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+            from rosgraph_msgs.msg import Clock
+        except ImportError:                        # pragma: no cover
+            return
+        from ..core.stream_clock import stream_clock
+        clock = stream_clock()
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST, depth=10)
+
+        def _on_clock(msg) -> None:
+            clock.feed(msg.clock.sec + msg.clock.nanosec * 1e-9)
+
+        self._clock_sub = self._node.create_subscription(Clock, "/clock", _on_clock, qos)
+
+    def _subscribe_sim_run_info(self) -> None:
+        """The simulated sonar's run record -> ``core.sim_run_info``
+        (2026-11-11), for a session's ``metadata.json["simulation"]``.
+
+        Only a simulation graph has this topic. The publisher is latched
+        (RELIABLE / TRANSIENT_LOCAL / 1), so the subscription is too (CM-4):
+        a GCS started after the sonar still receives the record."""
+        try:
+            from rclpy.qos import (DurabilityPolicy, HistoryPolicy,
+                                   QoSProfile, ReliabilityPolicy)
+        except ImportError:                        # pragma: no cover
+            return
+        from ..core import sim_run_info
+        node = self._node
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         history=HistoryPolicy.KEEP_LAST, depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        sim_run_info.set_alive_probe(
+            lambda: node.count_publishers(sim_run_info.TOPIC) > 0)
+        self._sim_run_sub = node.create_subscription(
+            String, sim_run_info.TOPIC,
+            lambda msg: sim_run_info.feed(msg.data), qos)
 
     def _subscribe_rosout(self) -> None:
         """ROS 2 log messages of the SSS module -> embedded console.
@@ -171,15 +221,23 @@ class RosManager:
         if self._ping_pub is not None:
             self._ping_pub.publish(Bool(data=enable))
 
+    @staticmethod
+    def _subscribers(pub) -> Optional[int]:
+        if pub is None:
+            return None
+        try:
+            return int(pub.get_subscription_count())
+        except Exception:                 # pragma: no cover - rclpy teardown
+            return None
+
     def ping_enable_subscribers(self) -> Optional[int]:
         """How many nodes subscribe to ping/enable (the sonar node is one),
         or None when ROS is unavailable."""
-        if self._ping_pub is None:
-            return None
-        try:
-            return int(self._ping_pub.get_subscription_count())
-        except Exception:                 # pragma: no cover - rclpy teardown
-            return None
+        return self._subscribers(self._ping_pub)
+
+    def svlog_enable_subscribers(self) -> Optional[int]:
+        """The same for log/enable (``sss_processor`` is the one)."""
+        return self._subscribers(self._svlog_pub)
 
     def publish_svlog_enable(self, enable: bool) -> None:
         if self._svlog_pub is not None:

@@ -80,7 +80,9 @@ from typing import Deque, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from builtin_interfaces.msg import Time as TimeMsg
@@ -229,6 +231,10 @@ RATE_WATCH_PERIOD_S:       float = 10.0
 # opens at the first logged envelope) is carried into the next tick instead
 # of being judged: one message in 0.3 s is no rate.
 RATE_WATCH_MIN_S:          float = 5.0
+# Follow a /clock that appears after start-up (2026-11-09, _follow_clock):
+# checked on the steady clock; wall time again after this long without one.
+CLOCK_FOLLOW_PERIOD_S:     float = 1.0
+CLOCK_FOLLOW_LOST_S:       float = 5.0
 # SonarView's recordings carry ~12.8 Hz of each pose message for its 30 Hz
 # request; the autopilot default without a request is 4 Hz.
 POSE_RATE_WARN_HZ:         float = 10.0
@@ -569,6 +575,22 @@ class SSSProcessorNode(Node):
         self._mav_seq = 0
         self._mav_seq_lock = threading.Lock()
         self._node_boot_ns = time.monotonic_ns()
+        # Arrival clock of the stream-stopped check and the rate watchdog
+        # (2026-11-07): wall monotonic in every real launch (as before); the
+        # node clock when launched with use_sim_time (the GCS does in a
+        # simulation graph, one with a /clock publisher), so a simulation
+        # slowed below real time -- the ray-cast sonar -- neither tears rows
+        # nor reports rates at the wall pace.
+        self._sim_clock = bool(self.get_parameter('use_sim_time').value)
+        # Follow /clock when it appears AFTER start-up (2026-11-09): the GCS
+        # starts this node before Gazebo, so 'auto' resolved to wall time and
+        # a slowed ray-cast run reported wall-paced rates ("2.0 pings/s" for
+        # 20 Hz of sim time). Managed only when launched without sim time;
+        # back to wall time once /clock has had no publisher for
+        # CLOCK_FOLLOW_LOST_S (a later real-robot run has none).
+        self._clock_auto = not self._sim_clock
+        self._clock_lost_s = 0.0
+        self._watch_reset = False
         self._burst_clock = _BurstClock()
         self._zero_stamp_warned = False
         self._zero_odom_warned = False
@@ -589,7 +611,7 @@ class SSSProcessorNode(Node):
         self._watch_counts = {name: 0 for name in POSE_MESSAGES}
         self._watch_pings = [0, 0]
         self._watch_range_m: Optional[float] = None
-        self._watch_t0: Optional[float] = None
+        self._watch_t0: Optional[float] = None   # on the arrival clock
         self._watch_warned: set = set()
 
         # ---- QoS -----------------------------------------------------------
@@ -632,6 +654,11 @@ class SSSProcessorNode(Node):
         self._rate_client = self.create_client(MessageInterval, MAVLINK_RATE_SERVICE)
         self._rate_timer = self.create_timer(1.0, self._assert_mavlink_rates)
         self._watch_timer = self.create_timer(RATE_WATCH_PERIOD_S, self._check_rates)
+        if self._clock_auto:
+            # On the steady clock: it must tick whatever the node clock does.
+            self._clock_follow_timer = self.create_timer(
+                CLOCK_FOLLOW_PERIOD_S, self._follow_clock,
+                clock=Clock(clock_type=ClockType.STEADY_TIME))
         # Logging toggle.
         self.create_subscription(Bool, "~/log/enable", self._on_log_enable, 10)
 
@@ -696,7 +723,7 @@ class SSSProcessorNode(Node):
     def _watch_pose(self, name: str) -> None:
         """Count one logged pose envelope; the first opens the window."""
         if self._watch_t0 is None:
-            self._watch_t0 = time.monotonic()
+            self._watch_t0 = self._arrival_s()
         self._watch_counts[name] += 1
 
     def _on_odom(self, msg: Odometry) -> None:
@@ -850,10 +877,48 @@ class SSSProcessorNode(Node):
             self.get_logger().warn(f"mavlink STATUSTEXT write failed: {exc}")
 
     # ----- SonarView's mavlink rates + rate watchdog -------------------------
+    def _arrival_ns(self) -> int:
+        """Now on the arrival clock: ``time.monotonic_ns()`` (real launches),
+        the node clock under ``use_sim_time`` (see ``_sim_clock``)."""
+        if self._sim_clock:
+            return self.get_clock().now().nanoseconds
+        return time.monotonic_ns()
+
+    def _arrival_s(self) -> float:
+        return self._arrival_ns() * 1e-9
+
+    def _follow_clock(self) -> None:
+        """Switch the arrival clock to sim time when a /clock publisher
+        appears, and back to wall time once it has been gone for
+        CLOCK_FOLLOW_LOST_S (only when launched without use_sim_time)."""
+        has_clock = self.count_publishers("/clock") > 0
+        if has_clock and not self._sim_clock:
+            self._set_sim_clock(True)
+            self._clock_lost_s = 0.0
+        elif not has_clock and self._sim_clock:
+            self._clock_lost_s += CLOCK_FOLLOW_PERIOD_S
+            if self._clock_lost_s >= CLOCK_FOLLOW_LOST_S:
+                self._set_sim_clock(False)
+        else:
+            self._clock_lost_s = 0.0
+
+    def _set_sim_clock(self, on: bool) -> None:
+        self.set_parameters([Parameter("use_sim_time", Parameter.Type.BOOL, bool(on))])
+        with self._buf_lock:
+            self._sim_clock = bool(on)
+            # Arrival times on the old clock mean nothing on the new one.
+            self._last_arrival_wall_ns = None
+            self._watch_reset = True
+        self.get_logger().info(
+            "a /clock publisher appeared: arrival clock, stream-stopped check and "
+            "rate watchdog now on sim time (use_sim_time true)" if on else
+            "/clock has had no publisher for "
+            f"{CLOCK_FOLLOW_LOST_S:g} s: back on the wall clock (use_sim_time false)")
+
     def _sonar_streaming(self) -> bool:
         last = self._last_arrival_wall_ns
         return (last is not None
-                and time.monotonic_ns() - last < SONAR_ACTIVE_WINDOW_S * 1e9)
+                and self._arrival_ns() - last < SONAR_ACTIVE_WINDOW_S * 1e9)
 
     def _assert_mavlink_rates(self) -> None:
         """Ask the autopilot for SonarView's message intervals.
@@ -920,14 +985,20 @@ class SSSProcessorNode(Node):
     def _check_rates(self) -> None:
         """Warn when a recording falls short of SonarView's rates.
 
-        The window opens at the first logged pose envelope (`_watch_pose`),
-        not at the previous tick: the time before the .svlog opened diluted
-        the first window (2.8 Hz reported, 2026-10-28). If a whole tick
-        passes while recording with nothing logged, the window opens at that
-        tick, so a pose that never arrives is still reported (0 Hz). A
-        window shorter than RATE_WATCH_MIN_S is carried into the next tick.
+        Timed on the arrival clock (`_arrival_s`: wall, or sim time under
+        use_sim_time / a followed /clock). The window opens at the first
+        logged pose envelope (`_watch_pose`), not at the previous tick: the
+        time before the .svlog opened diluted the first window (2.8 Hz
+        reported, 2026-10-28). If a whole tick passes while recording with
+        nothing logged, the window opens at that tick, so a pose that never
+        arrives is still reported (0 Hz). A window shorter than
+        RATE_WATCH_MIN_S is carried into the next tick. A change of arrival
+        clock (_set_sim_clock) closes the window; it reopens as above.
         """
-        now = time.monotonic()
+        now = self._arrival_s()
+        if self._watch_reset:
+            self._watch_reset = False
+            self._watch_t0 = None
         if not self._svlog.active or self._watch_t0 is None:
             for k in self._watch_counts:
                 self._watch_counts[k] = 0
@@ -1269,7 +1340,7 @@ class SSSProcessorNode(Node):
         stamp_ns = stamp_to_ns(msg.header.stamp)
         ready = []
         with self._buf_lock:
-            self._last_arrival_wall_ns = time.monotonic_ns()
+            self._last_arrival_wall_ns = self._arrival_ns()
             if self._preroll is None and self._counter_restarted(
                     channel, int(msg.ping_number)):
                 # Re-base: everything pending belongs to the old numbering
@@ -1364,7 +1435,8 @@ class SSSProcessorNode(Node):
 
         Without this the last group of a run would sit in the buffer until
         the next ping, which may never come -- the stream stopping is exactly
-        when it must not be lost. "Stopped" is judged on the wall clock
+        when it must not be lost. "Stopped" is judged on the arrival clock
+        (wall; the node clock in a simulation graph, ``_arrival_ns``)
         against the last *arrival* (``_last_arrival_wall_ns``), never
         against a message stamp: stamps run on the stream's clock (Gazebo
         sim time, a device clock on replay), and comparing them with wall
@@ -1374,7 +1446,7 @@ class SSSProcessorNode(Node):
         with self._buf_lock:
             ready = []
             idle = (self._last_arrival_wall_ns is not None
-                    and time.monotonic_ns() - self._last_arrival_wall_ns
+                    and self._arrival_ns() - self._last_arrival_wall_ns
                     > ASSEMBLY_MAX_LAG_NS)
             if not (drain_all or idle):
                 return

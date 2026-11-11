@@ -241,6 +241,76 @@ def test_incomplete_group_is_flushed_not_held(node):
     assert 5000 not in node._groups
 
 
+class _FakeSimClock:
+    """``node.get_clock()`` of a simulation graph: /clock, set by the test."""
+
+    def __init__(self, ns):
+        self.ns = int(ns)
+
+    def now(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(nanoseconds=self.ns)
+
+
+def test_sim_graph_judges_the_stream_stopped_on_the_sim_clock(node, monkeypatch):
+    """Launched with use_sim_time (the GCS does under a /clock publisher), the
+    arrival clock is the node clock: a simulation slowed below real time
+    (seconds of wall time between pings) does not look stopped while sim time
+    has not moved, and does once it has (2026-11-07)."""
+    feed_odom(node, count=200, period_ns=PING_PERIOD_NS)
+    for i in range(proc.OFFSET_PREROLL_MAX):
+        t = i * PING_PERIOD_NS
+        node._on_port(make_profile(0, 900 + i, t))
+        node._on_starboard(make_profile(1, 900 + i, t + 1_000_000))
+    node.published.clear()
+    clock = _FakeSimClock(50_000_000_000)
+    monkeypatch.setattr(node, "_sim_clock", True)
+    monkeypatch.setattr(node, "get_clock", lambda: clock)
+    node._on_port(make_profile(0, 5000, 100 * PING_PERIOD_NS))
+    assert node._last_arrival_wall_ns == clock.ns, "arrival stamped on the sim clock"
+    clock.ns += proc.ASSEMBLY_MAX_LAG_NS // 2
+    node._flush_pending()
+    assert node.published == [] and 5000 in node._groups, "half a lag of sim time: alive"
+    clock.ns += proc.ASSEMBLY_MAX_LAG_NS
+    node._flush_pending()
+    assert len(node.published) == 1 and node.published[0].port_ping_number == 5000
+
+
+def test_real_launch_keeps_the_wall_arrival_clock(node):
+    """Every real-robot launch: no use_sim_time, monotonic arrival clock."""
+    assert node._sim_clock is False
+    before = time.monotonic_ns()
+    assert before <= node._arrival_ns() <= time.monotonic_ns()
+
+
+def test_a_clock_appearing_after_start_switches_to_sim_time_and_back(node, monkeypatch):
+    """The GCS starts the processor before Gazebo, so 'auto' resolves to wall
+    time; once a /clock publisher appears the arrival clock, the
+    stream-stopped check and the rate watchdog switch to sim time, and back to
+    wall time after CLOCK_FOLLOW_LOST_S without one (2026-11-09)."""
+    assert node._clock_auto and node._sim_clock is False
+    pubs = {"n": 0}
+    monkeypatch.setattr(node, "count_publishers", lambda topic: pubs["n"])
+    node._last_arrival_wall_ns = 123
+    node._follow_clock()
+    assert node._sim_clock is False                       # no /clock yet
+    pubs["n"] = 1
+    node._follow_clock()
+    assert node._sim_clock is True
+    assert node.get_parameter("use_sim_time").value is True
+    assert node._last_arrival_wall_ns is None and node._watch_reset
+    node._check_rates()                                   # window restarted, no warning
+    assert node._watch_reset is False
+    pubs["n"] = 0
+    steps = int(round(proc.CLOCK_FOLLOW_LOST_S / proc.CLOCK_FOLLOW_PERIOD_S))
+    for _ in range(steps - 1):
+        node._follow_clock()
+    assert node._sim_clock is True                        # a short gap is tolerated
+    node._follow_clock()
+    assert node._sim_clock is False
+    assert node.get_parameter("use_sim_time").value is False
+
+
 def test_preroll_is_bounded_and_never_strands_a_ping(node):
     """A run shorter than the pre-roll still delivers every ping it produced."""
     feed_odom(node)

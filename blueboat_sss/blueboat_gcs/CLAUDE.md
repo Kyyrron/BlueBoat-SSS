@@ -276,7 +276,11 @@ enabled while the pipeline is RUNNING) changes `range_length_mm` live:
 on — resuming pinging **unconditionally** on success or failure (result crosses
 the bus as `sonar_params_result(bool, str)`). A successful change inserts a
 waterfall `break_row()`: the column scale adapts per ping, so the seam marks where
-the horizontal scale changed. The simulator refuses gracefully (fixed swath).
+the horizontal scale changed. The GCS's built-in `--sim` simulator refuses gracefully
+(fixed swath). The simulated sonar node `sss_sim_node` accepts the change like the real
+driver, re-reading its acquisition on the re-enable. With its **ray-cast** renderer, keep
+the range ≤ 30 m: above 40 m the GPU runs out of memory and the node skips every cycle
+(the simulator's README, "Range advice for the ray-cast", measured 2026-11-07).
 
 **Replay timeline is the log's own clock.** `load_svlog` stamps profiles from their
 `timestamp_ms` and re-bases mavlink onto that clock through a measured constant: the
@@ -320,6 +324,17 @@ stale (re-stamping a frozen ping from a frozen `RobotState` recreates the pile-u
 A GPS+compass dead-reckoning fallback (`alignment.gps_fallback`) covers a dead or
 zero-frozen `/blueboat/odom`. All are mitigations for an upstream `/blueboat/odom` defect, not a fix
 for it — the processor's half is the odom buffer's nearest-stamp tolerance above.
+
+**Stream clock** (2026-11-07, `core/stream_clock.py`). Every world-timing rule of the
+GCS — the attitude / compass freshness attached to each ping (`attitude_age_s`,
+`compass_stale_s`), telemetry staleness, the odom-dead GPS fallback, the geo pairing's
+odom freshness, the odom emit throttle, mission time and a session's `duration_s` —
+reads `stream_now()`, not `time.monotonic()`. In a real-robot graph (no `/clock`
+publisher) it *is* `time.monotonic()`. In a simulation graph `ros_manager` feeds it
+`/clock`, and it advances in sim seconds (continuous, interpolated, never backwards,
+wall-paced after 3 s of `/clock` silence), so a simulation slowed below real time (the
+ray-cast sonar) records what a real-speed one does. `started_utc` / `ended_utc` stay wall;
+the profile join (`profile_wait_ms`) stays wall (a latency). `tests/test_stream_clock.py`.
 
 **Pinger gating** (`alignment.pinger_frame`, default `auto`): all-zero vectors are
 rejected (the robot publishes `zeros(3)` before any USBL detection), the frame comes
@@ -406,7 +421,10 @@ moving the file while the processor's async `log_enable=False` was still in
 flight made its next append recreate a headerless stub — and runs synchronously
 on STOP/app-close (pinging already off); `merged_sessions/` is excluded from the
 sweep, sub-frame stubs are skipped (never deleted), and an empty adoption on a
-session with pings warns loudly.
+session with pings warns loudly. Record ON waits for `sss_processor` to subscribe to
+`log/enable` before publishing (2026-11-11, `_poll_log_enable`, the `ping/enable` rule):
+"running" is a 2 s timer, and an enable sent 5 ms before the processor was up left a
+session without a `.svlog`.
 
 ## Data produced by the GCS
 
@@ -415,7 +433,11 @@ streaming artifacts land inside it:
 
 ```
 <data_root>/sessions/2026_07_08-14_02_31/
-    metadata.json          times, config snapshot, counters, topic table
+    metadata.json          times, config snapshot, counters, topic table, and
+                           "simulation": the simulated sonar's run record (renderer,
+                           profile sha256, world, seeds, build; its latched
+                           /side_scan_sonar/ground_truth/run_info via core/sim_run_info.py,
+                           2026-11-11) -- null on real water
     *.svlog                adopted from data_root by mtime window (+/- 10 s)
     mosaic/                sonar_mosaic.npz, sonar_mosaic.png, boat_trajectory.csv
     waterfall/             waterfall.png, waterfall_raw.npz  <- archival raw record

@@ -69,7 +69,9 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from ..config.settings import AppConfig
 from ..models.detection import Detection
 from .mosaic_service import MosaicService
+from . import sim_run_info
 from .signals import AppSignals
+from .stream_clock import now as stream_now
 from .waterfall_service import WaterfallService
 
 _SVLOG_MTIME_SLACK_S = 10.0     # tolerance around the session window
@@ -152,6 +154,10 @@ class RecordingManager(QObject):
         self._mosaic = mosaic
         self._waterfall = waterfall
         self._start_wall: Optional[float] = None
+        # The session's start on the stream clock (core/stream_clock.py):
+        # duration_s is measured on it, so a simulation slowed below real
+        # time records the duration it simulated, as a real-speed run does.
+        self._start_stream: Optional[float] = None
         self._start_stamp: str = ""
         self.session_dir: Optional[Path] = None
         # (session_dir, start_wall, ping_count) of an ended session whose
@@ -196,6 +202,7 @@ class RecordingManager(QObject):
         # it now so its .svlog cannot be swallowed by this session.
         self.adopt_now()
         self._start_wall = time.time()
+        self._start_stream = stream_now()
         self._start_stamp = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         self._ping_count = 0
         self._detections.clear()
@@ -226,7 +233,10 @@ class RecordingManager(QObject):
         mosaic_snap = self._mosaic.export_snapshot()
         waterfall_snap = self._waterfall.export_snapshot()
         self._write_detections(session)
-        self._write_metadata(session, start_wall, [])
+        self._write_metadata(session, start_wall, [],
+                             duration_s=(None if self._start_stream is None
+                                         else stream_now() - self._start_stream))
+        self._start_stream = None
         self._pending_adoption = (session, start_wall, self._ping_count)
         QThreadPool.globalInstance().start(
             _ExportJob(session, mosaic_snap, waterfall_snap, self._signals))
@@ -335,13 +345,18 @@ class RecordingManager(QObject):
             return None
 
     def _write_metadata(self, session: Path, start_wall: float,
-                        svlogs: List[str]) -> None:
+                        svlogs: List[str],
+                        duration_s: Optional[float] = None) -> None:
+        # duration_s: stream-clock seconds (wall in a real run, sim seconds
+        # under /clock); started_utc / ended_utc say *when* it was recorded.
+        if duration_s is None:
+            duration_s = time.time() - start_wall
         meta = {
             "session": self._start_stamp,
             "started_utc": datetime.utcfromtimestamp(
                 start_wall).isoformat() + "Z",
             "ended_utc": datetime.utcnow().isoformat() + "Z",
-            "duration_s": round(time.time() - start_wall, 1),
+            "duration_s": round(duration_s, 1),
             "ping_count": self._ping_count,
             "detection_count": len(self._detections),
             "adopted_svlogs": svlogs,
@@ -356,6 +371,11 @@ class RecordingManager(QObject):
                 if self._display_settings is not None else None),
             "display_model": self._display_model_json(),
             "topics": asdict(self._config.topics),
+            # What produced a SIMULATED session: the sonar renderer, profile
+            # and its sha256, world digest, seeds, acquisition and build of
+            # BlueBoat-SSS-Sim (its latched ~/ground_truth/run_info; null on
+            # real water and when no simulator is publishing). 2026-11-11.
+            "simulation": sim_run_info.latest(),
             "note": ("waterfall/waterfall_raw.npz holds raw dB; mosaic/*.npz "
                      "holds the display-model-normalised level (its "
                      "value_domain key says which); PNGs go through the "

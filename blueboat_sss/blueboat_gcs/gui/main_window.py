@@ -9,7 +9,6 @@ in ``_connect_signals`` — nothing else changes.
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Optional
@@ -26,6 +25,7 @@ from ..core.geo_service import GeoService
 from ..core.mosaic_service import MosaicService
 from ..core.recording_session import RecordingManager
 from ..core.signals import AppSignals
+from ..core.stream_clock import now as stream_now
 from ..core.waterfall_service import WaterfallService
 from ..mapping.tiles import TileFetcher
 from ..models.detection import Detection, PingerFix
@@ -330,7 +330,7 @@ class MainWindow(QMainWindow):
             return
         self._apply_backpressure(ping)
         ping = self._align_ping_pose(ping)
-        ping = self._attitude.attach(ping, time.monotonic())
+        ping = self._attitude.attach(ping, stream_now())
         self._mosaic_service.on_sonar_ping(ping)
         self.waterfall_service.on_sonar_ping(ping)
         self.seabed_imager.on_sonar_ping(ping)
@@ -356,7 +356,7 @@ class MainWindow(QMainWindow):
 
     def _on_robot_state(self, state: RobotState) -> None:
         self._last_robot_state = state
-        self._last_state_walltime = time.monotonic()
+        self._last_state_walltime = stream_now()
         self.geo.on_robot_state(state)          # freshest pose for pairing
         self._heading.update_odom(self._last_state_walltime, state.yaw)
         if self._telemetry_stale:
@@ -366,7 +366,7 @@ class MainWindow(QMainWindow):
             self.trajectory_layer.set_stale(False)
             self.statusBar().showMessage("Telemetry resumed.", 4000)
         self.left_panel.on_robot_state(state)
-        marker_yaw = self._heading.heading(time.monotonic())
+        marker_yaw = self._heading.heading(stream_now())
         self.trajectory_layer.add_pose(
             state.x, state.y,
             state.yaw if marker_yaw is None else marker_yaw)
@@ -487,7 +487,7 @@ class MainWindow(QMainWindow):
         """
         if self._config.alignment.heading_source != "compass":
             return ping
-        yaw = self._heading.heading(time.monotonic())
+        yaw = self._heading.heading(stream_now())
         if yaw is None:
             return ping
         return dc_replace(ping, yaw=yaw)
@@ -505,11 +505,11 @@ class MainWindow(QMainWindow):
             state = self._last_robot_state
             if state is None:
                 return                      # cannot place it yet
-            yaw = self._heading.heading(time.monotonic())
+            yaw = self._heading.heading(stream_now())
             wx, wy = robot_to_world(fix.x, fix.y, state.x, state.y,
                                     state.yaw if yaw is None else yaw)
             fix = dc_replace(fix, x=wx, y=wy, frame="world")
-        self._last_pinger_walltime = time.monotonic()
+        self._last_pinger_walltime = stream_now()
         self.pinger_layer.update(fix)
         self.left_panel.on_pinger(fix.x, fix.y,
                                   self.geo.local_to_gps(fix.x, fix.y))
@@ -552,14 +552,14 @@ class MainWindow(QMainWindow):
         # last known position of a silent pinger is not a position.
         stale_s = self._config.alignment.pinger_stale_after_s
         if (stale_s > 0 and self._last_pinger_walltime is not None
-                and time.monotonic() - self._last_pinger_walltime > stale_s):
+                and stream_now() - self._last_pinger_walltime > stale_s):
             self._last_pinger_walltime = None
             self.pinger_layer.clear()      # re-shows on the next fix
             self.statusBar().showMessage(
                 "Pinger signal lost — marker hidden.", 6000)
         if self._telemetry_stale or self._last_state_walltime is None:
             return
-        if time.monotonic() - self._last_state_walltime > self._stale_after_s:
+        if stream_now() - self._last_state_walltime > self._stale_after_s:
             self._telemetry_stale = True
             self.trajectory_layer.set_stale(True)
             self.trajectory_layer.begin_new_segment()
@@ -738,7 +738,7 @@ class MainWindow(QMainWindow):
     # node is restarted. STOP terminates the nodes (and START relaunches
     # them if pressed again). Recording is fully independent.
     def _on_start(self) -> None:
-        self._mission_start = time.monotonic()
+        self._mission_start = stream_now()
         # Robot-state re-sync (as if the application had just launched),
         # while PRESERVING any displayed trajectory: forget the cached
         # pose and break the track polyline so no phantom segment joins
@@ -873,7 +873,7 @@ class MainWindow(QMainWindow):
     def _update_mission_time(self) -> None:
         self.left_panel.set_mission_time(
             None if self._mission_start is None
-            else time.monotonic() - self._mission_start)
+            else stream_now() - self._mission_start)
 
     # ---- shutdown --------------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
