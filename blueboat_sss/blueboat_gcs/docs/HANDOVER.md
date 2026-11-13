@@ -478,8 +478,9 @@ controls are pure visualization and never touch stored data.
   `ros2 bag play` wrapper in the toolbar would formalise post-mission review.
 * **Dirty-rect rendering**: the 4 Hz full-raster render is fine to multi-km² at
   25 cm cells; if surveys grow past that, render only the changed bounding box.
-* **Belief-grid / replanner layers**: when the adaptive replanner exists, its belief
-  grid and planned waypoints are two more `map_layers` classes + two signals.
+* **Belief-grid / replanner layers**: Belief's grid (`/belief_map/belief_grid`) and the
+  Replanner's plan (`/replanner/plan`, `nav_msgs/Path`) exist; they would be two more
+  `map_layers` classes + two signals.
 * **Click-to-export patch**: right-click → save the N×N metre raw patch around the
   cursor (useful for building the detection dataset).
 * **Persist UI state** (checkboxes, last view, dock sizes) via `QSettings`.
