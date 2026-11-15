@@ -265,9 +265,42 @@ the documented pixel→world formula; the detection overlay applies its exact
 inverse), mark it with `SelectionLayer` under the WorldRoot, center the map, and
 show world + GPS coordinates (coordinate card in the main window, status bar in
 replay). Gap rows and evicted history refuse with a status message. Since
-2026-10-16 clicks and overlay use **georef convention 2**, as the pictures:
-`WaterfallService.row_georef` (the row's tracked bottom `h`) and
-`seabed_imager.LEVER_ARM_M` (0.285 m per side).
+2026-10-16 clicks and overlay use the pictures' georef convention:
+`WaterfallService.row_georef` (the row's tracked bottom `h`),
+`seabed_imager.LEVER_ARM_M` (0.285 m per side) and, since 2026-11-15,
+`WaterfallService.row_lever_x` (the row's fore/aft arm, below).
+
+**Fore/aft arm: a ping is placed from the transducers' point (2026-11-15, CR-SSS-2).**
+The transducers sit `a` = −0.345 m along the heading from the navigation pose (0.345 m
+aft; adopted from the simulator's profile, not measured — the module `CLAUDE.md`,
+*Fore/aft arm*). Until this date every placement started from the navigation point, so
+one object seen on two opposite headings landed `2·|a|` = 0.69 m apart.
+- **The rule, one definition:** `models/sonar.sensor_point(x, y, yaw, a)` =
+  `(x + cos(yaw)·a, y + sin(yaw)·a)`; `SonarPing.x_offset_m` carries `a` and
+  `SonarPing.sensor_x` / `sensor_y` apply it to the ping's **final** pose (after the live
+  re-stamping of pose and compass yaw). `a = 0` returns the pose itself, the same objects,
+  so everything computed without an arm is bit for bit what it was.
+- **Where `a` comes from:** live, the ping's own `ProcessedSSSPing.transducer_x_offset`
+  (`core/live_native.transducer_x_offset_of`; the processor is the one source in a live
+  graph, and one built before 2026-11-15 sends 0.0 = the old placement); replay, "Save
+  pictures" and the session rebuild, `alignment.transducer_x_offset_m` (default −0.345 =
+  `core/svlog.TRANSDUCER_X_OFFSET_M`), passed to `load_svlog(transducer_x_offset_m=…)`.
+  `0.0` there re-places a recording as before. The `--sim` bench simulator sends no arm.
+- **Where it is applied:** the mosaic (`mapping/rasterizer.py` builds its ping line, and
+  the virtual pings between two real ones, from the sensor point; the legacy scatter in
+  `core/mosaic_service.py` too), the swath line (`gui/main_window.py`), the waterfall click
+  (both windows: `waterfall_pixel_to_world(..., lever_x=row_lever_x(row))`; the arm is the
+  ninth per-row metadata column, in memory only) and the seabed-picture grids (below).
+- **Where it is not, on purpose:** `boat_trajectory.csv` and every boat marker (the
+  navigation point); the row poses in the pictures' `rows_data` (navigation pose, the arm
+  is in `georef`); the along-track estimator and the square-row sampling (unchanged, so
+  the detector's input is byte-identical; `TODO.md`); the detection overlay (its row is the
+  detection's time, its column the across-track component: an arm along the heading
+  changes neither).
+- **Recorded:** `metadata.json` `transducer_x_offset_m` (the arm of the session's pings;
+  a list if it changed, `null` without pings), every picture's `georef`.
+- Pinned by `tests/test_fore_aft_arm.py`: a point seen heading east and heading west
+  coincides with the arm and is 0.69 m apart without it, on every path above.
 
 **Runtime sonar range.** The right panel's Acquisition group (main window only,
 enabled while the pipeline is RUNNING) changes `range_length_mm` live:
@@ -512,8 +545,11 @@ along-track position interpolated in time, in both geometries
 (`SeabedImager._late_index`; `test_late_pings_keep_picture_rows_chronological`).
 Still open: at pivot turns the navigation point (GPS near the bow on the pool corpus)
 outruns the transducers, so square rows repeat pings (30–65 % on `weight_1time`); the
-fix needs the transducers' own track, whose fore/aft arm is not settled (−0.345 m drawing
-vs −0.60 m measured from the pool's navigation fix). Each row carries `yaw_rate_rad_s`.
+fix needs the along-track estimator fed the transducers' own track. Every ping carries the
+arm since 2026-11-15 (`sensor_x` / `sensor_y`), but the estimator still takes the
+navigation point: changing it changes which ping each row copies, and the arm is adopted,
+not measured (−0.345 m drawing vs −0.60 m from the pool's navigation fix). Each row carries
+`yaw_rate_rad_s`.
 
 Windowing: a range change ends the window so every image is one homogeneous grid; the
 50 % overlap is the standard tiling guarantee that an object smaller than the stride
@@ -534,6 +570,21 @@ rotate/translate by that row pose (`world_x = x − sin(yaw)·y_local`,
 submersion, and no lever) and its stored grids stay valid as written.
 `waterfall_pixel_to_world`'s default arguments are convention 1 bit for bit
 (`tests/test_perception_golden.py`).
+
+**Georef convention 3 (2026-11-15): convention 2 placed from the transducers' point.**
+A picture whose pings carry a fore/aft arm `a` (`SonarPing.x_offset_m`) computes
+`world_x = x + cos(yaw)·a − sin(yaw)·y_local`, `world_y = y + sin(yaw)·a + cos(yaw)·y_local`
+and writes `georef = {"convention": 3, "altitude": "bottom_m", "lever_arm_m": {"x": a,
+"y_port": 0.285, "y_stbd": 0.285}}` with the convention-3 formula text
+(`seabed_imager.georef_for`, `FORMULA_CONVENTION_3`). **No key is added and the schema
+stays 5**: `lever_arm_m.x` existed (it was 0.0). The row pose in `rows_data` stays the
+navigation pose; the dB, the PNG and which ping each row copies are unchanged. A picture
+whose pings carry no arm is convention 2 exactly as before, grids and text, so the
+Perception goldens are untouched and a recording re-processed with
+`alignment.transducer_x_offset_m: 0.0` says what it said then. One arm per picture: pings
+with another arm close the window, as a range change does. BlueBoat-Perception reads
+`lever_arm_m.x` and does not apply it yet (CR-PER-2, session-06 handoff), so its
+detections of a convention-3 picture are still placed as under convention 2.
 
 **Schema 5 (2026-10-16), additive keys** (`tests/test_perception_golden.py` pins that
 nothing else changed): `stream_id` (`gcs-<UTC>-<4 hex>`, new at every

@@ -339,7 +339,9 @@ class MainWindow(QMainWindow):
         # tracks the current sonar configuration automatically. Stored
         # latest-wins and flushed by _swath_timer, never drawn per ping.
         if ping.y_local.size:
-            self._pending_swath = (ping.robot_x, ping.robot_y, ping.yaw,
+            # Through the transducers' point: the line is where this ping
+            # was acquired, the fore/aft arm behind the navigation point.
+            self._pending_swath = (ping.sensor_x, ping.sensor_y, ping.yaw,
                                    float(np.abs(ping.y_local).max()))
 
     def _flush_swath(self) -> None:
@@ -646,12 +648,14 @@ class MainWindow(QMainWindow):
                 "No position for that waterfall point (gap row, or the "
                 "history was discarded).", 6000)
             return
-        # Georef convention 2, as the seabed pictures: the row's tracked
-        # bottom and the transducer lever arm (row_georef).
+        # As the seabed pictures (georef convention 3): the row's tracked
+        # bottom, the lateral lever arm (row_georef) and the row's fore/aft
+        # arm (row_lever_x; 0 = convention 2).
         rx, ry, yaw, bottom = self.waterfall_service.row_georef(row)
         wx, wy = waterfall_pixel_to_world(
             rx, ry, yaw, bottom, self.waterfall_service.pitch_m,
-            float(col), self.waterfall_service.columns, *LEVER_ARM_M)
+            float(col), self.waterfall_service.columns, *LEVER_ARM_M,
+            lever_x=self.waterfall_service.row_lever_x(row))
         wx, wy = float(wx), float(wy)
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(

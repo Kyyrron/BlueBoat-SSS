@@ -33,7 +33,8 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from ..core.live_native import (PendingRows, ProcessedFields, ProfileCache,
-                                attach_native, profile_from_msg)
+                                attach_native, profile_from_msg,
+                                transducer_x_offset_of)
 from ..core.signals import AppSignals
 from ..models.sonar import SonarPing
 from ..utils.geodesy import quat_to_yaw
@@ -319,6 +320,10 @@ class SonarListener:
             # the seabed-image metadata (joins rows to per-ping records).
             port_ping_number=pn,
             stbd_ping_number=spn,
+            # The processor's fore/aft arm (its parameter
+            # transducer_x_offset_m): the one source in a live graph. A
+            # processor built before 2026-11-15 sends 0.0 = no arm.
+            x_offset_m=transducer_x_offset_of(msg),
         )
         fields = ProcessedFields(port_pn=pn, stbd_pn=spn, water_depth=depth,
                                  port_y=py, port_db=pi, stbd_y=sy, stbd_db=si)

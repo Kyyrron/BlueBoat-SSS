@@ -84,6 +84,17 @@ _SVLOG_MTIME_SLACK_S = 10.0     # tolerance around the session window
 _SVLOG_MIN_BYTES = 10
 
 
+def session_x_offset(arms):
+    """``metadata.json["transducer_x_offset_m"]`` from the distinct
+    fore/aft arms a session's pings carried: the value when there is one
+    (every session in practice), the list when it changed, None when the
+    session holds no ping."""
+    arms = [float(a) for a in arms]
+    if not arms:
+        return None
+    return arms[0] if len(arms) == 1 else arms
+
+
 def write_session_metadata(session: Path, meta: dict) -> None:
     """Write ``metadata.json`` with the session schema.
 
@@ -164,6 +175,9 @@ class RecordingManager(QObject):
         # adoption sweep has not run yet; consumed by adopt_now().
         self._pending_adoption: Optional[tuple] = None
         self._ping_count = 0
+        # The fore/aft arm(s) the session's pings were placed with
+        # (SonarPing.x_offset_m), in order of first appearance.
+        self._x_offsets: List[float] = []
         self._detections: List[Detection] = []
         self._priority_mode = "average"
         self._display_settings = None
@@ -171,9 +185,12 @@ class RecordingManager(QObject):
         signals.detection.connect(self._log_detection)
 
     # ---- bookkeeping slots -------------------------------------------------------
-    def _count_ping(self, _ping) -> None:
+    def _count_ping(self, ping) -> None:
         if self.active:
             self._ping_count += 1
+            arm = float(getattr(ping, "x_offset_m", 0.0))
+            if arm not in self._x_offsets:
+                self._x_offsets.append(arm)
 
     def _log_detection(self, det: Detection) -> None:
         if self.active:
@@ -205,6 +222,7 @@ class RecordingManager(QObject):
         self._start_stream = stream_now()
         self._start_stamp = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         self._ping_count = 0
+        self._x_offsets = []
         self._detections.clear()
         # The directory exists from the start of the session so streaming
         # artifacts (live seabed_images/) land inside it as they are made.
@@ -360,6 +378,10 @@ class RecordingManager(QObject):
             "ping_count": self._ping_count,
             "detection_count": len(self._detections),
             "adopted_svlogs": svlogs,
+            # The fore/aft arm of the transducers the session's pings were
+            # placed with [m, + forward]: the processor's own value on each
+            # ping (ProcessedSSSPing.transducer_x_offset). null = no ping.
+            "transducer_x_offset_m": session_x_offset(self._x_offsets),
             "mosaic": {
                 "cell_size_m": self._config.mosaic.cell_size_m,
                 "densify": self._config.mosaic.densify,

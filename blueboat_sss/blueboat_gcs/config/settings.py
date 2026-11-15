@@ -399,7 +399,18 @@ class AlignmentConfig:
         position (the producer's fixed_pinger path);
       * "robot" / "world" — force one interpretation (legacy setups).
     pinger_stale_after_s: hide the pinger marker when no fix arrived
-    for this long (0 disables)."""
+    for this long (0 disables).
+
+    transducer_x_offset_m: fore/aft arm of the two transducers from the
+    navigation pose [m], + forward (2026-11-15). Used wherever the GCS
+    builds pings itself from a ``.svlog`` -- the replay window, "Save
+    pictures", the session rebuild -- because a ``.svlog`` records the
+    boat's pose only. LIVE pings do not read it: they carry the
+    processor's own value (``ProcessedSSSPing.transducer_x_offset``, its
+    parameter ``transducer_x_offset_m``), so one graph has one arm.
+    The default is ``core/svlog.py`` ``TRANSDUCER_X_OFFSET_M`` (-0.345,
+    adopted from the simulator's profile, not measured). ``0.0`` re-places
+    a recording exactly as before 2026-11-15."""
 
     pose_source: str = "auto"          # auto | embedded | gcs
     frozen_epsilon_m: float = 0.05
@@ -409,6 +420,7 @@ class AlignmentConfig:
     compass_stale_s: float = 2.0
     pinger_frame: str = "auto"         # auto | robot | world
     pinger_stale_after_s: float = 10.0
+    transducer_x_offset_m: float = -0.345   # = core/svlog.TRANSDUCER_X_OFFSET_M
 
 
 @dataclass

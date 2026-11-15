@@ -428,8 +428,10 @@ class MeasureLayer:
 
 # ---------------------------------------------------------------------------
 class SwathLayer:
-    """Current sonar acquisition range: a thin white line through the robot,
-    perpendicular to its heading, spanning ±range.
+    """Current sonar acquisition range: a thin white line through the
+    transducers' point (the caller passes ``SonarPing.sensor_x/y``, the
+    navigation point moved by the fore/aft arm), perpendicular to the
+    heading, spanning ±range.
 
     The extent is derived from the actual samples of every ping
     (max |y_local|), so it always reflects the *current* sonar

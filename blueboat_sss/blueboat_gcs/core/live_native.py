@@ -48,6 +48,19 @@ class CachedProfile:
     analog_gain: float = 0.0
 
 
+def transducer_x_offset_of(msg: Any) -> float:
+    """The fore/aft arm a ``ProcessedSSSPing`` carries [m, + forward]:
+    its ``transducer_x_offset``, the processor's own parameter -- the one
+    source of the arm in a live graph. 0.0 (no arm) when the field is
+    absent or not a finite number, which is also what a processor built
+    before 2026-11-15 sends."""
+    try:
+        value = float(getattr(msg, "transducer_x_offset", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return value if np.isfinite(value) else 0.0
+
+
 def side_of_profile(channel_number: int, transducer_heading_deg: float) -> int:
     """CM-5: side from the packet — ``channel_number`` (0 port / 1 stbd),
     falling back to the sign of the transducer mounting angle, **wrapped

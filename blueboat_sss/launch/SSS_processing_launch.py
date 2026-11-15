@@ -25,6 +25,17 @@ Usage
     ros2 launch blueboat_sss SSS_processing_launch.py with_acquisition:=True \
         range_length_mm:=30000
     ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True
+    ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True \
+        transducer_x_offset_m:=0.0
+
+Transducer fore/aft arm (2026-11-15). ``transducer_x_offset_m`` (default
+-0.345, + forward of the /blueboat/odom pose) is the processor's parameter
+of the same name: the value it publishes in every
+``ProcessedSSSPing.transducer_x_offset``, from which the GCS (and any other
+consumer) places the ping. The default is ``sss_processor_node``'s own
+``TRANSDUCER_X_OFFSET_M`` = the simulator's ``model.mount_x_m`` (adopted, not
+measured). ``:=0.0`` re-processes a recording as it was placed before
+2026-11-15.
 
 Clock (2026-11-07). ``SimpleLauncher(use_sim_time='auto')``: when a
 ``/clock`` publisher exists at launch (a simulation graph -- Gazebo), every
@@ -70,6 +81,12 @@ def generate_launch_description():
     sl_num_results       = sl.declare_arg('num_results',       default_value=1200)
     sl_pulse_len_percent = sl.declare_arg('pulse_len_percent', default_value=0.00125)
 
+    # ---- sss_processor_node parameter ---------------------------------------
+    # Fore/aft arm of the transducers [m, + forward]; = the node's own
+    # TRANSDUCER_X_OFFSET_M (tests/test_fore_aft_arm.py holds them equal).
+    sl_transducer_x_offset_m = sl.declare_arg('transducer_x_offset_m',
+                                              default_value=-0.345)
+
     # ---- acquisition (optional, off by default) -----------------------------
     # Launch-time conditions, one per group (simple_launch evaluates
     # if_arg/unless_arg as substitutions when the description runs).
@@ -96,6 +113,9 @@ def generate_launch_description():
     # log/enable for .svlog recording (Record ON/OFF in the GCS).
     sl.node('blueboat_sss', 'sss_processor_node.py',
             name='sss_processor',
-            output='screen')
+            output='screen',
+            parameters={
+                'transducer_x_offset_m': sl_transducer_x_offset_m,
+            })
 
     return sl.launch_description()

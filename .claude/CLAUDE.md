@@ -273,13 +273,36 @@ and `TRANSDUCER_SUBMERSION_M` = **0.22** since 2026-11-02 (**measured**, SSS-Sim
 field-calibration pass 3: the rear-most hull holes 0.030 m above the keel, the waterline
 0.216–0.241 m at 16–22 kg, and the 0.90 m pool reproduces every run's FBR altitude to
 ±0.03 m; = the simulator's `sensor_depth_m`; was 0.15, an estimate), mirrored in the
-GCS's `core/svlog.py`; `TRANSDUCER_X_OFFSET_M` is still 0.0: the drawing says −0.345 m
-from the hull centre, the pool walls −0.60 m from the navigation fix (GPS near the bow),
-and it only rides in `ProcessedSSSPing.transducer_x_offset` — no georeference uses a
-fore/aft arm yet (a georef convention change, Perception's contract; planned). So
-`water_depth = altitude + 0.22` and `y = ±(0.285 + sqrt(s² − altitude²))`. **VERIFIED**
-(`sss_processor_node.py:136-139`). The golden pings keep their frozen 0.15 convention
+GCS's `core/svlog.py`. So `water_depth = altitude + 0.22` and
+`y = ±(0.285 + sqrt(s² − altitude²))`. **VERIFIED** (`sss_processor_node.py`, the
+*Transducer geometry* block). The golden pings keep their frozen 0.15 convention
 (`tests/golden_pings.py`).
+
+**Fore/aft arm (2026-11-15, owner's decision of 2026-11-14; CR-SSS-1 / CR-SSS-2).**
+`TRANSDUCER_X_OFFSET_M` = **−0.345** (+ forward: 0.345 m aft of the `/blueboat/odom`
+pose; was 0.0), = the simulator's `model.mount_x_m`, mirrored in the GCS's `core/svlog.py`.
+**Adopted from the simulator's `config/default_sonar.yaml`, not measured**
+(`~/ros2_ws/sim_runs/sim_acceptance/owner_measurements.yaml` says so; the drawing gives
+−0.345 m from the hull centre, the pool walls −0.60 m from the navigation fix with the GPS
+near the bow: open, `TODO.md`). `tests/test_fore_aft_arm.py` holds the processor's four
+constants, the GCS mirror, the config and launch defaults and the simulator's file together.
+- **Processor:** the constant is the default of the node parameter
+  `transducer_x_offset_m` (the node's only declared parameter; dynamic typing, so `:=0`
+  is accepted; a value that is not a finite number logs an error and keeps the default),
+  forwarded by `SSS_processing_launch.py`'s argument of the same name. It is published
+  unchanged in every `ProcessedSSSPing.transducer_x_offset` and changes nothing else in
+  the row: the pose stays the navigation pose, `*_y` are untouched
+  (`tests/test_processor_fore_aft_arm.py`).
+- **Consumers place a ping from `pose + R(yaw)·(arm, 0)`.** The GCS does, everywhere
+  (`blueboat_gcs/CLAUDE.md`, *Fore/aft arm*). BlueBoat-Belief and BlueBoat-Perception do
+  not yet (change requests in the session-06 handoff).
+- **Old sessions:** `transducer_x_offset_m:=0.0` on the launch line (processor) and
+  `alignment.transducer_x_offset_m: 0.0` in the GCS config re-process a recording exactly
+  as it was placed before 2026-11-15. A parameter, not a code fork.
+- **`~/ros2_ws/install` must be rebuilt** after a change of the constant
+  (`colcon build --packages-select blueboat_sss`): the GCS takes the arm of a live ping from
+  the message, so a stale installed processor silently keeps the old value. Its start-up
+  line says which arm it runs with.
 
 `.svlog` files are written to `../../../../data/SSS_data`, resolved relative to the
 launch working directory — the same root the GCS uses as `data_root`. The node resolves
@@ -310,6 +333,10 @@ Perception's default detector input (`fixed_gray`, its decision 6.4) is a fixed 
 the **32FC1 dB** and the per-row `gain_port_db` / `gain_stbd_db`, not of the display PNG:
 a change to those values, to the pictures' slant pitch or to the live 0.75 m nadir blank
 changes what its detector is trained and run on. The display model does not reach it.
+Since 2026-11-15 a picture built from pings that carry the fore/aft arm says georef
+**convention 3** (`lever_arm_m.x` = the arm, same keys, schema still 5) and its grids
+include the arm; the dB, the PNG and the row poses are unchanged, so the detector's input
+is too. Perception reads the key and does not apply it yet (CR-PER-2).
 
 ---
 
@@ -563,7 +590,9 @@ the `svlog-forensics` skill (`.claude/skills/svlog-forensics/`); which tool answ
 
 **ROS 2 nodes** — `ros2 launch blueboat_sss SSS_processing_launch.py` (processor only;
 `with_acquisition:=True` adds `sss_node.py`, `will_use_rosbag:=True` overrides;
-`msec_per_ping:=0` free-runs the device, a diagnostic only). `SSS_simple_launch.py` = acquisition
+`msec_per_ping:=0` free-runs the device, a diagnostic only;
+`transducer_x_offset_m:=0.0` publishes no fore/aft arm, for a recording made before
+2026-11-15). `SSS_simple_launch.py` = acquisition
 only. `SSS_processing_launch.py` is what the GCS launches; its **Sonar: Real sonars**
 selector appends `with_acquisition:=True`. The two flags are launch-time conditions
 (nested `sl.group(unless_arg=…)` / `sl.group(if_arg=…)`) — a Python truthiness test on
@@ -581,8 +610,15 @@ QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m pytest -p no:cacheprovider
 - Do not `source ~/ros2_ws/install/setup.bash` first: it switches `python3` to the
   workspace venv, which lacks pytest. The system python has pytest, rclpy, PySide6 and
   `blueboat_interfaces`.
-- **387 pass / 51 skip on 2026-10-27** with the workspace's `blueboat_interfaces` on
-  `PYTHONPATH` / `LD_LIBRARY_PATH` (356 / 50 before the SonarView-parity work; the new
+- **452 pass / 52 skip on 2026-11-15** with the workspace's `blueboat_interfaces` on
+  `PYTHONPATH` / `LD_LIBRARY_PATH`
+  (`PYTHONPATH=~/ros2_ws/install/blueboat_interfaces/lib/python3.12/site-packages:$PYTHONPATH
+  LD_LIBRARY_PATH=~/ros2_ws/install/blueboat_interfaces/lib:$LD_LIBRARY_PATH`), and
+  **394 pass / 110 skip** with the bare command above, where the node-side files skip
+  because `/usr/bin/python3` alone does not find `blueboat_interfaces` (measured the same
+  day before the fore/aft work: 416 / 52 and 368 / 100; the 36 new tests are
+  `test_fore_aft_arm.py`, 26, and `test_processor_fore_aft_arm.py`, 10, node-side).
+  Earlier: 387 pass / 51 skip on 2026-10-27 (356 / 50 before the SonarView-parity work; the new
   skip is the brping oracle, `bluerobotics-ping` being absent from the system python;
   353 / 50 on 2026-10-16; 351 / 50 before the along-track window tests;
   297 / 50 on 2026-09-28; the gate was **red, 298 /

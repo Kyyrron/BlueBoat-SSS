@@ -77,21 +77,30 @@ Row geometry (``seabed.row_geometry``, decision 2026-09-05, PROVISIONAL):
 Pixel convention (identical to the live waterfall view): row 0 = newest,
 last row = oldest; column 0 = far range **port**, last column = far
 range starboard, transducer at the centre seam; every column is one
-slant bin of ``bin_pitch_m`` metres. Pixel→world, **georef convention 2**
-(schema 5, 2026-10-16; the processor's ``project_side`` geometry):
+slant bin of ``bin_pitch_m`` metres. Pixel→world, **georef convention 3**
+(2026-11-15: the processor's ``project_side`` geometry, placed from the
+transducers' point):
 
     k(j)         = (W/2 - 1 - j) if j < W/2 else (j - W/2)
     s(j)         = (k + 0.5) * bin_pitch_m
     y_local(i,j) = ±(lever_side + sqrt(max(s² - bottom_i², 0)))   (+ port, − starboard)
-    world_x(i,j) = x_i - sin(yaw_i) * y_local
-    world_y(i,j) = y_i + cos(yaw_i) * y_local
+    world_x(i,j) = x_i + cos(yaw_i) * a - sin(yaw_i) * y_local
+    world_y(i,j) = y_i + sin(yaw_i) * a + cos(yaw_i) * y_local
 
-with ``bottom_i`` the row's tracked transducer altitude (``bottom_m``) and
+with ``bottom_i`` the row's tracked transducer altitude (``bottom_m``),
 ``lever_side`` the transducer's lateral offset (``core/svlog.py``
-``TRANSDUCER_Y_OFFSET_*``, 0.285 m). Schema <= 4 pictures (no ``georef``
-key) used **convention 1**: lever 0 and ``altitude_m`` (the correction
-altitude + submersion) in place of ``bottom_m`` -- their stored world
-grids stay valid as written.
+``TRANSDUCER_Y_OFFSET_*``, 0.285 m) and ``a`` the fore/aft arm of the
+transducers from the row pose, + forward (``georef.lever_arm_m.x``; the
+pings' own ``SonarPing.x_offset_m``, -0.345 m). ``(x_i, y_i, yaw_i)`` stays
+the NAVIGATION pose (``rows_data`` ``x_m`` / ``y_m`` / ``yaw_rad``): the arm
+is in the grids and in ``georef``, never folded into the row pose.
+
+**Convention 2** (schema 5, 2026-10-16) is the same with ``a = 0`` and is
+what a picture built from pings without an arm still says -- its
+``georef`` and grids are unchanged bit for bit (``georef_for``). Schema
+<= 4 pictures (no ``georef`` key) used **convention 1**: lever 0 and
+``altitude_m`` (the correction altitude + submersion) in place of
+``bottom_m`` -- their stored world grids stay valid as written.
 """
 
 from __future__ import annotations
@@ -111,7 +120,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from ..config.settings import AppConfig
 from ..models.sonar import (SonarPing, build_slant_row, native_bins,
-                            slant_col_to_y_local)
+                            sensor_point, slant_col_to_y_local)
 from .along_track import AlongTrackEstimator
 from .display_model import DisplayModel, DisplayModelSnapshot
 from .svlog import TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M
@@ -127,6 +136,50 @@ LEVER_ARM_M = (TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M)
 GEOREF = {"convention": 2, "altitude": "bottom_m",
           "lever_arm_m": {"x": 0.0, "y_port": float(LEVER_ARM_M[0]),
                           "y_stbd": float(LEVER_ARM_M[1])}}
+#: The convention a picture declares when its pings carry a fore/aft arm
+#: (2026-11-15): convention 2 placed from the transducers' point.
+GEOREF_CONVENTION_FORE_AFT = 3
+
+
+def georef_for(lever_x: float) -> dict:
+    """``metadata()["georef"]`` of a picture whose pings carry the
+    fore/aft arm ``lever_x`` [m, + forward].
+
+    No arm (0.0) is ``GEOREF`` itself, convention 2, so a recording
+    re-processed with the old value says exactly what it said then. With an
+    arm: the same keys, ``convention`` 3 and ``lever_arm_m.x`` = the arm.
+    """
+    g = dict(GEOREF, lever_arm_m=dict(GEOREF["lever_arm_m"]))
+    if lever_x != 0.0:
+        g["convention"] = GEOREF_CONVENTION_FORE_AFT
+        g["lever_arm_m"]["x"] = float(lever_x)
+    return g
+
+
+#: The pixel->world formula text of each convention, written into every
+#: picture's ``pixel_convention.formula``. Convention 2's is verbatim what
+#: schema 5 has carried since 2026-10-16.
+_FORMULA_HEAD = ("k = (W/2-1-j) if j < W/2 else (j-W/2); "
+                 "s = (k+0.5)*bin_pitch_m; "
+                 "y_local(i,j) = sign * (lever_side + sqrt(max(s^2 - "
+                 "bottom_m[i]^2, 0))) (+ port, - starboard; "
+                 "lever_side = georef.lever_arm_m.y_port / y_stbd); ")
+_FORMULA_TAIL = ("or use the "
+                 "precomputed world_x/world_y grids in the "
+                 "companion _world.npz. Schema <= 4 (no georef): "
+                 "convention 1, lever 0 and altitude_m[i]")
+FORMULA_CONVENTION_2 = ("georef convention 2: " + _FORMULA_HEAD
+                        + "world = (x_i - sin(yaw_i)*y_local, "
+                          "y_i + cos(yaw_i)*y_local); " + _FORMULA_TAIL)
+FORMULA_CONVENTION_3 = ("georef convention 3: " + _FORMULA_HEAD
+                        + "a = georef.lever_arm_m.x (fore/aft arm of the "
+                          "transducers from the row pose, + forward; the "
+                          "row pose x_m/y_m/yaw_rad stays the navigation "
+                          "pose); "
+                          "world = (x_i + cos(yaw_i)*a - sin(yaw_i)*y_local, "
+                          "y_i + sin(yaw_i)*a + cos(yaw_i)*y_local); "
+                        + _FORMULA_TAIL
+                        + ". Convention 2 = convention 3 with a = 0")
 
 
 def new_stream_id() -> str:
@@ -139,27 +192,33 @@ def new_stream_id() -> str:
 
 
 def waterfall_pixel_to_world(x, y, yaw, depth, pitch_m, col, width: int,
-                             lever_port: float = 0.0, lever_stbd: float = 0.0):
+                             lever_port: float = 0.0, lever_stbd: float = 0.0,
+                             lever_x: float = 0.0):
     """Waterfall pixel -> world position (the documented formula).
 
     Native slant-bin layout: the column's slant range is
     ``(k + 0.5) · pitch`` about the centre seam, the row's altitude
     turns it into ``y_local = ±(lever + sqrt(max(s² − depth², 0)))``
-    (+ port, − starboard), then rotate/translate by the row pose:
-    ``wx = x − sin(yaw)·y_local``, ``wy = y + cos(yaw)·y_local``.
+    (+ port, − starboard), then rotate/translate by the row pose from the
+    transducers' point ``(sx, sy) = (x, y) + R(yaw)·(lever_x, 0)``:
+    ``wx = sx − sin(yaw)·y_local``, ``wy = sy + cos(yaw)·y_local``.
 
-    Georef convention 2 (the pictures, clicks and overlay since
-    2026-10-16) passes ``depth`` = the row's tracked bottom and
-    ``*LEVER_ARM_M``; the defaults (lever 0) are convention 1 bit for bit.
+    Georef convention 3 (2026-11-15) passes ``depth`` = the row's tracked
+    bottom, ``*LEVER_ARM_M`` and ``lever_x`` = the row's fore/aft arm
+    (``SonarPing.x_offset_m``). ``lever_x = 0`` is convention 2 (the
+    pictures, clicks and overlay since 2026-10-16) bit for bit, and the
+    defaults (no lever at all) are convention 1 bit for bit.
 
     Accepts scalars (a waterfall click) or broadcasting numpy arrays
     (the per-pixel world grids of a whole seabed image). This is the
     single definition; the waterfall service's detection overlay applies
-    its exact inverse.
+    its exact inverse (which no fore/aft arm changes: the arm lies along
+    the heading, the overlay's column is the across-track component).
     """
     y_local = slant_col_to_y_local(col, width, pitch_m, depth,
                                    lever_port, lever_stbd)
-    return x - np.sin(yaw) * y_local, y + np.cos(yaw) * y_local
+    sx, sy = sensor_point(x, y, yaw, lever_x)
+    return sx - np.sin(yaw) * y_local, sy + np.cos(yaw) * y_local
 
 
 def _opt(v) -> Optional[float]:
@@ -293,17 +352,10 @@ class SeabedImage:
                           "dark centre band is the physical water column, "
                           "kept in the data and darkened by the display "
                           "model (not erased)",
-                "formula": ("georef convention 2: "
-                            "k = (W/2-1-j) if j < W/2 else (j-W/2); "
-                            "s = (k+0.5)*bin_pitch_m; "
-                            "y_local(i,j) = sign * (lever_side + sqrt(max(s^2 - "
-                            "bottom_m[i]^2, 0))) (+ port, - starboard; "
-                            "lever_side = georef.lever_arm_m.y_port / y_stbd); "
-                            "world = (x_i - sin(yaw_i)*y_local, "
-                            "y_i + cos(yaw_i)*y_local); or use the "
-                            "precomputed world_x/world_y grids in the "
-                            "companion _world.npz. Schema <= 4 (no georef): "
-                            "convention 1, lever 0 and altitude_m[i]"),
+                "formula": (FORMULA_CONVENTION_3
+                            if int((self.georef or {}).get("convention", 0))
+                            >= GEOREF_CONVENTION_FORE_AFT
+                            else FORMULA_CONVENTION_2),
             },
             "rows_data": [
                 {"t_s": float(self.row_t[i]),
@@ -427,6 +479,9 @@ class SeabedImager(QObject):
         # is deprecated: nothing is forced onto a fixed grid any more).
         self._pitch = 0.0
         self._half = 0
+        # Fore/aft arm of the buffered pings [m] (SonarPing.x_offset_m):
+        # one value per picture, as the layout is.
+        self._lever_x = 0.0
         # The window's display model (shared with the waterfall and the
         # mosaic). Owned only when nothing is injected — then this imager
         # feeds it itself; a shared model is fed by the waterfall service
@@ -483,6 +538,7 @@ class SeabedImager(QObject):
         self._emitted_any = False
         self._pitch = 0.0
         self._half = 0
+        self._lever_x = 0.0
         self._stream_id = new_stream_id()
         if self._owns_model:
             self._model.reset()
@@ -492,6 +548,16 @@ class SeabedImager(QObject):
         nb = native_bins(ping)
         if nb is None or nb.extent_bins == 0:
             return
+        # One fore/aft arm per picture (its ``georef`` states one): pings
+        # carrying another arm end the current window, as a layout change
+        # does. In practice the arm is constant for a whole stream.
+        arm = float(getattr(ping, "x_offset_m", 0.0))
+        if not math.isfinite(arm):
+            arm = 0.0
+        if arm != self._lever_x:
+            if self._buf_rows:
+                self.break_window()
+            self._lever_x = arm
         # A training image must be one homogeneous grid: a change of
         # acquisition (bin pitch or extent) ends the current window and
         # the next one adopts the new layout.
@@ -717,14 +783,16 @@ class SeabedImager(QObject):
         """Assemble the picture (arrays already newest-first)."""
         W = arr.shape[1]
         # Per-pixel world grids (vectorized over the whole window), georef
-        # convention 2: each row's tracked bottom turns its slant columns
-        # into ground ranges from the transducer, which sits the lever arm
-        # off the centre line -- the processor's project_side geometry.
+        # convention 3 (2 when the pings carry no fore/aft arm): each row's
+        # tracked bottom turns its slant columns into ground ranges from
+        # the transducer, which sits the lateral lever arm off the centre
+        # line (the processor's project_side geometry) and the fore/aft arm
+        # along the heading from the row's navigation pose.
         j = np.arange(W, dtype=np.float64)
         wx, wy = waterfall_pixel_to_world(
             pose[:, 0:1], pose[:, 1:2], pose[:, 2:3],
             np.maximum(np.asarray(bottoms, np.float64)[:, None], 0.0),
-            self._pitch, j[None, :], W, *LEVER_ARM_M)
+            self._pitch, j[None, :], W, *LEVER_ARM_M, lever_x=self._lever_x)
         # The model snapshot is immutable: safe on the save thread.
         snap = (self._model.snapshot()
                 if self._nadir_contrast and self._model.ready else None)
@@ -743,7 +811,7 @@ class SeabedImager(QObject):
             row_gain_db=np.asarray(gains, np.float32).reshape(-1, 2),
             display=snap,
             stream_id=self._stream_id,
-            georef=dict(GEOREF, lever_arm_m=dict(GEOREF["lever_arm_m"])),
+            georef=georef_for(self._lever_x),
             row_attitude=(None if att is None
                           else np.asarray(att, np.float64).reshape(-1, 4)),
             row_ping_numbers=(None if pns is None

@@ -36,7 +36,7 @@ from typing import Callable, Optional
 from ..config.settings import AppConfig
 from ..core.seabed_imager import generate_from_pings
 from .mosaic_service import MosaicService
-from .recording_session import write_session_metadata
+from .recording_session import session_x_offset, write_session_metadata
 from .svlog import SvlogMission, load_svlog
 from .waterfall_service import WaterfallService
 
@@ -63,7 +63,9 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
                          manual_depth_m=config.depth.manual_m,
                          blank_nadir=config.depth.blank_nadir,
                          nadir_blank_m=config.depth.nadir_blank_m,
-                         nadir_max_fraction=config.depth.nadir_max_fraction)
+                         nadir_max_fraction=config.depth.nadir_max_fraction,
+                         transducer_x_offset_m=(
+                             config.alignment.transducer_x_offset_m))
 
     # One display model for the three artifacts (the same rule as a
     # window): fitted over the whole log before anything is rendered.
@@ -102,6 +104,10 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
         "ping_count": mission.ping_count,
         "detection_count": 0,
         "adopted_svlogs": [svlog_path.name],
+        # The fore/aft arm the rebuilt pings were placed with
+        # (alignment.transducer_x_offset_m; a .svlog records none).
+        "transducer_x_offset_m": session_x_offset(
+            sorted({float(p.x_offset_m) for p in mission.pings})),
         "mosaic": {
             "cell_size_m": mosaic.cell_size_m,
             "densify": config.mosaic.densify,

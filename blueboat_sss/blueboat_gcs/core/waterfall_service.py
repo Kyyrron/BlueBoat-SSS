@@ -99,9 +99,11 @@ _MAX_GAP_ROWS = 5
 _PNG_MAX_ROWS = 20_000
 
 #: Per-row metadata columns: t, x, y, yaw, water_depth, bottom_slant_m,
-#: gain_port_db, gain_stbd_db (the last two: receive-gain offsets the
-#: display model removes, core/display_model.gain_offset_db).
-_META_COLS = 8
+#: gain_port_db, gain_stbd_db (receive-gain offsets the display model
+#: removes, core/display_model.gain_offset_db), x_offset_m (the ping's
+#: fore/aft arm, SonarPing.x_offset_m: a click places the row from the
+#: transducers' point). In memory only; waterfall_raw.npz is unchanged.
+_META_COLS = 9
 
 
 class WaterfallService(QObject):
@@ -392,8 +394,10 @@ class WaterfallService(QObject):
         if h <= 0.0:
             h = max(float(ping.water_depth), 0.0)
         gains = self._model.gain_offsets(ping)
+        arm = float(getattr(ping, "x_offset_m", 0.0))
         meta[off] = (ping.t, ping.robot_x, ping.robot_y, ping.yaw,
-                     max(float(ping.water_depth), 0.0), h, gains[0], gains[1])
+                     max(float(ping.water_depth), 0.0), h, gains[0], gains[1],
+                     arm if math.isfinite(arm) else 0.0)
         self._along.observe(float(ping.t), float(ping.robot_x),
                             float(ping.robot_y))
         finite = np.isfinite(row)
@@ -437,14 +441,27 @@ class WaterfallService(QObject):
 
     def row_georef(self, row: int) -> Optional[Tuple[float, float, float, float]]:
         """(robot_x, robot_y, yaw, bottom) of an absolute row for the
-        georef convention 2 pixel->world (the seabed pictures' convention:
-        ``bottom`` = the row's tracked bottom ``h``, used with the
-        transducer lever arm), or None where :meth:`row_meta` is None."""
+        pixel->world of the seabed pictures' georef convention (``bottom``
+        = the row's tracked bottom ``h``, used with the lateral transducer
+        lever arm; the fore/aft arm is :meth:`row_lever_x`), or None where
+        :meth:`row_meta` is None. The pose is the navigation pose."""
         if self.row_meta(row) is None:
             return None
         idx = row - self._row0
         m = self._metas[idx // _TILE_ROWS][idx % _TILE_ROWS]
         return float(m[1]), float(m[2]), float(m[3]), float(m[5])
+
+    def row_lever_x(self, row: int) -> float:
+        """The fore/aft arm [m, + forward] of an absolute row's ping
+        (``SonarPing.x_offset_m``), for the pixel->world of a click: the
+        ``lever_x`` of ``waterfall_pixel_to_world`` next to
+        :meth:`row_georef`. 0.0 where the row has none (a gap row, an
+        evicted row, a ping without an arm)."""
+        if self.row_meta(row) is None:
+            return 0.0
+        idx = row - self._row0
+        v = float(self._metas[idx // _TILE_ROWS][idx % _TILE_ROWS][8])
+        return v if math.isfinite(v) else 0.0
 
     # ---- display -----------------------------------------------------------------
     def set_enabled(self, enabled: bool) -> None:

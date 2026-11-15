@@ -9,6 +9,36 @@ marked with why.
 
 ---
 
+## Transducer fore/aft arm (2026-11-15, CR-SSS-1 / CR-SSS-2; handoff `~/ros2_ws/sim_runs/sim_acceptance/06_sss/handoff_06.md`)
+
+Done 2026-11-15 (owner's decision of 2026-11-14):
+- **One set of values**: fore/aft −0.345 m in the processor (`TRANSDUCER_X_OFFSET_M`, the
+  default of the new node / launch parameter `transducer_x_offset_m`) and in the GCS
+  (`core/svlog.py`, `alignment.transducer_x_offset_m`), = the simulator's `model.mount_x_m`.
+  **Adopted, not measured.**
+- **The GCS places every ping from the transducers' point**: mosaic (both modes), swath
+  line, waterfall click, seabed-picture grids (georef convention 3 when the arm is not 0).
+- Effect on one object seen on two opposite headings (handoff, section 4): simulated tyres
+  0.70–0.72 m apart before, 0.01–0.03 m after; real mooring block A1 0.76 → 0.07 m, A2
+  1.31 → 0.62 m.
+
+Open:
+- [ ] **The arm is not measured** (CR-OWN-1). On the real boat it counts from the navigation
+  fix: the pool corpus read −0.60 m with the GPS near the bow, the drawing says −0.345 m from
+  the hull centre. Needs reciprocal passes over a point target, at equal range on both passes
+  so a heading error cancels. Then one value in `owner_measurements.yaml`, the simulator's
+  profile and the two defaults here (`tests/test_fore_aft_arm.py` fails until they agree).
+- [ ] **A2's residual of 0.6 m is not explained.** Its two passes are at 20.2 m and 9.4 m;
+  A1's, at 13.9 m and 10.3 m, close to 0.07 m. An arm or a clock lag acts the same on both
+  blocks, so the difference is range-dependent: a heading error is the candidate (not
+  established; one recording, frozen autopilot clock).
+- [ ] **BlueBoat-Perception still places detections without the arm** (it reads
+  `georef.lever_arm_m.x` and ignores it): CR-PER-2 in the handoff. Until then the map shows
+  its markers 0.345 m along-track off the mosaic; the waterfall overlay is unaffected.
+- [ ] **BlueBoat-Belief places ping evidence without `transducer_x_offset`**: CR-BEL-1.
+- [ ] **A per-session arm on the real boat.** The value is now a parameter in both places;
+  nothing yet records where the GPS sat on the day.
+
 ## From the pool corpus (SSS-Sim field-calibration pass 3; plan `~/calib/pass3/GCS_PLAN.md`)
 
 Done 2026-11-02 (operator's order):
@@ -27,9 +57,12 @@ Open:
   Find where the rate is lost (bag_replay republish, QoS, CPU).
 - [ ] **Square rows repeat pings at pivot turns** (30–65 % on `weight_1time`): the
   navigation point (GPS near the bow) outruns the transducers. Needs along-track from the
-  transducers' own track, i.e. a settled fore/aft arm (−0.345 m drawing vs −0.60 m from the
-  pool's navigation fix) as a per-session setting, and a georef convention with that arm
-  (Perception's contract).
+  transducers' own track. The arm now exists on every ping (`SonarPing.x_offset_m`,
+  `sensor_x` / `sensor_y`, 2026-11-15) and the pictures have a georef convention with it
+  (convention 3); what is left is to feed `AlongTrackEstimator` the transducers' point in
+  the imager and the waterfall. Not done on 2026-11-15 on purpose: it changes which ping
+  each square row copies, i.e. the detector's input, and the arm is adopted, not measured
+  (−0.345 m drawing vs −0.60 m from the pool's navigation fix).
 - [ ] **Display fit ignores seabed nearer than 1 m** (`mosaic.water_column_min_m`): at 0.6 m
   altitude the 0.6–1 m band never enters the curve. An acquisition-derived bound
   (`max(0.15 m, 11 bins)`, the measured ringing) was tried on 2026-11-02 and reverted: it

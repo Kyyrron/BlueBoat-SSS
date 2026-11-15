@@ -89,6 +89,34 @@ lever arm across-track.
 - Older sessions are not rewritten. Their pictures have no `georef` key, which means
   convention 1, and Perception reads them that way.
 
+**Convention 3 (2026-11-15): the fore/aft arm.** The transducers sit 0.345 m aft of the
+navigation point (`core/svlog.py` `TRANSDUCER_X_OFFSET_M` = −0.345, adopted from the
+simulator's profile, not measured). Convention 2 placed every row from the navigation
+point, so one object seen on two opposite headings landed 0.69 m apart.
+- Each ping carries its arm (`SonarPing.x_offset_m`: live, the processor's
+  `ProcessedSSSPing.transducer_x_offset`; replay, `alignment.transducer_x_offset_m`).
+- `waterfall_pixel_to_world(..., lever_x=a)`:
+  `world = (x + cos(yaw)·a − sin(yaw)·y_local, y + sin(yaw)·a + cos(yaw)·y_local)`.
+  `lever_x = 0` is convention 2 bit for bit.
+- A picture whose pings carry an arm writes `georef = {"convention": 3, "altitude":
+  "bottom_m", "lever_arm_m": {"x": -0.345, "y_port": 0.285, "y_stbd": 0.285}}`, the
+  convention-3 `pixel_convention.formula`, and grids with the arm. **Same keys, schema
+  still 5.** `rows_data` `x_m` / `y_m` / `yaw_rad` stay the navigation pose.
+- A picture whose pings carry no arm (arm 0: an old processor, a recording re-processed
+  with `alignment.transducer_x_offset_m: 0.0`, the golden pings) is convention 2 exactly
+  as before (`georef_for`). One arm per picture: a change of arm closes the window.
+- **Perception's side (change request CR-PER-2, not applied here, CM-3).** Its
+  `core/image.py` already reads `lever_arm_m.x` into `Georef.lever_x_m`, but
+  `core/geometry.py` `world_grids` and `edge_points` do not use it (`convention >= 2`
+  is treated as 2). Until they do, a convention-3 picture gives detections whose
+  `world_xy` is 0.345 m along-track from the station's grid at that pixel: exactly where
+  they were before this change. `tests/test_perception_golden.py`
+  `test_live_perception_path_georeferences_with_convention_2` still holds because the
+  golden pings carry no arm.
+- The waterfall's detection overlay is unaffected either way: its row is the detection's
+  time and its column the across-track component, which an arm along the heading does not
+  change (`tests/test_fore_aft_arm.py`).
+
 **Q8, metadata only, never geometry.**
 - `SonarPing` gained optional `roll`, `pitch`, `yaw_rate`, `attitude_age_s` (NaN means
   unknown) and `port_ping_number`, `stbd_ping_number` (0 means absent). Defaults keep
@@ -122,7 +150,8 @@ bit for bit. A row whose profile *was* attached never used this path. Noted in S
 
 ## 6. Data on disk
 - Session pictures gain the additive keys. The PNG and npz formats are unchanged; the
-  npz `world_x` / `world_y` values follow convention 2.
+  npz `world_x` / `world_y` values follow convention 2, or convention 3 since 2026-11-15
+  when the pings carry the fore/aft arm (the picture's own `georef` says which).
 - **No existing session is rewritten** (NC #6, CM-7). Nothing new is written outside
   sessions: the published images are a live stream, and Perception writes into its own
   roots.

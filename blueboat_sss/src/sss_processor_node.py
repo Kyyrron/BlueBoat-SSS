@@ -56,6 +56,16 @@ every 30 s period (something resets the intervals; not identified). The
 request is autopilot-wide: every /mavros/* consumer, BlueBoat-Control's
 /blueboat/odom included, gets the higher rate (about 13 Hz delivered,
 measured with SonarView). Absent the service (simulation) it is skipped.
+
+Parameters
+----------
+transducer_x_offset_m   float, default TRANSDUCER_X_OFFSET_M (-0.345). Fore/aft
+    arm of the two transducers from the pose /blueboat/odom reports, in metres,
+    + forward. Published unchanged in every ProcessedSSSPing.transducer_x_offset
+    so a consumer places the ping from the transducers' point
+    (pose + R(yaw) . (arm, 0)) without knowing this node's constants. A bag of
+    a session processed before 2026-11-15 is re-processed as it was then with
+    ``transducer_x_offset_m:=0.0`` (SSS_processing_launch.py forwards it).
 """
 
 from __future__ import annotations
@@ -83,6 +93,7 @@ import rclpy
 from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from builtin_interfaces.msg import Time as TimeMsg
@@ -134,11 +145,22 @@ HEADING_BYTE: int = 52   # payload offset 44, float32 LE: transducer_heading_deg
 
 
 # ---------------------------------------------------------------------------
-# Transducer geometry -- measure on the physical BlueBoat and fill in.
-# All in meters, expressed in base_link (REP-103: +x forward, +y left = port,
-# +z up). y offsets are positive magnitudes; port/starboard sign is in code.
+# Transducer geometry. All in meters, expressed in base_link (REP-103: +x
+# forward, +y left = port, +z up). y offsets are positive magnitudes;
+# port/starboard sign is in code.
+#
+# One set of values in the processor, the GCS (blueboat_gcs/core/svlog.py)
+# and the simulator (BlueBoat-SSS-Sim config/default_sonar.yaml `model:`,
+# the single source of every profile); tests/test_fore_aft_arm.py holds the
+# three together. Status 2026-11-15: ADOPTED from the simulator's file, not
+# measured on the boat (~/ros2_ws/sim_runs/sim_acceptance/
+# owner_measurements.yaml says so; the pool corpus read -0.60 m from the
+# navigation fix against -0.345 m on the drawing, unresolved).
+#
+# TRANSDUCER_X_OFFSET_M is the DEFAULT of the node parameter
+# `transducer_x_offset_m`; the other three are constants.
 # ---------------------------------------------------------------------------
-TRANSDUCER_X_OFFSET_M:      float = 0.0  # TODO: fore/aft offset from base_link, not measured (assumed amidships)
+TRANSDUCER_X_OFFSET_M:      float = -0.345  # ADOPTED 2026-11-15 = sim model.mount_x_m (rear-most hull mounting holes, 0.345 m aft of the hull centre, BlueBoat.dae); was 0.0 ("assumed amidships")
 TRANSDUCER_Y_OFFSET_PORT_M: float = 0.285  # hull centreline, BR-101447: 570 mm / 2
 TRANSDUCER_Y_OFFSET_STBD_M: float = 0.285  # same, magnitude (sign is in code)
 TRANSDUCER_SUBMERSION_M:    float = 0.22  # MEASURED 2026-11-02 (SSS-Sim field-calibration pass 3: rear-most hull holes 0.030 m above the keel, waterline 0.216-0.241 m at 16-22 kg, the 0.90 m pool reproduces the FBR altitude to +-0.03 m) = sim sensor_depth_m; was 0.15 (estimate)
@@ -527,6 +549,25 @@ class SSSProcessorNode(Node):
         self._emitted = 0
         self._one_sided = 0
         self._already_bootstrapped_logged = False
+
+        # Fore/aft arm of the transducers [m, + forward], published in every
+        # ProcessedSSSPing.transducer_x_offset. A parameter so a session
+        # recorded before 2026-11-15 re-processes as it was (":=0.0").
+        # Dynamic typing: a launch line writing ":=0" sends an integer.
+        self.declare_parameter(
+            "transducer_x_offset_m", TRANSDUCER_X_OFFSET_M,
+            ParameterDescriptor(
+                dynamic_typing=True,
+                description="Fore/aft arm of the transducers from the "
+                            "/blueboat/odom pose [m], + forward; published "
+                            "in ProcessedSSSPing.transducer_x_offset"))
+        self._transducer_x_offset_m = self._read_x_offset()
+        self.get_logger().info(
+            f"transducer fore/aft arm: {self._transducer_x_offset_m:+.3f} m "
+            "(+ forward of the /blueboat/odom pose; parameter "
+            "transducer_x_offset_m)"
+            + ("" if self._transducer_x_offset_m == TRANSDUCER_X_OFFSET_M
+               else f" -- NOT the default {TRANSDUCER_X_OFFSET_M:+.3f} m"))
 
         # ---- Logging + mavlink envelope state ------------------------------
 
@@ -1479,6 +1520,21 @@ class SSSProcessorNode(Node):
         return side_from_fields(int(msg.channel_number),
                                 float(msg.transducer_heading_deg))
 
+    def _read_x_offset(self) -> float:
+        """The ``transducer_x_offset_m`` parameter as a finite float; the
+        default (with an error on the log) when it is not one."""
+        raw = self.get_parameter("transducer_x_offset_m").value
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = math.nan
+        if isinstance(raw, bool) or not math.isfinite(value):
+            self.get_logger().error(
+                f"transducer_x_offset_m = {raw!r} is not a finite number of "
+                f"metres; using the default {TRANSDUCER_X_OFFSET_M:+.3f} m")
+            return float(TRANSDUCER_X_OFFSET_M)
+        return value
+
     @staticmethod
     def _side_geometry(side: int) -> Tuple[float, float]:
         """(side_sign, transducer y offset) of a resolved side — the group
@@ -1620,7 +1676,7 @@ class SSSProcessorNode(Node):
         out.robot_y = float(odom.pose.pose.position.y)
         out.robot_orientation = odom.pose.pose.orientation
         out.water_depth = float(water_depth)
-        out.transducer_x_offset = float(TRANSDUCER_X_OFFSET_M)
+        out.transducer_x_offset = float(self._transducer_x_offset_m)
         out.port_intensity_db = port_int
         out.port_y = port_y
         out.starboard_intensity_db = stbd_int

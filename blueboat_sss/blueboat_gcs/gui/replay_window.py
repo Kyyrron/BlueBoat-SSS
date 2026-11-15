@@ -362,11 +362,13 @@ class ReplayWindow(QMainWindow):
                 "No position for that waterfall point (session gap row).",
                 6000)
             return
-        # Georef convention 2, as the seabed pictures (row_georef).
+        # As the seabed pictures (georef convention 3): row_georef and the
+        # row's fore/aft arm (row_lever_x; 0 = convention 2).
         rx, ry, yaw, bottom = self.waterfall_service.row_georef(row)
         wx, wy = waterfall_pixel_to_world(
             rx, ry, yaw, bottom, self.waterfall_service.pitch_m,
-            float(col), self.waterfall_service.columns, *LEVER_ARM_M)
+            float(col), self.waterfall_service.columns, *LEVER_ARM_M,
+            lever_x=self.waterfall_service.row_lever_x(row))
         wx, wy = float(wx), float(wy)
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(
@@ -724,7 +726,9 @@ class ReplayWindow(QMainWindow):
                 depth_mode=mode, manual_depth_m=manual_m,
                 blank_nadir=self._config.depth.blank_nadir,
                 nadir_blank_m=self._config.depth.nadir_blank_m,
-                nadir_max_fraction=self._config.depth.nadir_max_fraction)
+                nadir_max_fraction=self._config.depth.nadir_max_fraction,
+                transducer_x_offset_m=(
+                    self._config.alignment.transducer_x_offset_m))
         finally:
             progress.close()
         # The native rows and the tracked bottom do not depend on the depth
@@ -823,7 +827,8 @@ def open_svlog_dialog(parent, config: AppConfig) -> Optional[ReplayWindow]:
             manual_depth_m=config.depth.manual_m,
             blank_nadir=config.depth.blank_nadir,
             nadir_blank_m=config.depth.nadir_blank_m,
-            nadir_max_fraction=config.depth.nadir_max_fraction)
+            nadir_max_fraction=config.depth.nadir_max_fraction,
+            transducer_x_offset_m=config.alignment.transducer_x_offset_m)
     except (OSError, ValueError) as exc:
         progress.close()
         QMessageBox.critical(parent, "Open SVLOG",

@@ -129,6 +129,44 @@ class SonarPing:
     #: unknown); they differ by the boat's constant device offset.
     port_ping_number: int = 0
     stbd_ping_number: int = 0
+    #: Fore/aft arm of the transducers from the pose above [m], + forward
+    #: (REP-103 x of base_link; -0.345 on the BlueBoat, 2026-11-15). Live:
+    #: ``ProcessedSSSPing.transducer_x_offset``, the processor's own value.
+    #: Replay: ``alignment.transducer_x_offset_m``. 0.0 = no arm, which is
+    #: every ping built before 2026-11-15 and every synthetic one. A ping is
+    #: PLACED from :attr:`sensor_x` / :attr:`sensor_y`, never from
+    #: ``robot_x`` / ``robot_y`` (those are the boat, e.g. its trajectory).
+    x_offset_m: float = 0.0
+
+    @property
+    def sensor_x(self) -> float:
+        """World x of the transducers' point at the ping [m]."""
+        return sensor_point(self.robot_x, self.robot_y, self.yaw,
+                            self.x_offset_m)[0]
+
+    @property
+    def sensor_y(self) -> float:
+        """World y of the transducers' point at the ping [m]."""
+        return sensor_point(self.robot_x, self.robot_y, self.yaw,
+                            self.x_offset_m)[1]
+
+
+def sensor_point(x, y, yaw, x_offset_m):
+    """The transducers' point of a pose: ``(x, y) + R(yaw)·(x_offset_m, 0)``.
+
+    The one definition of the fore/aft lever arm for every placement of a
+    ping (mosaic, swath line, waterfall click, seabed-picture grids). The
+    arm lies along the heading, so its world direction follows the heading
+    and the same object seen on two opposite passes moves by twice the arm
+    between them when it is ignored. Scalars or broadcasting arrays.
+
+    An arm of exactly 0 returns ``(x, y)`` untouched -- the same objects,
+    so every result computed before the arm existed is reproduced bit for
+    bit (``x + cos(yaw)·0.0`` would turn a -0.0 into +0.0).
+    """
+    if np.ndim(x_offset_m) == 0 and float(x_offset_m) == 0.0:
+        return x, y
+    return x + np.cos(yaw) * x_offset_m, y + np.sin(yaw) * x_offset_m
 
 
 @dataclass(frozen=True, slots=True)

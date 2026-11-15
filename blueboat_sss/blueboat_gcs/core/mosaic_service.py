@@ -342,7 +342,7 @@ class MosaicService(QObject):
         if self._config.mosaic.densify:
             xw, yw, v, rng = self._rasterizer.rasterize(ping)
         else:                                   # legacy point-scatter path
-            xw, yw = project_to_world(ping.robot_x, ping.robot_y, ping.yaw,
+            xw, yw = project_to_world(ping.sensor_x, ping.sensor_y, ping.yaw,
                                       ping.y_local)
             v, rng = ping.intensity_db, np.abs(ping.y_local)
         self._grid.add_samples(xw, yw, v, slant_range=rng,
@@ -353,6 +353,8 @@ class MosaicService(QObject):
             self._t_first = ping.t
         self._depth_t.append(ping.t - self._t_first)
         self._depth_z.append(ping.water_depth)
+        # The boat's own track (boat_trajectory.csv): the navigation point,
+        # never the transducers' (the samples above are placed from those).
         self._traj.append((ping.robot_x, ping.robot_y))
 
     def reset_tracking(self) -> None:

@@ -49,7 +49,9 @@ def project_to_world(robot_x: float, robot_y: float, yaw: float,
     """Rotate a ping's lateral samples into world coordinates.
 
     Verbatim from ``sss_helper.project_to_world``. The ping is purely
-    lateral in the boat frame (x_body = 0), REP-103: +y_body = port.
+    lateral about the point passed in, REP-103: +y_body = port. That point
+    is the TRANSDUCERS' (``SonarPing.sensor_x`` / ``sensor_y``: the fore/aft
+    arm along the heading already applied), not the navigation point.
     """
     x_world = robot_x - math.sin(yaw) * y_local
     y_world = robot_y + math.cos(yaw) * y_local

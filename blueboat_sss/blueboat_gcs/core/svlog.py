@@ -88,6 +88,14 @@ RELOCK_AFTER = 15
 TRANSDUCER_SUBMERSION_M = 0.22   # measured 2026-11-02 (= sss_processor_node, = sim sensor_depth_m); was 0.15
 TRANSDUCER_Y_OFFSET_PORT_M = 0.285  # BR-101447 hull spacing 570 mm / 2
 TRANSDUCER_Y_OFFSET_STBD_M = 0.285
+#: Fore/aft arm of the transducers from the navigation pose [m], + forward:
+#: = sss_processor_node.TRANSDUCER_X_OFFSET_M = the simulator's
+#: model.mount_x_m (tests/test_fore_aft_arm.py holds the three together).
+#: ADOPTED 2026-11-15 from the simulator's config/default_sonar.yaml, not
+#: measured on the boat. The default of ``alignment.transducer_x_offset_m``
+#: (replay, session rebuild, Save pictures); live pings carry the
+#: processor's own value instead. Was absent (no fore/aft arm) before.
+TRANSDUCER_X_OFFSET_M = -0.345
 PAIR_TOLERANCE_NS = 50_000_000    # 50 ms processor tolerance
 
 
@@ -691,8 +699,16 @@ def load_svlog(path: Path,
                manual_depth_m: float = 0.0,
                blank_nadir: bool = True,
                nadir_blank_m: float = 0.75,
-               nadir_max_fraction: float = 0.5) -> SvlogMission:
+               nadir_max_fraction: float = 0.5,
+               transducer_x_offset_m: float = TRANSDUCER_X_OFFSET_M
+               ) -> SvlogMission:
     """Read + process an entire .svlog into a SvlogMission.
+
+    ``transducer_x_offset_m`` is stamped on every ping
+    (``SonarPing.x_offset_m``): the fore/aft arm its consumers place it
+    with. A ``.svlog`` records the boat's pose only, so the arm is the
+    reader's: ``alignment.transducer_x_offset_m`` in every GCS caller, and
+    ``0.0`` reproduces a session as it was placed before 2026-11-15.
 
     Five behaviours differ deliberately from the original implementation,
     all driven by measurements on real logs (see
@@ -741,6 +757,10 @@ def load_svlog(path: Path,
     """
     data = Path(path).read_bytes()
     mission = SvlogMission(path=Path(path))
+    # The fore/aft arm every decoded ping carries (a non-finite value = none).
+    x_offset_m = float(transducer_x_offset_m)
+    if not math.isfinite(x_offset_m):
+        x_offset_m = 0.0
 
     clock_ns = 0
     last_boot_ms: Optional[int] = None
@@ -1072,6 +1092,7 @@ def load_svlog(path: Path,
             roll=roll, pitch=pitch, yaw_rate=yaw_rate, attitude_age_s=att_age,
             port_ping_number=int(p["ping_number"]) if p is not None else 0,
             stbd_ping_number=int(s["ping_number"]) if s is not None else 0,
+            x_offset_m=x_offset_m,
             **nat)))
         mission.ping_count += 1
         if p is not None and s is not None:

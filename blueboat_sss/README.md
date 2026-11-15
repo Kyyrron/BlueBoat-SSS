@@ -131,11 +131,32 @@ checksum errors): a loss there happened before ROS.
 
 ## Transducer geometry
 
-Not launch parameters — four module-level constants at the top of
-`src/sss_processor_node.py`, all currently `0.0` and carrying `TODO`s:
-`TRANSDUCER_X_OFFSET_M`, `TRANSDUCER_Y_OFFSET_PORT_M`,
-`TRANSDUCER_Y_OFFSET_STBD_M`, `TRANSDUCER_SUBMERSION_M`. Measure them on the
-physical BlueBoat before any localization-accuracy work.
+Four module-level constants at the top of `src/sss_processor_node.py`, the
+same values the GCS (`blueboat_gcs/core/svlog.py`) and the simulator
+(`BlueBoat-SSS-Sim` `config/default_sonar.yaml`, `model:`) use;
+`tests/test_fore_aft_arm.py` holds the three together:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `TRANSDUCER_X_OFFSET_M` | −0.345 m | fore/aft arm from the `/blueboat/odom` pose, + forward (0.345 m aft) |
+| `TRANSDUCER_Y_OFFSET_PORT_M` / `_STBD_M` | 0.285 m | lateral offset of each transducer |
+| `TRANSDUCER_SUBMERSION_M` | 0.22 m | depth under the waterline |
+
+Status (2026-11-15): **adopted from the simulator's profile, not measured on
+the boat** (`~/ros2_ws/sim_runs/sim_acceptance/owner_measurements.yaml`).
+
+The fore/aft arm is also a node and launch parameter, `transducer_x_offset_m`
+(default the constant). The processor publishes it in every
+`ProcessedSSSPing.transducer_x_offset`; it does not move the pose or the `*_y`
+values. A consumer places the ping from `pose + R(yaw)·(arm, 0)`, as the GCS
+does. To re-process a recording as it was placed before 2026-11-15:
+
+```bash
+ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True \
+    transducer_x_offset_m:=0.0
+```
+
+The two lateral offsets and the submersion are constants only.
 
 In the processed message the sign of `*_y` encodes the side: **+y = port,
 -y = starboard**. Samples are already slant-range corrected and the water
