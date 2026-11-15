@@ -105,14 +105,15 @@ point, so one object seen on two opposite headings landed 0.69 m apart.
 - A picture whose pings carry no arm (arm 0: an old processor, a recording re-processed
   with `alignment.transducer_x_offset_m: 0.0`, the golden pings) is convention 2 exactly
   as before (`georef_for`). One arm per picture: a change of arm closes the window.
-- **Perception's side (change request CR-PER-2, not applied here, CM-3).** Its
-  `core/image.py` already reads `lever_arm_m.x` into `Georef.lever_x_m`, but
-  `core/geometry.py` `world_grids` and `edge_points` do not use it (`convention >= 2`
-  is treated as 2). Until they do, a convention-3 picture gives detections whose
-  `world_xy` is 0.345 m along-track from the station's grid at that pixel: exactly where
-  they were before this change. `tests/test_perception_golden.py`
-  `test_live_perception_path_georeferences_with_convention_2` still holds because the
-  golden pings carry no arm.
+- **Perception's side (CR-PER-2, applied in BlueBoat-Perception 2026-11-15).** Its
+  `core/geometry.py` `to_world` / `sensor_point` place convention 3 from the transducers'
+  point in this module's operation order, bit-exact with the seabed-picture grids; conventions
+  1 and 2 are unchanged byte for byte. `tests/test_perception_golden.py` pins both:
+  `test_live_perception_path_georeferences_with_convention_2` (golden pings, no arm) and its
+  twin `..._with_convention_3` (the same pings with `x_offset_m = −0.345`; Perception REQUESTS
+  R-5). The installed Perception keeps the old placement until
+  `colcon build --packages-select blueboat_perception`, and `perception_core.load()` takes the
+  installed package first, so on a sourced shell the twin fails until that rebuild.
 - The waterfall's detection overlay is unaffected either way: its row is the detection's
   time and its column the across-track component, which an arm along the heading does not
   change (`tests/test_fore_aft_arm.py`).

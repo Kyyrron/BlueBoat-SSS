@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -193,6 +194,31 @@ def test_live_perception_path_georeferences_with_convention_2(runs, variant):
     if core is None:
         pytest.skip(why)
     for img, _record, dets in perception_core.detect(runs[variant], core):
+        (d,) = dets
+        r, c = d["pixel"]
+        assert d["world_xy"] == [float(img.world_x[r, c]), float(img.world_y[r, c])]
+
+
+#: The fore/aft arm of 2026-11-15 (adopted from the simulator's profile, not measured).
+ARM = -0.345
+
+
+@pytest.mark.parametrize("variant", _variants())
+def test_live_perception_path_georeferences_with_convention_3(qapp_module, pings, variant):
+    """Pings carrying the fore/aft arm make convention-3 pictures; through the
+    live envelope, Perception's world point is the station's own convention-3
+    grid at that pixel (BlueBoat-Perception REQUESTS R-5, CR-PER-2)."""
+    from blueboat_gcs.core import perception_core
+    core, why = perception_core.load()
+    if core is None:
+        pytest.skip(why)
+    g, k = variant.split("/")
+    armed = [replace(p, x_offset_m=ARM) for p in pings]
+    images = cap.run_variant(g, k, armed)
+    assert images
+    for img, record, dets in perception_core.detect(images, core):
+        assert img.georef["convention"] == 3 and img.georef["lever_arm_m"]["x"] == ARM
+        assert record["input"]["georef_convention"] == 3
         (d,) = dets
         r, c = d["pixel"]
         assert d["world_xy"] == [float(img.world_x[r, c]), float(img.world_y[r, c])]

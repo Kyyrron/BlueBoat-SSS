@@ -294,8 +294,10 @@ constants, the GCS mirror, the config and launch defaults and the simulator's fi
   the row: the pose stays the navigation pose, `*_y` are untouched
   (`tests/test_processor_fore_aft_arm.py`).
 - **Consumers place a ping from `pose + R(yaw)·(arm, 0)`.** The GCS does, everywhere
-  (`blueboat_gcs/CLAUDE.md`, *Fore/aft arm*). BlueBoat-Belief and BlueBoat-Perception do
-  not yet (change requests in the session-06 handoff).
+  (`blueboat_gcs/CLAUDE.md`, *Fore/aft arm*). BlueBoat-Belief does since 2026-11-15 (its
+  `DESIGN.md` D-12: it reads `transducer_x_offset` from every processed ping; the installed node
+  predates it until `~/ros2_ws/install` is rebuilt). BlueBoat-Perception does not yet (CR-PER-2
+  in the session-06 handoff).
 - **Old sessions:** `transducer_x_offset_m:=0.0` on the launch line (processor) and
   `alignment.transducer_x_offset_m: 0.0` in the GCS config re-process a recording exactly
   as it was placed before 2026-11-15. A parameter, not a code fork.
@@ -614,7 +616,8 @@ QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m pytest -p no:cacheprovider
   `PYTHONPATH` / `LD_LIBRARY_PATH`
   (`PYTHONPATH=~/ros2_ws/install/blueboat_interfaces/lib/python3.12/site-packages:$PYTHONPATH
   LD_LIBRARY_PATH=~/ros2_ws/install/blueboat_interfaces/lib:$LD_LIBRARY_PATH`), and
-  **394 pass / 110 skip** with the bare command above, where the node-side files skip
+  **398 pass / 110 skip** with the bare command above (394 before the convention-3 twin in
+  `test_perception_golden.py`, +4, BlueBoat-Perception R-5, same day), where the node-side files skip
   because `/usr/bin/python3` alone does not find `blueboat_interfaces` (measured the same
   day before the fore/aft work: 416 / 52 and 368 / 100; the 36 new tests are
   `test_fore_aft_arm.py`, 26, and `test_processor_fore_aft_arm.py`, 10, node-side).

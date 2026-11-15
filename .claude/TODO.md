@@ -35,7 +35,6 @@ Open:
 - [ ] **BlueBoat-Perception still places detections without the arm** (it reads
   `georef.lever_arm_m.x` and ignores it): CR-PER-2 in the handoff. Until then the map shows
   its markers 0.345 m along-track off the mosaic; the waterfall overlay is unaffected.
-- [ ] **BlueBoat-Belief places ping evidence without `transducer_x_offset`**: CR-BEL-1.
 - [ ] **A per-session arm on the real boat.** The value is now a parameter in both places;
   nothing yet records where the GPS sat on the day.
 
