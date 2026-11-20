@@ -32,9 +32,10 @@ Open:
   A1's, at 13.9 m and 10.3 m, close to 0.07 m. An arm or a clock lag acts the same on both
   blocks, so the difference is range-dependent: a heading error is the candidate (not
   established; one recording, frozen autopilot clock).
-- [ ] **BlueBoat-Perception still places detections without the arm** (it reads
-  `georef.lever_arm_m.x` and ignores it): CR-PER-2 in the handoff. Until then the map shows
-  its markers 0.345 m along-track off the mosaic; the waterfall overlay is unaffected.
+- [x] **BlueBoat-Perception places detections with the arm** (2026-11-18 check: done in Perception
+  `0d55d76`, 2026-11-15, CR-PER-2; session 12 confirmed Perception's grids equal the station's `_world.npz`
+  bit for bit on 34/34 pictures, `~/ros2_ws/sim_runs/perception/handoff_12_cr_per_2.md`). Before it, the map
+  showed its markers 0.345 m along-track off the mosaic.
 - [ ] **A per-session arm on the real boat.** The value is now a parameter in both places;
   nothing yet records where the GPS sat on the day.
 
