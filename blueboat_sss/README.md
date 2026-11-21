@@ -1,194 +1,30 @@
-# Side Scan Sonar — Usage Guide
+# blueboat_sss
 
-Quick start for the `blueboat_sss` ROS 2 package (nodes, topics, parameters). Its nodes
-run on the operator laptop, like every node of the project, and reach the two Omniscan
-units over the BlueBoat Base Station WiFi. The full interface
-reference is `../.claude/CLAUDE.md`; the operator copy-paste command sheet is
-`terminals.txt`.
+ROS 2 package (`ament_cmake`) for the BlueBoat's two Cerulean Omniscan 450 SS side-scan
+sonars. It has two nodes: a driver that talks to the sonars and a processor that turns
+their pings into georeferenced rows and records `.svlog` files. Both run on the operator
+laptop and reach the sonars over the BlueBoat Base Station WiFi. Nothing runs on the boat.
 
-The package ships two nodes:
+In the project chain (`sonar → Perception → Belief → Replanner → Control`) this package is
+the sonar: its `/sss_processor/processed` feeds the GCS and Belief. The GCS app
+(`blueboat_gcs/`, in this folder) is described in the [module README](../README.md).
 
-- **`side_scan_sonar`** (`src/sss_node.py`) — drives the pair of Cerulean
-  Omniscan 450 SS units over TCP (port `192.168.2.92:51200`, starboard
-  `192.168.2.93:51200`). Publishes the decoded header on `~/port/profile` and
-  `~/starboard/profile` (`blueboat_interfaces/OmniscanProfile`), and the
-  already-framed Cerulean Ping Protocol packet, verbatim, on `~/port/raw` and
-  `~/starboard/raw` (`std_msgs/UInt8MultiArray`).
-- **`sss_processor`** (`src/sss_processor_node.py`) — slant-range correction,
-  bottom tracking (FBR), port/starboard merge, and `.svlog` writing. Publishes
-  `blueboat_interfaces/ProcessedSSSPing` on `/sss_processor/processed`.
+## Nodes
 
-Pinging and logging are both **OFF at startup**.
-
-## Launching
-
-```bash
-# Processor only — what the GCS launches with its "Sonar: Simulation" selector
-ros2 launch blueboat_sss SSS_processing_launch.py
-# Processor + driver — what it launches with "Sonar: Real sonars"
-ros2 launch blueboat_sss SSS_processing_launch.py with_acquisition:=True
-
-# Acquisition only
-ros2 launch blueboat_sss SSS_simple_launch.py
-ros2 launch blueboat_sss SSS_simple_launch.py range_length_mm:=20000 gain_index:=4
-```
-
-## Start / stop pinging
-
-Pinging fires the transducers and produces the data streams.
-
-```bash
-ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
-ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: false'
-```
-
-> ⚠️ Don't leave the Omniscans pinging for long periods out of water —
-> Cerulean's docs note the transmit transducer can heat up and be damaged.
-> A few minutes dry is fine.
-
-## Start / stop `.svlog` recording
-
-Logging belongs to the **processor**, not the driver. This is the GCS
-Record ON/OFF toggle.
-
-```bash
-ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: true'
-ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: false'
-```
-
-The processor writes `.svlog` to `../../../../data/SSS_data`, resolved relative
-to the **launch working directory** — the same root the GCS uses as `data_root`.
-The node resolves that to an absolute path and creates the directory at startup,
-and enabling logging creates it again if it has gone. If it cannot be created or
-written, the processor logs an **error** (visible on `/rosout` and in the GCS
-console) and recording stays off — it never reports a recording that is not
-there. Every log line names the file, not just the directory.
-
-The file is a SonarView-compatible stream of framed Ping Protocol packets: both
-channels interleaved in one file, distinguished by the per-packet
-`channel_number` field, so it opens directly in SonarView with both channels
-visible. Files roll at 500 MB (`MAX_LOG_SIZE_BYTES` in
-`src/_custom_libraries/svlog_helper.py`).
-
-The `.svlog` is rebuilt from `~/port/raw` and `~/starboard/raw`. Those two
-topics must keep being published, or the logs come out empty.
-
-Recorded `.svlog` files are primary field data — never edit or overwrite them.
-The writer holds to that too: a name collision rolls to `<stamp>-001.svlog`
-rather than replacing the file already there.
-
-## Acquisition parameters
-
-Declared identically in `src/sss_node.py` and both launch files, and re-read on
-every ping enable:
-
-| parameter | default | meaning |
-| ------------------- | ------- | ------------------------------------------ |
-| `range_start_mm`    | 0       | start of the sampled window |
-| `range_length_mm`   | 20000   | swath per side, in mm |
-| `msec_per_ping`     | 50      | ping interval lower bound — SonarView's; 0 = free run |
-| `gain_index`        | -1      | -1 = device auto |
-| `num_results`       | 1200    | samples per ping (the device maximum) |
-| `pulse_len_percent` | 0.00125 | transmit pulse as a fraction of 2R/c (44.3 µs floor to ~27 m) |
-
-These are SonarView's acquisition settings (2026-10-27): only the range may
-differ from what SonarView records. **Set the range from the water depth (~4x
-the deepest expected), not from the area you hope to cover.** The 80 m used in
-the sea trials pushed the bottom return to sample 49/600 and broke bottom
-detection outright. The 20 m default gives 16.7 mm range sampling at 1200
-samples.
-
-To change a parameter without restarting, toggle pinging off, set it, toggle
-back on:
-
-```bash
-ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: false'
-ros2 param  set /side_scan_sonar range_length_mm 30000
-ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
-```
-
-The GCS performs this dance itself: the right panel's **Acquisition → Sonar
-range** slider (enabled while the pipeline is running) pauses pinging, sets
-`range_length_mm` via the node's `set_parameters` service, and resumes —
-always, even when the change fails. The commands above remain the manual
-fallback.
-
-### Publishing rate
-
-One ROS message per ping packet received — no batching. The period is
-`max(msec_per_ping, 2R/c + ~3 ms)`: the default 50 gives a steady **20 Hz per
-side up to ~35 m**, then range-limited (**~7.6 Hz at 95.6 m**) — exactly what
-SonarView records. `msec_per_ping = 0` free-runs the device at 2R/c + ~2.3 ms,
-**measured 34.5 Hz at 20 m** (2026-10-27), which costs 1.7× the WiFi bandwidth
-and lost 4–61 % of pings in the field; use it only as a diagnostic. Note that
-`pulse_len_percent` scales the transmit pulse with the range, so a long range
-costs range resolution as well as rate.
-
-Every frame the devices send reaches `~/raw` (status frames, id 2194, included,
-as SonarView records them); only profiles reach `~/profile`. Each side logs a
-health line every 10 s while pinging (rate, missing ping numbers, longest gap,
-checksum errors): a loss there happened before ROS.
-
-## Transducer geometry
-
-Four module-level constants at the top of `src/sss_processor_node.py`, the
-same values the GCS (`blueboat_gcs/core/svlog.py`) and the simulator
-(`BlueBoat-SSS-Sim` `config/default_sonar.yaml`, `model:`) use;
-`tests/test_fore_aft_arm.py` holds the three together:
-
-| Constant | Value | Meaning |
+| Node | Executable | Does |
 |---|---|---|
-| `TRANSDUCER_X_OFFSET_M` | −0.345 m | fore/aft arm from the `/blueboat/odom` pose, + forward (0.345 m aft) |
-| `TRANSDUCER_Y_OFFSET_PORT_M` / `_STBD_M` | 0.285 m | lateral offset of each transducer |
-| `TRANSDUCER_SUBMERSION_M` | 0.22 m | depth under the waterline |
+| `side_scan_sonar` | `sss_node.py` | Drives both units over TCP (port `192.168.2.92:51200`, starboard `192.168.2.93:51200`). Publishes each profile, decoded and as the raw Ping Protocol frame |
+| `sss_processor` | `sss_processor_node.py` | Slant-range correction, bottom tracking, port/starboard merge into one row, pose from `/blueboat/odom`, `.svlog` recording |
 
-Status (2026-11-15): **adopted from the simulator's profile, not measured on
-the boat** (`~/ros2_ws/sim_runs/sim_acceptance/owner_measurements.yaml`).
+Pinging and logging are both **off at start-up**.
 
-The fore/aft arm is also a node and launch parameter, `transducer_x_offset_m`
-(default the constant). The processor publishes it in every
-`ProcessedSSSPing.transducer_x_offset`; it does not move the pose or the `*_y`
-values. A consumer places the ping from `pose + R(yaw)·(arm, 0)`, as the GCS
-does. To re-process a recording as it was placed before 2026-11-15:
-
-```bash
-ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True \
-    transducer_x_offset_m:=0.0
-```
-
-The two lateral offsets and the submersion are constants only.
-
-In the processed message the sign of `*_y` encodes the side: **+y = port,
--y = starboard**. Samples are already slant-range corrected and the water
-column is already removed.
-
-## Quick health check
-
-```bash
-# Are the nodes up?
-ros2 node info /side_scan_sonar
-ros2 node info /sss_processor
-
-# Are subscribers attached to the control topics?
-ros2 topic info /side_scan_sonar/ping/enable
-ros2 topic info /sss_processor/log/enable
-
-# Is data actually arriving when ping is on?
-ros2 topic echo /side_scan_sonar/port/profile --field ping_number
-ros2 topic hz   /side_scan_sonar/starboard/profile
-ros2 topic hz   /sss_processor/processed
-```
-
-If the raw rates are fine but the processor reports 0 Hz, the most common cause
-is a QoS mismatch. All four sonar publishers are `BEST_EFFORT` / `KEEP_LAST(10)`;
-a `RELIABLE` subscriber is QoS-incompatible and receives *nothing*. Change both
-ends together or not at all.
-
-The processor also treats pose as a hard gate: it drops a ping pair outright if
-`/blueboat/odom` has produced nothing, so a silent processor with healthy raw
-topics can equally mean no odom.
+In simulation, the BlueBoat-SSS-Sim node takes the place of `side_scan_sonar` with the
+same name, topics and parameters. Then start only the processor.
 
 ## Build
+
+Needs `blueboat_interfaces` (from BlueBoat-Control) built first, plus `simple_launch`,
+`scipy`, `mavros_msgs` and `geographic_msgs`.
 
 ```bash
 cd ~/ros2_ws
@@ -196,13 +32,185 @@ colcon build --packages-select blueboat_sss
 source install/setup.bash
 ```
 
-`CMakeLists.txt` installs `launch/` plus the six `src/` scripts flat into
-`lib/blueboat_sss/`; the flat layout is what lets the two nodes import
-`sss_helper` / `svlog_helper` / `math_helper` / `omniscan_link` without a
-package prefix.
+## Launch
 
-Node dependencies: `simple_launch`, `scipy`, `mavros_msgs`, `geographic_msgs`,
-and `blueboat_interfaces` (supplied by BlueBoat-Control). The driver speaks the
-Ping Protocol itself (`omniscan_link.py`); `bluerobotics-ping` (`brping`) is
-only the test oracle for its command bytes since 2026-10-27 — its two device
-instances shared one receive buffer.
+| Command | Starts |
+|---|---|
+| `ros2 launch blueboat_sss SSS_processing_launch.py` | Processor only (what the GCS starts with **Sonar: Simulation**) |
+| `ros2 launch blueboat_sss SSS_processing_launch.py with_acquisition:=True` | Processor + driver (what the GCS starts with **Sonar: Real sonars**) |
+| `ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True` | Processor only, for a rosbag replay (never starts the driver) |
+| `ros2 launch blueboat_sss SSS_simple_launch.py` | Driver only |
+
+Acquisition parameters can be given to either launch file, for example
+`range_length_mm:=20000 gain_index:=4`. When a simulation `/clock` exists at launch,
+`SSS_processing_launch.py` switches its nodes to sim time by itself.
+
+## Start and stop
+
+```bash
+# pinging (driver)
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: false'
+
+# .svlog recording (processor)
+ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: true'
+ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: false'
+```
+
+The GCS sends these for you (START / STOP, Record ON / OFF).
+
+> Do not leave the Omniscans pinging for long out of water: the transmit transducer can
+> overheat. A few minutes dry is fine.
+
+## Topics
+
+| Topic | Type | Dir | Node |
+|---|---|---|---|
+| `/side_scan_sonar/{port,starboard}/profile` | `blueboat_interfaces/OmniscanProfile` | pub | driver |
+| `/side_scan_sonar/{port,starboard}/raw` | `std_msgs/UInt8MultiArray` (every device frame, verbatim) | pub | driver |
+| `/side_scan_sonar/ping/enable` | `std_msgs/Bool` | sub | driver |
+| `/sss_processor/processed` | `blueboat_interfaces/ProcessedSSSPing` | pub | processor |
+| `/sss_processor/log/enable` | `std_msgs/Bool` | sub | processor |
+| `/blueboat/odom` | `nav_msgs/Odometry` | sub | processor (required pose) |
+| `/mavros/...` (IMU, GPS, compass, velocity, pose, VFR HUD, state) | MAVROS types | sub | processor (written into the `.svlog`) |
+
+The sonar topics are `BEST_EFFORT` / `KEEP_LAST(10)`. A `RELIABLE` subscriber receives
+nothing. Change a QoS at both ends or not at all.
+
+In `ProcessedSSSPing`, the sign of `*_y` gives the side (+y port, −y starboard). Samples
+are already slant-range corrected, with the water column removed.
+
+## Acquisition parameters
+
+Node parameters of `side_scan_sonar`, the same in both launch files. They are re-read on
+every ping enable.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `range_start_mm` | 0 | start of the sampled window |
+| `range_length_mm` | 20000 | range per side, mm |
+| `msec_per_ping` | 50 | minimum ping interval (20 Hz, as SonarView); 0 = free run, diagnostic only |
+| `gain_index` | −1 | −1 = device auto gain |
+| `num_results` | 1200 | samples per ping (device maximum; 16.7 mm at 20 m) |
+| `pulse_len_percent` | 0.00125 | transmit pulse as a fraction of 2R/c (stays at the 44.3 µs minimum up to ~27 m) |
+
+The defaults are SonarView's settings and the project's survey setting (20 m per side).
+
+- **Set the range from the water depth** (about 4× the deepest expected), not from the area
+  you want to cover. Too long a range pushes the bottom return into the first few samples
+  and bottom tracking fails.
+- The ping rate is `max(msec_per_ping, 2R/c + ~3 ms)`: 20 Hz per side up to about 35 m.
+- Free run (`msec_per_ping:=0`) pings faster, uses more WiFi and lost pings in the field.
+
+Change a parameter while running: pinging off, set, pinging on.
+
+```bash
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: false'
+ros2 param set /side_scan_sonar range_length_mm 30000
+ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
+```
+
+The GCS range slider does exactly this.
+
+Processor parameter: `transducer_x_offset_m` (default −0.345, + forward of the
+`/blueboat/odom` pose). It is published in every `ProcessedSSSPing.transducer_x_offset`.
+To re-process a recording made before this arm existed, pass `transducer_x_offset_m:=0.0`.
+
+## Transducer geometry
+
+Constants at the top of `src/sss_processor_node.py`, the same values as the GCS and the
+simulator:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `TRANSDUCER_X_OFFSET_M` | −0.345 m | fore/aft arm from the odometry point (0.345 m aft) |
+| `TRANSDUCER_Y_OFFSET_PORT_M` / `_STBD_M` | 0.285 m | lateral offset of each transducer |
+| `TRANSDUCER_SUBMERSION_M` | 0.22 m | depth below the waterline |
+
+These values are adopted from the simulator's profile, **not measured on the boat**.
+
+## `.svlog` recording
+
+- The processor writes the `.svlog`, rebuilt from the two `raw` topics. If `raw` stops,
+  the log comes out empty.
+- Output folder: `../../../../data/SSS_data`, **relative to the launch working directory**.
+  Launched by the GCS from `BlueBoat-SSS/blueboat_sss/`, that is `~/ros2_ws/data/SSS_data`.
+  If the folder cannot be created or written, the processor logs an error and does not record.
+- Format: SonarView-compatible framed Ping Protocol, both channels in one file (told apart
+  by each packet's `channel_number`), plus the MAVLink navigation stream. Opens directly in
+  SonarView.
+- Files roll at 500 MB. A name collision gets a `-001` suffix; nothing is overwritten.
+- Recorded `.svlog` files are primary field data: never edit or overwrite them.
+
+## Health check
+
+```bash
+ros2 node info /side_scan_sonar
+ros2 node info /sss_processor
+ros2 topic info /side_scan_sonar/ping/enable        # subscriber attached?
+ros2 topic echo /side_scan_sonar/port/profile --field ping_number
+ros2 topic hz   /side_scan_sonar/starboard/profile
+ros2 topic hz   /sss_processor/processed
+```
+
+If the profiles arrive but `/sss_processor/processed` is at 0 Hz:
+
+1. **No odometry.** The processor drops pings while `/blueboat/odom` is silent.
+2. **QoS mismatch.** A `RELIABLE` subscriber on a sonar topic gets nothing.
+
+While pinging, the driver logs a health line per side every 10 s (rate, missing ping
+numbers, longest gap, checksum errors). A loss shown there happened before ROS.
+
+## Offline tools
+
+From `~/ros2_ws`, with the workspace sourced:
+
+| Script | Does |
+|---|---|
+| `custom_scripts/svlog_to_rosbag.py` | Converts a `.svlog` into a rosbag the processor can replay. Set `INPUT_FILE` at the top of the script; it writes `./output_bag` (must not exist) |
+| `custom_scripts/processed_sss_printer.py` | Re-plots a saved GCS mosaic. Options `--mosaic`, `--trajectory`, `--cmap` |
+
+Replay a converted log through the processor:
+
+```bash
+ros2 launch blueboat_sss SSS_processing_launch.py will_use_rosbag:=True
+ros2 bag play output_bag          # in another terminal, from the bag's folder
+```
+
+Enable logging first if you want a fresh `.svlog` from the replay.
+
+## Layout
+
+```
+blueboat_sss/
+  src/sss_node.py               driver
+  src/sss_processor_node.py     processor
+  src/_custom_libraries/        omniscan_link.py (Ping Protocol), svlog_helper.py,
+                                sss_helper.py, math_helper.py
+  launch/                       SSS_processing_launch.py, SSS_simple_launch.py
+  custom_scripts/               offline tools
+  tests/                        pytest suite (fake Omniscan devices included)
+  terminals.txt                 operator command sheet
+  blueboat_gcs/                 the GCS app (not installed by colcon)
+```
+
+All `src/` scripts are installed flat into `lib/blueboat_sss/`, so the nodes import the
+helpers without a package prefix. Keep the executable names `sss_node.py` and
+`sss_processor_node.py`: the GCS finds the running nodes by name.
+
+## Tests
+
+```bash
+cd ~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-SSS/blueboat_sss
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m pytest -p no:cacheprovider
+```
+
+Use the system python and do not source the workspace first (its venv has no pytest).
+Node tests skip when `blueboat_interfaces` is not found; corpus tests skip without the
+field `.svlog` corpus.
+
+## More
+
+- GCS and the whole module: [`../README.md`](../README.md)
+- `.svlog` format and the measured device settings: `blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md`
+- Operator command sheet: `terminals.txt`
