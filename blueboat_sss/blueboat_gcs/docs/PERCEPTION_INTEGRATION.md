@@ -70,7 +70,7 @@ moved from the `1_000_000 + 16·id + k` range to `2_000_000 + 16·id + k`.
 
 ## 4. Georeferencing convention 2 (Q6) and Q8
 
-**The problem.** Since `994a74b` (2026-10-13) the processor projects
+**The problem.** Since 2026-10-13 the processor projects
 `y = ±(0.285 + sqrt(s² − h²))`, with `h` its altitude (= `water_depth − 0.15`). The picture
 grids still used `sqrt(s² − water_depth²)` with no lever, so the two disagreed by the
 lever arm across-track.
@@ -105,13 +105,13 @@ point, so one object seen on two opposite headings landed 0.69 m apart.
 - A picture whose pings carry no arm (arm 0: an old processor, a recording re-processed
   with `alignment.transducer_x_offset_m: 0.0`, the golden pings) is convention 2 exactly
   as before (`georef_for`). One arm per picture: a change of arm closes the window.
-- **Perception's side (CR-PER-2, applied in BlueBoat-Perception 2026-11-15).** Its
+- **Perception's side (applied in BlueBoat-Perception on 2026-11-15).** Its
   `core/geometry.py` `to_world` / `sensor_point` place convention 3 from the transducers'
   point in this module's operation order, bit-exact with the seabed-picture grids; conventions
   1 and 2 are unchanged byte for byte. `tests/test_perception_golden.py` pins both:
   `test_live_perception_path_georeferences_with_convention_2` (golden pings, no arm) and its
-  twin `..._with_convention_3` (the same pings with `x_offset_m = −0.345`; Perception REQUESTS
-  R-5). The installed Perception keeps the old placement until
+  twin `..._with_convention_3` (the same pings with `x_offset_m = −0.345`; requested in Perception's
+  `docs/REQUESTS.md`). The installed Perception keeps the old placement until
   `colcon build --packages-select blueboat_perception`, and `perception_core.load()` takes the
   installed package first, so on a sourced shell the twin fails until that rebuild.
 - The waterfall's detection overlay is unaffected either way: its row is the detection's
@@ -159,7 +159,7 @@ bit for bit. A row whose profile *was* attached never used this path. Noted in S
 
 ## 7. Tests (the gate: 353 pass / 0 fail / 50 skip on 2026-10-16, after §9)
 - **Baseline before any edit: 298 / 4 fail / 50.** The four were stale expectations after
-  `994a74b`, repaired as a labelled baseline repair (no behaviour change; listed in SSS
+  the 2026-10-13 change of the transducer offsets, repaired as a labelled baseline repair (no behaviour change; listed in SSS
   `TODO.md`). Gate after the repair: 302 / 0 / 50.
 - `tests/test_perception_golden.py` (29). It compares against
   `tests/fixtures/perception_golden.json`, captured by

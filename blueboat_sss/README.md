@@ -6,8 +6,9 @@ their pings into georeferenced rows and records `.svlog` files. Both run on the 
 laptop and reach the sonars over the BlueBoat Base Station WiFi. Nothing runs on the boat.
 
 In the project chain (`sonar → Perception → Belief → Replanner → Control`) this package is
-the sonar: its `/sss_processor/processed` feeds the GCS and Belief. The GCS app
-(`blueboat_gcs/`, in this folder) is described in the [module README](../README.md).
+the sonar: its `/sss_processor/processed` feeds the Ground Control Station (GCS) and Belief.
+The GCS app (`blueboat_gcs/`, in this folder) is described in the [module README](../README.md)
+and the [user guide](../docs/USER_GUIDE.md).
 
 ## Nodes
 
@@ -75,7 +76,7 @@ The GCS sends these for you (START / STOP, Record ON / OFF).
 | `/mavros/...` (IMU, GPS, compass, velocity, pose, VFR HUD, state) | MAVROS types | sub | processor (written into the `.svlog`) |
 
 The sonar topics are `BEST_EFFORT` / `KEEP_LAST(10)`. A `RELIABLE` subscriber receives
-nothing. Change a QoS at both ends or not at all.
+nothing. Change a delivery setting (QoS, quality of service) at both ends or not at all.
 
 In `ProcessedSSSPing`, the sign of `*_y` gives the side (+y port, −y starboard). Samples
 are already slant-range corrected, with the water column removed.
@@ -92,7 +93,7 @@ every ping enable.
 | `msec_per_ping` | 50 | minimum ping interval (20 Hz, as SonarView); 0 = free run, diagnostic only |
 | `gain_index` | −1 | −1 = device auto gain |
 | `num_results` | 1200 | samples per ping (device maximum; 16.7 mm at 20 m) |
-| `pulse_len_percent` | 0.00125 | transmit pulse as a fraction of 2R/c (stays at the 44.3 µs minimum up to ~27 m) |
+| `pulse_len_percent` | 0.00125 | transmit pulse as a fraction of 2R/c, the round-trip time at range R and sound speed c (stays at the 44.3 µs minimum up to ~27 m) |
 
 The defaults are SonarView's settings and the project's survey setting (20 m per side).
 
@@ -211,6 +212,6 @@ field `.svlog` corpus.
 
 ## More
 
-- GCS and the whole module: [`../README.md`](../README.md)
+- The GCS and the whole module: [`../README.md`](../README.md), [`../docs/USER_GUIDE.md`](../docs/USER_GUIDE.md)
 - `.svlog` format and the measured device settings: `blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md`
 - Operator command sheet: `terminals.txt`

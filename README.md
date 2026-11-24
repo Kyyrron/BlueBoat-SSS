@@ -1,180 +1,152 @@
 # BlueBoat-SSS
 
-Side-scan sonar acquisition, processing and operator display for the BlueBoat USV.
-It drives the boat's two Cerulean Omniscan 450 SS units (port and starboard), turns their
-pings into georeferenced rows, records SonarView-compatible `.svlog` files, and shows
-everything live in the Ground Control Station (GCS) desktop app.
+Side-scan sonar (SSS) acquisition, processing and operator display for the BlueBoat uncrewed
+surface vessel (USV). This module drives the boat's two Cerulean Omniscan 450 SS sonars (port and
+starboard), turns their pings into positioned rows, records SonarView-compatible `.svlog` files,
+and shows everything live in the **Ground Control Station (GCS)** desktop app.
+
+![The GCS replaying a real harbour recording as a mosaic over satellite imagery](docs/img/gcs_replay_mosaic.jpg)
+
+*The GCS replay window on a real harbour recording. The copper area is the sonar mosaic: the
+seabed seen by both sonars, placed on the satellite map. The blue line is the boat's track; the
+black band along it is the water column under the boat, where a side-scan sonar sees nothing.
+Bright marks are objects; the dark area behind an object is its acoustic shadow.*
+
+## What you can do with it
+
+- **Drive the two sonars** from the laptop over the BlueBoat WiFi, at the settings SonarView uses
+  (20 m per side, 1200 samples, 20 pings per second).
+- **Watch the seabed live**: a waterfall (the newest ping on top) and a mosaic over satellite
+  imagery, with the boat's track, the acoustic pinger and the detections from BlueBoat-Perception.
+- **Record a session**: the `.svlog` sonar log, the mosaic, the waterfall and the seabed images
+  in one folder per recording.
+- **Make seabed images for the detector**: square-pixel pictures with all the metadata needed to
+  place every pixel on the map, sent live to BlueBoat-Perception.
+- **Replay any `.svlog`** (yours or SonarView's): render it as a mosaic or waterfall, save its
+  pictures, run the detector on it, merge two logs or convert it to a ros2 bag.
+- **Change the sonar range while running**, from a slider.
+- **Work without the boat**: a built-in demo mode needs no ROS and no sonar.
+
+![The same recording as a waterfall](docs/img/gcs_replay_waterfall.jpg)
+
+*The same recording as a waterfall: port on the left, starboard on the right, one row per ping,
+the newest at the top. The dark centre is the water column under the boat. The bottom right
+corner gives the scale (centimetres per ping and per sample).*
+
+## How it connects to the other modules
+
+```
+[ sonar: BlueBoat-SSS ] → Perception → Belief → Replanner → Control
+```
+
+| Module | Link | Relation to this module |
+|---|---|---|
+| BlueBoat-Control | [github.com/Kyyrron/BlueBoat-Control](https://github.com/Kyyrron/BlueBoat-Control) | Provides the message types (`blueboat_interfaces`) and the boat's position (`/blueboat/odom`); build it first |
+| BlueBoat-Perception | [github.com/Kyyrron/BlueBoat-Perception](https://github.com/Kyyrron/BlueBoat-Perception) | Receives every seabed image; its detections are the only ones the GCS draws |
+| BlueBoat-Belief | [github.com/Kyyrron/BlueBoat-Belief](https://github.com/Kyyrron/BlueBoat-Belief) | Reads the processed pings (`/sss_processor/processed`) |
+| BlueBoat-SSS-Sim | [github.com/Kyyrron/BlueBoat-SSS-Sim](https://github.com/Kyyrron/BlueBoat-SSS-Sim) | Replaces the sonar driver in simulation with a node of the same name and topics |
+| BlueBoat-MCS | [github.com/Kyyrron/BlueBoat-MCS](https://github.com/Kyyrron/BlueBoat-MCS) | The Mission Control Station (MCS) that runs the mission beside the GCS |
+| Whole project | [github.com/Kyyrron/BlueBoat-SideScanSonar](https://github.com/Kyyrron/BlueBoat-SideScanSonar) | The superproject that holds every module |
+
+All the software runs on the operator laptop. The sonar driver reaches the sonars over the BlueBoat
+Base Station WiFi (`192.168.2.92` port, `192.168.2.93` starboard). The GCS runs no detector itself.
 
 The module has two parts:
 
 | Part | What it is |
 |---|---|
-| `blueboat_sss` | ROS 2 package: the sonar driver `sss_node.py` and the processor `sss_processor_node.py` (slant-range correction, bottom tracking, port/starboard merge, `.svlog` recording). Usage: [`blueboat_sss/README.md`](blueboat_sss/README.md) |
-| `blueboat_gcs` | PySide6 desktop app: live mosaic over satellite tiles, waterfall, boat track, detection and USBL pinger overlays, recording sessions, seabed images for Perception, `.svlog` replay. Not a colcon package |
+| `blueboat_sss` | ROS 2 package: the sonar driver and the processor. Details: [blueboat_sss/README.md](blueboat_sss/README.md) |
+| `blueboat_sss/blueboat_gcs` | The GCS desktop app (PySide6). Not a colcon package: it runs from its folder |
 
-## Where it fits
+## Dependencies
 
-```
-sonar (this module) → Perception → Belief → Replanner → Control
-```
-
-- This module is the first link: it produces the processed pings and the seabed images.
-- **All software runs on the operator laptop** (`~/ros2_ws`). The boat carries only hardware
-  and firmware. The driver reaches the sonars over the BlueBoat Base Station WiFi
-  (`192.168.2.92` port, `192.168.2.93` starboard, TCP 51200).
-- The GCS runs no detector. It only draws the detections that BlueBoat-Perception publishes.
-- In simulation, BlueBoat-SSS-Sim replaces the driver with a drop-in node of the same name
-  and topics. The processor and the GCS run unchanged.
-
-## Prerequisites
-
-- ROS 2 Jazzy, workspace `~/ros2_ws`.
-- `blueboat_interfaces` (message types), from BlueBoat-Control, built in the same workspace.
-- Node dependencies: `simple_launch`, `scipy`, `mavros_msgs`, `geographic_msgs`;
-  `rosbag2_py` for the `.svlog` → rosbag converter.
-- GCS Python packages (PySide6, numpy, opencv-python, PyYAML):
-
-```bash
-pip install -r ~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-SSS/requirements.txt
-```
-
-Keep numpy below 2: the ROS 2 Jazzy packages and scipy are built against numpy 1.x.
-On an externally managed system python, add `--break-system-packages`.
-
-## Build
-
-```bash
-cd ~/ros2_ws
-colcon build --packages-select blueboat_interfaces   # first, if not built yet
-colcon build --packages-select blueboat_sss
-source install/setup.bash
-```
-
-The GCS needs no build: it runs from the source tree.
-
-## Run
-
-### The GCS (normal way)
-
-Start it from the `blueboat_sss/` folder. It imports `blueboat_gcs` from there, and its
-data path is relative to it.
-
-```bash
-cd ~/ros2_ws && source env.sh
-cd src/BlueBoat-SideScanSonar/BlueBoat-SSS/blueboat_sss
-python3 -m blueboat_gcs.main                      # live, with ROS
-python3 -m blueboat_gcs.main --config site.yaml   # with a config override
-python3 -m blueboat_gcs.main --sim                # built-in demo, no ROS needed
-```
-
-`build.sh` runs a full `colcon build`, sources `env.sh` and starts the GCS in one go.
-
-What the operator does in the GCS:
-
-1. At start-up the GCS launches the processing pipeline itself
-   (`ros2 launch blueboat_sss SSS_processing_launch.py`).
-2. The toolbar **Sonar** selector picks the source: **Simulation** (the simulator's sonar)
-   or **Real sonars** (the GCS then also starts the driver). The choice is remembered.
-3. **START** turns pinging on and starts the live view.
-4. **Record ON / OFF** opens and closes a recording session.
-5. **STOP** turns pinging off, closes the session and stops the nodes.
-6. **Open SVLOG** opens a recorded `.svlog` in the replay window.
-
-The right panel's **Acquisition → Sonar range** slider changes the range while running.
-
-### The nodes by hand (without the GCS)
-
-```bash
-ros2 launch blueboat_sss SSS_processing_launch.py                        # processor only
-ros2 launch blueboat_sss SSS_processing_launch.py with_acquisition:=True # + real driver
-ros2 launch blueboat_sss SSS_simple_launch.py                            # driver only
-ros2 topic pub --once /side_scan_sonar/ping/enable std_msgs/msg/Bool 'data: true'
-```
-
-Pinging and recording are **off at start-up**. All commands, parameters and checks:
-[`blueboat_sss/README.md`](blueboat_sss/README.md).
-
-## Main topics
-
-| Topic | Type | Producer → consumer |
+| Dependency | Link | Quick install |
 |---|---|---|
-| `/side_scan_sonar/{port,starboard}/profile` | `blueboat_interfaces/OmniscanProfile` | driver → processor, GCS |
-| `/side_scan_sonar/{port,starboard}/raw` | `std_msgs/UInt8MultiArray` | driver → processor (feeds the `.svlog`) |
-| `/side_scan_sonar/ping/enable` | `std_msgs/Bool` | GCS → driver (START / STOP) |
-| `/sss_processor/processed` | `blueboat_interfaces/ProcessedSSSPing` | processor → GCS, Belief |
-| `/sss_processor/log/enable` | `std_msgs/Bool` | GCS → processor (Record ON / OFF) |
-| `/sss_ai/seabed_image`, `…/png`, `…/metadata` | `sensor_msgs/Image`, `sensor_msgs/Image`, `std_msgs/String` | GCS → Perception |
-| `/sss_ai/detections` | `vision_msgs/Detection2DArray` | Perception → GCS (drawn on the map) |
+| Ubuntu 24.04, ROS 2 Jazzy | [docs.ros.org](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html) | `sudo apt install ros-jazzy-desktop` |
+| `blueboat_interfaces` | [BlueBoat-Control](https://github.com/Kyyrron/BlueBoat-Control) | built in the same workspace |
+| ROS packages for the nodes | apt | `sudo apt install ros-jazzy-simple-launch ros-jazzy-mavros-msgs ros-jazzy-geographic-msgs ros-jazzy-rosbag2-py python3-scipy` |
+| GCS Python packages (PySide6, numpy, opencv-python, PyYAML) | `requirements.txt` | `pip install -r requirements.txt` |
+| SonarView (optional) | [Cerulean Sonar](https://ceruleansonar.com/pages/sonarview) | to open `.svlog` files in the vendor's viewer |
 
-The GCS also reads `/blueboat/odom`, `/mavros/global_position/global`,
-`/mavros/global_position/compass_hdg`, `/mavros/imu/data`, `/mavros/vfr_hud` and
-`/blueboat/pinger_coordinates`. The sonar topics are `BEST_EFFORT`. Change a QoS at both
-ends or not at all.
+Keep numpy below version 2 in the Python you run the nodes with: the ROS 2 Jazzy packages and
+scipy are built against numpy 1. On a system Python, pip may need `--break-system-packages`.
 
-## Configuration
-
-| File | Sets |
-|---|---|
-| `blueboat_sss/blueboat_gcs/config/default.yaml` | GCS: topic names, pipeline launch command, default sonar source, mosaic, display, seabed images, map tiles, range-slider limits, `data_root` |
-| `--config <file>.yaml` | Your overrides on top of `default.yaml` (for example one per site) |
-| Launch arguments | Driver acquisition (`range_length_mm`, `num_results`, …) and the processor's `transducer_x_offset_m`; see the package README |
-
-## Data
-
-Everything goes under `~/ros2_ws/data/SSS_data/` (`data_root`, resolved from the
-`blueboat_sss/` folder).
-
-```
-data/SSS_data/
-  sessions/<stamp>/          one folder per Record ON → OFF
-    metadata.json            times, config, counters (+ the simulator's run record in simulation)
-    *.svlog                  the sonar log of that session
-    mosaic/  waterfall/  detections/  seabed_images/
-  merged_sessions/<name>/    two logs merged from the replay window
-```
-
-Recorded `.svlog` files are primary field data: never edit or overwrite them.
-
-## Layout
-
-```
-BlueBoat-SSS/
-  requirements.txt           GCS Python packages
-  build.sh                   build the workspace and start the GCS
-  blueboat_sss/              ROS 2 package (ament_cmake)
-    src/                     sss_node.py, sss_processor_node.py
-    src/_custom_libraries/   omniscan_link (protocol), svlog / sss / math helpers
-    launch/                  SSS_processing_launch.py, SSS_simple_launch.py
-    custom_scripts/          offline tools (.svlog → rosbag, mosaic plotter)
-    tests/                   pytest suite (driver, processor, GCS)
-    terminals.txt            operator command sheet
-    blueboat_gcs/            the GCS app
-      main.py                entry point
-      gui/ ros/ core/ mapping/ models/ utils/ sim/ analysis/ tools/
-      config/default.yaml
-      docs/                  architecture and background
-```
-
-## Tests
-
-From `blueboat_sss/`, with the system python and **without** sourcing the workspace
-(the workspace venv has no pytest):
+## Installation, step by step
 
 ```bash
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m pytest -p no:cacheprovider
+# 1. Get the project with its submodules (or clone https://github.com/Kyyrron/BlueBoat-SSS alone)
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
+git clone --recurse-submodules https://github.com/Kyyrron/BlueBoat-SideScanSonar.git
+
+# 2. ROS packages the nodes need
+sudo apt install ros-jazzy-simple-launch ros-jazzy-mavros-msgs ros-jazzy-geographic-msgs \
+                 ros-jazzy-rosbag2-py python3-scipy
+
+# 3. GCS Python packages, in the workspace venv
+cd ~/ros2_ws && source .venv/bin/activate
+pip install -r src/BlueBoat-SideScanSonar/BlueBoat-SSS/requirements.txt
+
+# 4. Build: the message types first, then the sonar package
+cd ~/ros2_ws && source /opt/ros/jazzy/setup.bash
+colcon build --packages-select blueboat_interfaces
+colcon build --packages-select blueboat_sss
+
+# 5. Every new terminal
+cd ~/ros2_ws && source env.sh       # env.sh: "source .venv/bin/activate" + "source install/setup.bash"
 ```
 
-Tests that need `blueboat_interfaces`, a ROS graph or the field `.svlog` corpus skip
-when it is missing.
+The GCS needs no build. `build.sh` (in this folder) runs `colcon build`, sources `env.sh` and
+starts the GCS in one go.
 
-## Further reading
+## Check the installation
 
-| Topic | File |
+```bash
+# 1. The GCS in demo mode: no ROS, no sonar
+cd ~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-SSS/blueboat_sss
+python3 -m blueboat_gcs.main --sim
+```
+
+The window opens; press **START** and a simulated mosaic and waterfall build up.
+
+```bash
+# 2. The ROS nodes are installed
+cd ~/ros2_ws && source env.sh
+ros2 launch blueboat_sss SSS_processing_launch.py --show-args
+```
+
+## Tips: when to use it, what to know
+
+- **Start the GCS from the `blueboat_sss/` folder.** It imports its package and resolves its data
+  folder from there.
+- **Normal operation**: start the GCS, choose the **Sonar** source (*Simulation* or *Real
+  sonars*), press **START**, then **Record ON / OFF** around what you want to keep, then **STOP**.
+  The GCS launches and stops the sonar nodes itself. Full walk-through:
+  [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
+- **Pinging and recording are off at start-up**, on purpose.
+- **Set the range from the water depth** (about four times the deepest water), not from the area
+  to cover. Too long a range breaks bottom tracking. The project's setting is 20 m.
+- **Do not leave the sonars pinging for long out of water**: the transducer can overheat.
+- **Data leaves the GCS only through a recording session.** If nothing was recording, STOP saves
+  nothing.
+- **Recorded `.svlog` files are field data**: never edit or overwrite them.
+- **Simulated pictures are brighter and more even than real ones.** Never quote a simulated level
+  as a field level (superproject `SIM_VALIDITY_CONDITIONS.md`).
+- **The sonar topics use "best effort" delivery.** A subscriber set to "reliable" receives
+  nothing; change the delivery setting at both ends or not at all.
+
+## More documentation
+
+| Document | What you find there |
 |---|---|
-| Nodes, parameters, recording, health checks | [`blueboat_sss/README.md`](blueboat_sss/README.md) |
-| GCS architecture and design | `blueboat_sss/blueboat_gcs/docs/ARCHITECTURE.md` |
-| GCS integration points | `blueboat_sss/blueboat_gcs/docs/HANDOVER.md` |
-| Seabed images for Perception | `blueboat_sss/blueboat_gcs/docs/PERCEPTION_INTEGRATION.md` |
-| `.svlog` format and measured device settings | `blueboat_sss/blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md` |
-| Side-scan background | `blueboat_sss/blueboat_gcs/docs/SCIENTIFIC_BACKGROUND.md` |
-| The whole project | the superproject `README.md` and `docs/` |
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Using the GCS: start, record, replay, configuration, data folders, topics |
+| [blueboat_sss/README.md](blueboat_sss/README.md) | The two ROS nodes: launches, parameters, recording, health checks, offline tools |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | How to work on this module: Claude Code, setup, tests, rules, next steps |
+| [blueboat_gcs/docs/ARCHITECTURE.md](blueboat_sss/blueboat_gcs/docs/ARCHITECTURE.md) | How the GCS is built |
+| [blueboat_gcs/docs/PERCEPTION_INTEGRATION.md](blueboat_sss/blueboat_gcs/docs/PERCEPTION_INTEGRATION.md) | The seabed images sent to BlueBoat-Perception |
+| [blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md](blueboat_sss/blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md) | The `.svlog` format and the measured device settings |
+| [blueboat_gcs/docs/SCIENTIFIC_BACKGROUND.md](blueboat_sss/blueboat_gcs/docs/SCIENTIFIC_BACKGROUND.md) | Side-scan sonar background and the display model |
+| [blueboat_gcs/docs/HANDOVER.md](blueboat_sss/blueboat_gcs/docs/HANDOVER.md) | The GCS's integration points with the other modules |
+
+---
+
+**Author** — BERTRAND Killian, Kyushu Institute of Technology, 2026.

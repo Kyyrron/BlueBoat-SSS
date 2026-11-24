@@ -413,7 +413,7 @@ offline CLI runs the same core over a recorded session's `seabed_images/`.
   and `launch/SSS_simple_launch.py` (acquisition only, for running the driver by hand).
   Both are installed by `install(DIRECTORY launch ...)` in `CMakeLists.txt`. The
   matplotlib listener node is gone; this app replaces it.
-* **Transducer offsets**: since `994a74b` (2026-10-13) `sss_processor_node.py` uses
+* **Transducer offsets**: since 2026-10-13 `sss_processor_node.py` uses
   `TRANSDUCER_Y_OFFSET_PORT/STBD_M = 0.285` (BR-101447 hull spacing / 2) and
   `TRANSDUCER_SUBMERSION_M = 0.15` (an estimate), mirrored in `core/svlog.py`; the
   fore/aft offset is still 0.0 (unmeasured). The seabed pictures, the waterfall clicks
