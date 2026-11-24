@@ -49,3 +49,31 @@ def yaw_to_compass_deg(yaw_rad: float) -> float:
 def format_latlon(lat: float, lon: float) -> str:
     """Uniform GPS display format used everywhere in the GUI."""
     return f"{lat:.7f}, {lon:.7f}"
+
+
+#: sensor_msgs/NavSatStatus values the gate below cares about.
+NAVSAT_STATUS_NO_FIX: int = -1     # receiver reports: unable to fix position
+NAVSAT_STATUS_UNKNOWN: int = -2    # publisher never set the field (msg default)
+
+
+def navsat_fix_ok(status: int, lat: float, lon: float) -> tuple[bool, str]:
+    """Pure acceptance gate for a NavSatFix — ``(accepted, reason)``.
+
+    Rejects only what is *known* bad: an explicit ``STATUS_NO_FIX``,
+    non-finite coordinates, and the ``(0, 0)`` no-fix sentinel (the
+    cross-module contract for ``/mavros/global_position/global``).
+
+    ``STATUS_UNKNOWN`` (-2) is **accepted**: since ROS 2 Iron the message
+    default for ``status`` is -2, so any publisher that fills only
+    lat/lon — the MCS bridge's simulated GPS for Gazebo runs of
+    GPS-anchored missions is exactly that — sends every fix with -2.
+    Treating all negative statuses as "no fix" silently discarded that
+    entire feed while MCS (which never reads ``status``) anchored fine.
+    """
+    if status == NAVSAT_STATUS_NO_FIX:
+        return False, "status NO_FIX"
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return False, f"non-finite coordinates ({lat}, {lon})"
+    if lat == 0.0 and lon == 0.0:
+        return False, "(0, 0) no-fix sentinel"
+    return True, ""

@@ -9,14 +9,18 @@ topics.odom                             nav_msgs/Odometry           ~20 Hz
 topics.navsat                           sensor_msgs/NavSatFix       ~5 Hz
 topics.compass_hdg                      std_msgs/Float64 (degrees)  ~10 Hz
 topics.vfr_hud (optional)               mavros_msgs/VfrHud          ~4 Hz
+topics.imu                              sensor_msgs/Imu             IMU rate
 ======================================  ==========================  ======
 
 The listener merges the latest values into a ``RobotState`` and emits it
 on every odom message, throttled to ``EMIT_HZ`` — the panels do not need
 20 Hz updates, and this keeps the queued-signal traffic low.
 
-The GUI-side ``CoordinateConverter`` binds its GPS origin from the first
-RobotState that carries both a local pose and a fix (see main_window).
+The GUI-side ``GeoService`` anchors the map by pairing ``gps_fix``
+emissions (from ``_on_navsat``, at GPS rate) with fresh odom positions;
+``compass_heading`` feeds the live heading policy (see main_window).
+``attitude`` (roll, pitch, yaw rate of each IMU sample) is attached to the
+pings for the seabed-image metadata only (``utils/attitude.py``).
 mavros_msgs is optional: without it, speed falls back to the odom twist.
 """
 
@@ -30,16 +34,18 @@ from typing import Optional
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import Imu, NavSatFix
 from std_msgs.msg import Float64
 
 from ..config.settings import RosTopics
 from ..core.signals import AppSignals
+from ..core.stream_clock import now as stream_now
 from ..models.robot_state import RobotState
-from ..utils.geodesy import quat_to_yaw, yaw_to_compass_deg
+from ..utils.attitude import quat_to_roll_pitch
+from ..utils.geodesy import navsat_fix_ok, quat_to_yaw, yaw_to_compass_deg
 from ..utils.pose_alignment import GpsPoseSynthesizer
 
-try:  # pragma: no cover - mavros_msgs may be absent on the basestation
+try:  # pragma: no cover - mavros_msgs may be absent (no MAVROS installed)
     from mavros_msgs.msg import VfrHud
     MAVROS_MSGS_AVAILABLE = True
 except ImportError:  # pragma: no cover
@@ -57,6 +63,7 @@ class TelemetryListener:
         self._lock = threading.Lock()
         self._lat: Optional[float] = None
         self._lon: Optional[float] = None
+        self._navsat_reject_logged = False
         self._compass_deg: Optional[float] = None
         self._speed: Optional[float] = None
         # GPS dead-reckoning fallback (sea-trial fix): if /blueboat/odom
@@ -80,6 +87,8 @@ class TelemetryListener:
                                  self._on_navsat, best_effort)
         node.create_subscription(Float64, topics.compass_hdg,
                                  self._on_compass, 10)
+        # Like the other mavros sensor streams: BEST_EFFORT, depth 10.
+        node.create_subscription(Imu, topics.imu, self._on_imu, best_effort)
         if MAVROS_MSGS_AVAILABLE:
             node.create_subscription(VfrHud, topics.vfr_hud,
                                      self._on_vfr_hud, best_effort)
@@ -89,11 +98,28 @@ class TelemetryListener:
 
     # ---- callbacks (ROS thread) -----------------------------------------------
     def _on_navsat(self, msg: NavSatFix) -> None:
-        if (msg.status.status < 0 or math.isnan(msg.latitude)
-                or math.isnan(msg.longitude)):
+        # Gate is the pure utils/geodesy.navsat_fix_ok: STATUS_UNKNOWN (-2,
+        # the message default — what the MCS bridge's simulated GPS sends)
+        # is a valid fix; only an explicit NO_FIX, non-finite coordinates
+        # or the (0, 0) sentinel are dropped. The first fix of each kind is
+        # logged so a filtered-out GPS feed is visible in the console
+        # instead of looking like "no GPS at all".
+        ok, reason = navsat_fix_ok(int(msg.status.status),
+                                   float(msg.latitude), float(msg.longitude))
+        if not ok:
+            if not self._navsat_reject_logged:
+                self._navsat_reject_logged = True
+                self._signals.log_line.emit(
+                    "app", f"GPS: NavSatFix rejected ({reason}) — fixes are "
+                           "arriving but do not pass the acceptance gate.")
             return
         with self._lock:
             self._lat, self._lon = float(msg.latitude), float(msg.longitude)
+        # GeoService pairing stream: GPS rate, on the reception clock (sim
+        # time or replayed stamps must not break the odom-freshness pairing;
+        # core/stream_clock.py).
+        self._signals.gps_fix.emit(stream_now(), float(msg.latitude),
+                                   float(msg.longitude))
         if self._gps_fallback:
             # Passive tracking: keeps the dead-reckoning reference + last
             # position current so the zero-frozen-odom check in _on_odom
@@ -105,7 +131,7 @@ class TelemetryListener:
         """5 Hz node timer: emit a GPS-dead-reckoned RobotState when the
         odom stream is dead (> 2 s silent) or zero-frozen while the GPS
         fix moves. Regular odom resumes normal emission automatically."""
-        now = time.monotonic()
+        now = stream_now()
         odom_dead = now - self._last_odom_wall > 2.0
         if not (odom_dead or self._odom_frozen_hint):
             return
@@ -124,7 +150,8 @@ class TelemetryListener:
                 "ALIGNMENT: /blueboat/odom is "
                 + ("silent" if odom_dead else "frozen at the origin")
                 + " while the GPS fix moves — RobotState is now GPS+compass "
-                  "dead-reckoned (fix the robot-side odom publisher; see "
+                  "dead-reckoned (fix the /blueboat/odom publisher, "
+                  "robot_interface; see "
                   "HANDOVER 'Sea-trial pose alignment').")
         self._signals.robot_state.emit(RobotState(
             t=t, x=x, y=y, yaw=yaw, lat=lat, lon=lon,
@@ -137,19 +164,34 @@ class TelemetryListener:
             return
         with self._lock:
             self._compass_deg = float(msg.data) % 360.0
+        self._signals.compass_heading.emit(stream_now(),
+                                           float(msg.data) % 360.0)
+
+    def _on_imu(self, msg: Imu) -> None:
+        """Attitude for the seabed-image metadata (never geometry).
+        ``orientation_covariance[0] == -1`` means no orientation estimate
+        (sensor_msgs/Imu convention): roll/pitch are then unknown."""
+        q = msg.orientation
+        if msg.orientation_covariance[0] == -1.0:
+            roll = pitch = math.nan
+        else:
+            roll, pitch = quat_to_roll_pitch(q.x, q.y, q.z, q.w)
+        self._signals.attitude.emit(stream_now(), roll, pitch,
+                                    float(msg.angular_velocity.z))
 
     def _on_vfr_hud(self, msg: "VfrHud") -> None:
         with self._lock:
             self._speed = float(msg.groundspeed)
 
     def _on_odom(self, msg: Odometry) -> None:
-        # Throttle on the WALL clock, never on message stamps: replayed
+        # Throttle on the reception clock, never on message stamps: replayed
         # bags, sim time, or a restarted publisher can carry stamps that
         # jump backwards, and a stamp-based throttle would then silently
         # reject every message until the stamps caught up with the last
         # seen value (robot frozen until it "returns" to its previous
-        # time). monotonic() is immune to all of that.
-        now = time.monotonic()
+        # time). The stream clock (wall monotonic; sim-paced under /clock,
+        # core/stream_clock.py) never goes backwards either.
+        now = stream_now()
         self._last_odom_wall = now
         px = float(msg.pose.pose.position.x)
         py = float(msg.pose.pose.position.y)

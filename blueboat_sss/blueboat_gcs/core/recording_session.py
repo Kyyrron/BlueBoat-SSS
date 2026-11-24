@@ -12,6 +12,7 @@ Session folder layout (consumed by future processing scripts)::
 
     <data_root>/sessions/2026_07_08-14_02_31/
         metadata.json               # times, config snapshot, counters...
+        *.svlog                     # adopted from the processor (see below)
         mosaic/
             sonar_mosaic.npz        # raw planes (legacy keys + priorities)
             sonar_mosaic.png
@@ -21,14 +22,36 @@ Session folder layout (consumed by future processing scripts)::
             waterfall_raw.npz       # untouched ping buffer (AI datasets)
         detections/
             detections.csv          # uid, t, x, y, class, confidence
-        svlog/
-            *.svlog                 # adopted from the processor (see below)
 
 The .svlog adoption: the file is written by ``sss_processor_node``
 wherever *it* decides — the GCS cannot redirect it. After the session
 ends, every ``*.svlog`` found under ``data_root`` whose modification
-time falls inside the session window is *moved* into ``svlog/``. If the
-processor writes elsewhere, add that directory to the sweep list.
+time falls inside the session window is *moved* to the **session root**,
+alongside ``metadata.json``. If the processor writes elsewhere, add that
+directory to the sweep list.
+
+Adoption timing: ``end()`` writes ``metadata.json`` and the detections
+immediately but does NOT adopt — the ``log_enable=False`` message is
+asynchronous, and moving the file while the processor still holds its
+old absolute path open makes its next append recreate a headerless
+stub in ``data_root``. The caller schedules :meth:`adopt_now` after a
+short settle delay (``recording.adopt_delay_s``); STOP and app-close
+call it synchronously because pinging is already off there. Anything
+under ``sessions/`` or ``merged_sessions/`` is never adopted (a merged
+session is derived data with the same primary-record protection, NC #6).
+
+Export threading (2026-09-15): the mosaic and waterfall files are the
+slow part of ``end()`` — 2.5–7.4 s of compressed npz on a full mission
+(project_review.md §3.4), which is exactly the "Record OFF / STOP
+freezes the app" field symptom. ``end()`` now takes immutable
+snapshots of both services on the GUI thread
+(``MosaicService.export_snapshot`` / ``WaterfallService.export_snapshot``)
+and hands them to one :class:`_ExportJob` on the global ``QThreadPool``
+(the same pool the seabed-image saves use); it returns as soon as
+``metadata.json`` is on disk. :meth:`wait_for_exports` blocks until
+the pool drains — the app's ``closeEvent`` calls it so the process
+never exits under a write, and a test that lists the session folder
+calls it before asserting. Record OFF and STOP themselves never wait.
 """
 
 from __future__ import annotations
@@ -41,15 +64,92 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from ..config.settings import AppConfig
 from ..models.detection import Detection
 from .mosaic_service import MosaicService
+from . import sim_run_info
 from .signals import AppSignals
+from .stream_clock import now as stream_now
 from .waterfall_service import WaterfallService
 
 _SVLOG_MTIME_SLACK_S = 10.0     # tolerance around the session window
+
+#: The smallest possible framed Cerulean packet: 8-byte header (BR, u16
+#: length, u16 id, src, dst) + empty payload + u16 checksum. Anything
+#: below this is an empty/truncated stub (e.g. left by a writer that
+#: appended after its file moved) and is skipped — never moved, never
+#: deleted — and reported.
+_SVLOG_MIN_BYTES = 10
+
+
+def session_x_offset(arms):
+    """``metadata.json["transducer_x_offset_m"]`` from the distinct
+    fore/aft arms a session's pings carried: the value when there is one
+    (every session in practice), the list when it changed, None when the
+    session holds no ping."""
+    arms = [float(a) for a in arms]
+    if not arms:
+        return None
+    return arms[0] if len(arms) == 1 else arms
+
+
+def write_session_metadata(session: Path, meta: dict) -> None:
+    """Write ``metadata.json`` with the session schema.
+
+    Single writer for live sessions and rebuilt (merged) ones, so the
+    schema — in particular the keys ``ping_count``, ``detection_count``,
+    ``adopted_svlogs`` and ``mosaic`` that downstream scripts and the
+    regression suite rely on — cannot drift between the two producers.
+    """
+    with open(session / "metadata.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
+
+
+def update_session_metadata(session: Path, **updates) -> None:
+    """Patch keys into an existing ``metadata.json`` (e.g. the adoption
+    result, which is only known after the settle delay)."""
+    path = session / "metadata.json"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        meta = {}
+    meta.update(updates)
+    write_session_metadata(session, meta)
+
+
+class _ExportJob(QRunnable):
+    """Write a session's ``mosaic/`` and ``waterfall/`` from frozen
+    snapshots off the GUI thread (see the module docstring). Failures
+    are reported on the status bus, never raised into the pool."""
+
+    def __init__(self, session: Path, mosaic_snap, waterfall_snap,
+                 signals: AppSignals) -> None:
+        super().__init__()
+        self._session = session
+        self._mosaic = mosaic_snap
+        self._waterfall = waterfall_snap
+        self._signals = signals
+        self.setAutoDelete(True)
+
+    def run(self) -> None:  # noqa: D401
+        written = []
+        try:
+            if self._mosaic is not None:
+                self._mosaic.write(self._session / "mosaic")
+                written.append("mosaic")
+            if self._waterfall is not None:
+                self._waterfall.write(self._session / "waterfall")
+                written.append("waterfall")
+        except Exception as exc:  # pragma: no cover - reported, never raised
+            self._signals.status_message.emit(
+                f"WARNING: session {self._session.name} export failed: {exc}")
+            return
+        self._signals.status_message.emit(
+            f"Recording session saved to {self._session}"
+            + (f" ({', '.join(written)})" if written else " (no sonar data)"))
 
 
 class RecordingManager(QObject):
@@ -65,9 +165,19 @@ class RecordingManager(QObject):
         self._mosaic = mosaic
         self._waterfall = waterfall
         self._start_wall: Optional[float] = None
+        # The session's start on the stream clock (core/stream_clock.py):
+        # duration_s is measured on it, so a simulation slowed below real
+        # time records the duration it simulated, as a real-speed run does.
+        self._start_stream: Optional[float] = None
         self._start_stamp: str = ""
         self.session_dir: Optional[Path] = None
+        # (session_dir, start_wall, ping_count) of an ended session whose
+        # adoption sweep has not run yet; consumed by adopt_now().
+        self._pending_adoption: Optional[tuple] = None
         self._ping_count = 0
+        # The fore/aft arm(s) the session's pings were placed with
+        # (SonarPing.x_offset_m), in order of first appearance.
+        self._x_offsets: List[float] = []
         self._detections: List[Detection] = []
         self._priority_mode = "average"
         self._display_settings = None
@@ -75,9 +185,12 @@ class RecordingManager(QObject):
         signals.detection.connect(self._log_detection)
 
     # ---- bookkeeping slots -------------------------------------------------------
-    def _count_ping(self, _ping) -> None:
+    def _count_ping(self, ping) -> None:
         if self.active:
             self._ping_count += 1
+            arm = float(getattr(ping, "x_offset_m", 0.0))
+            if arm not in self._x_offsets:
+                self._x_offsets.append(arm)
 
     def _log_detection(self, det: Detection) -> None:
         if self.active:
@@ -94,12 +207,22 @@ class RecordingManager(QObject):
     def active(self) -> bool:
         return self._start_wall is not None
 
-    def begin(self) -> None:
+    def begin(self) -> bool:
         if self.active:
-            return
+            # Visible, never silent: a stuck "active" state here used to
+            # make every later Record ON reuse the first session folder.
+            self._signals.status_message.emit(
+                f"Recording session {self._start_stamp} is still active — "
+                "reusing it (STOP or Record OFF closes it).")
+            return False
+        # A still-pending adoption belongs to the previous session; run
+        # it now so its .svlog cannot be swallowed by this session.
+        self.adopt_now()
         self._start_wall = time.time()
+        self._start_stream = stream_now()
         self._start_stamp = datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
         self._ping_count = 0
+        self._x_offsets = []
         self._detections.clear()
         # The directory exists from the start of the session so streaming
         # artifacts (live seabed_images/) land inside it as they are made.
@@ -109,24 +232,70 @@ class RecordingManager(QObject):
         self.recording_state.emit(True)
         self._signals.status_message.emit(
             f"Recording session {self._start_stamp} started.")
+        return True
 
     def end(self) -> Optional[Path]:
-        """Finalize the session folder; returns it (None if not active)."""
+        """Finalize the session folder; returns it (None if not active).
+
+        Adoption of the .svlog is NOT done here — call :meth:`adopt_now`
+        after the log_enable=False message has settled (see module
+        docstring); until then ``metadata.json`` carries an empty
+        ``adopted_svlogs`` list.
+        """
         if not self.active:
             return None
         start_wall, self._start_wall = self._start_wall, None
         session = self.session_dir
 
-        self._mosaic.save_into(session / "mosaic")
-        self._waterfall.export_into(session / "waterfall")
+        # Snapshots on the GUI thread (cheap copies), files on the pool.
+        mosaic_snap = self._mosaic.export_snapshot()
+        waterfall_snap = self._waterfall.export_snapshot()
         self._write_detections(session)
-        adopted = self._adopt_svlogs(session, start_wall)
-        self._write_metadata(session, start_wall, adopted)
+        self._write_metadata(session, start_wall, [],
+                             duration_s=(None if self._start_stream is None
+                                         else stream_now() - self._start_stream))
+        self._start_stream = None
+        self._pending_adoption = (session, start_wall, self._ping_count)
+        QThreadPool.globalInstance().start(
+            _ExportJob(session, mosaic_snap, waterfall_snap, self._signals))
 
         self.recording_state.emit(False)
         self._signals.status_message.emit(
-            f"Recording session saved to {session}")
+            f"Recording session {session.name} closed — mosaic and "
+            "waterfall are being written in the background.")
         return session
+
+    @staticmethod
+    def wait_for_exports(timeout_s: Optional[float] = None) -> bool:
+        """Block until every pending export (and seabed-image save) on
+        the global pool has finished; True when the pool drained."""
+        ms = -1 if timeout_s is None else max(int(timeout_s * 1000), 0)
+        return bool(QThreadPool.globalInstance().waitForDone(ms))
+
+    def adopt_now(self) -> List[str]:
+        """Run the deferred .svlog adoption of the last ended session.
+
+        Idempotent: consumes the pending context, so extra calls (a
+        scheduled timer firing after app-close already adopted, say) are
+        no-ops. Rewrites the session's ``adopted_svlogs`` metadata key
+        and warns loudly when a session with pings adopted nothing.
+        """
+        if self._pending_adoption is None:
+            return []
+        (session, start_wall, ping_count), self._pending_adoption = \
+            self._pending_adoption, None
+        adopted = self._adopt_svlogs(session, start_wall)
+        update_session_metadata(session, adopted_svlogs=adopted)
+        if adopted:
+            self._signals.status_message.emit(
+                f"Adopted {', '.join(adopted)} into {session.name}.")
+        elif ping_count > 0:
+            self._signals.status_message.emit(
+                f"WARNING: session {session.name} recorded {ping_count} "
+                "pings but no .svlog was adopted — the processor may not "
+                "have been recording (check the console for "
+                "'logging ->' from sss_processor).")
+        return adopted
 
     # ---- artifact assembly ------------------------------------------------------
     def _write_detections(self, session: Path) -> None:
@@ -145,37 +314,74 @@ class RecordingManager(QObject):
                             f"{det.confidence:.3f}", f"{det.extent_m:.2f}"])
 
     def _adopt_svlogs(self, session: Path, start_wall: float) -> List[str]:
-        """Move .svlog files written during the session into svlog/."""
+        """Move .svlog files written during the session to the session root."""
         adopted: List[str] = []
+        # The processor resolves the shared data_root to an absolute path;
+        # do the same so the sweep and the writer agree regardless of cwd.
         root = Path(self._config.data_root).expanduser()
         lo = start_wall - _SVLOG_MTIME_SLACK_S
         hi = time.time() + _SVLOG_MTIME_SLACK_S
         if not root.exists():
+            self._signals.status_message.emit(
+                f"WARNING: data_root {root} does not exist — "
+                "no .svlog adopted.")
             return adopted
+        root = root.resolve()
+        # Anything already filed in a session — this one or an earlier
+        # one — is settled and is never moved again. merged_sessions/
+        # holds derived sessions with the same protection. Recorded
+        # .svlog are primary field data (CLAUDE.md NON-NEGOTIABLE #6).
+        protected = (root / "sessions", root / "merged_sessions")
         for f in root.rglob("*.svlog"):
-            if session in f.parents:
-                continue
             try:
-                if lo <= f.stat().st_mtime <= hi:
-                    dest = session # / "svlog"
-                    # dest.mkdir(exist_ok=True)
-                    shutil.move(str(f), dest / f.name)
-                    adopted.append(f.name)
+                f = f.resolve()
+                if any(p in f.parents for p in protected):
+                    continue
+                st = f.stat()
+                if not (lo <= st.st_mtime <= hi):
+                    continue
+                if st.st_size < _SVLOG_MIN_BYTES:
+                    # A headerless stub from a writer that appended after
+                    # its file was moved: worthless, but never deleted.
+                    self._signals.status_message.emit(
+                        f"Skipping stub {f.name} ({st.st_size} B) — "
+                        "not a valid .svlog.")
+                    continue
+                shutil.move(str(f), session / f.name)
+                adopted.append(f.name)
             except OSError:
                 continue
         return adopted
 
+    def _display_model_json(self):
+        model = getattr(self._waterfall, "model", None)
+        if model is None:
+            return None
+        try:
+            return model.snapshot().to_json()
+        except Exception:                      # pragma: no cover - metadata only
+            return None
+
     def _write_metadata(self, session: Path, start_wall: float,
-                        svlogs: List[str]) -> None:
+                        svlogs: List[str],
+                        duration_s: Optional[float] = None) -> None:
+        # duration_s: stream-clock seconds (wall in a real run, sim seconds
+        # under /clock); started_utc / ended_utc say *when* it was recorded.
+        if duration_s is None:
+            duration_s = time.time() - start_wall
         meta = {
             "session": self._start_stamp,
             "started_utc": datetime.utcfromtimestamp(
                 start_wall).isoformat() + "Z",
             "ended_utc": datetime.utcnow().isoformat() + "Z",
-            "duration_s": round(time.time() - start_wall, 1),
+            "duration_s": round(duration_s, 1),
             "ping_count": self._ping_count,
             "detection_count": len(self._detections),
             "adopted_svlogs": svlogs,
+            # The fore/aft arm of the transducers the session's pings were
+            # placed with [m, + forward]: the processor's own value on each
+            # ping (ProcessedSSSPing.transducer_x_offset). null = no ping.
+            "transducer_x_offset_m": session_x_offset(self._x_offsets),
             "mosaic": {
                 "cell_size_m": self._config.mosaic.cell_size_m,
                 "densify": self._config.mosaic.densify,
@@ -185,10 +391,17 @@ class RecordingManager(QObject):
             "display_settings_at_end": (
                 asdict(self._display_settings)
                 if self._display_settings is not None else None),
+            "display_model": self._display_model_json(),
             "topics": asdict(self._config.topics),
-            "note": ("mosaic/*.npz and waterfall/waterfall_raw.npz contain "
-                     "raw, unrendered data; PNGs go through the display "
-                     "pipeline and are quick-looks only."),
+            # What produced a SIMULATED session: the sonar renderer, profile
+            # and its sha256, world digest, seeds, acquisition and build of
+            # BlueBoat-SSS-Sim (its latched ~/ground_truth/run_info; null on
+            # real water and when no simulator is publishing). 2026-11-11.
+            "simulation": sim_run_info.latest(),
+            "note": ("waterfall/waterfall_raw.npz holds raw dB; mosaic/*.npz "
+                     "holds the display-model-normalised level (its "
+                     "value_domain key says which); PNGs go through the "
+                     "display pipeline and are quick-looks only; the AI "
+                     "feed is seabed_images/ + metadata/."),
         }
-        with open(session / "metadata.json", "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
+        write_session_metadata(session, meta)

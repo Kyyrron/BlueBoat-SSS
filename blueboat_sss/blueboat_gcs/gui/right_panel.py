@@ -33,8 +33,22 @@ class RightPanel(QWidget):
     clear_overlays_clicked = Signal()
     clear_sss_clicked = Signal()
     sss_opacity_changed = Signal(float)    # 0.0 .. 1.0
+    resolution_changed = Signal(float)     # mosaic cell size [m], 0 = auto
+    depth_mode_changed = Signal(str, float)  # (auto|manual|off, manual_m)
+    range_apply_requested = Signal(float)  # sonar range [m] (live only)
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, *,
+                 acquisition_range: Optional[Tuple[float, float]] = None,
+                 config=None) -> None:
+        """``acquisition_range=(min_m, max_m)`` adds the live sonar-range
+        group (main window only; the replay window has no sonar).
+
+        ``config`` (an AppConfig) seeds the display combos to the field
+        defaults — ``Depth comp.`` = ``depth.mode`` and ``Priority`` =
+        ``mosaic.priority_mode`` — so the widgets agree with the config
+        the services were built from (the combos otherwise start on their
+        first item regardless of config)."""
+        self._cfg = config
         super().__init__(parent)
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -93,6 +107,11 @@ class RightPanel(QWidget):
         # ---- display controls (SonarView-like; visualization only) ------------
         root.addWidget(self._build_display_box())
 
+        # ---- live sonar acquisition (range slider) ----------------------------
+        self._acq_box = None
+        if acquisition_range is not None:
+            root.addWidget(self._build_acquisition_box(*acquisition_range))
+
         # ---- distance tool ---------------------------------------------------
         dist = QGroupBox("Distance tool")
         dl = QVBoxLayout(dist)
@@ -118,6 +137,43 @@ class RightPanel(QWidget):
 
         root.addStretch(1)
 
+    # ---- live sonar acquisition -------------------------------------------------
+    def _build_acquisition_box(self, min_m: float, max_m: float) -> QGroupBox:
+        """Sonar range slider + Apply. Enabled only while the pipeline is
+        RUNNING (main_window drives ``set_acquisition_enabled``); Apply
+        triggers the enable-off → set-param → enable-on dance in the
+        launcher, so pinging pauses for ~a second at the change."""
+        box = QGroupBox("Acquisition")
+        form = QFormLayout(box)
+        form.setLabelAlignment(Qt.AlignRight)
+        self._range_slider = QSlider(Qt.Horizontal)
+        self._range_slider.setRange(int(min_m), int(max_m))
+        self._range_slider.setValue(20)                 # the field default
+        self._range_lbl = QLabel("20 m")
+        self._range_slider.valueChanged.connect(
+            lambda v: self._range_lbl.setText(f"{v} m"))
+        form.addRow("Sonar range",
+                    self._wrap(self._range_slider, self._range_lbl))
+        self._range_apply = QPushButton("Apply range")
+        self._range_apply.setToolTip(
+            "Set range_length_mm on the sonar node while it runs.\n"
+            "Pinging pauses briefly (the node reads parameters on the\n"
+            "enable rising edge) and resumes automatically.\n"
+            "Rule of thumb (NC #5): ~4x the deepest expected water,\n"
+            "not the area to cover — an over-long range breaks bottom\n"
+            "detection.")
+        self._range_apply.clicked.connect(
+            lambda: self.range_apply_requested.emit(
+                float(self._range_slider.value())))
+        form.addRow(self._range_apply)
+        box.setEnabled(False)          # until the pipeline reports running
+        self._acq_box = box
+        return box
+
+    def set_acquisition_enabled(self, on: bool) -> None:
+        if self._acq_box is not None:
+            self._acq_box.setEnabled(on)
+
     # ---- display controls -------------------------------------------------------
     def _build_display_box(self) -> QGroupBox:
         box = QGroupBox("Display")
@@ -137,15 +193,71 @@ class RightPanel(QWidget):
             "Oldest (first pass), Newest (last pass).")
         form.addRow("Priority", self._priority)
 
-        # Dynamic range is ALWAYS derived from the data (percentiles).
-        # The former manual min/max dB sliders were removed: real
-        # Omniscan data (uint16 pwr_results, per-gain min/max_pwr_db
-        # spanning e.g. +7..+64 dB) makes any fixed dB window meaningless
-        # across gain settings; the percentile scheme adapts by design,
-        # and Contrast/Brightness below give the operator the same
-        # practical control without unit assumptions.
-        self._gamma = self._slider(30, 300, 100)     # /100 -> 0.3 … 3.0
+        # ---- resolution --------------------------------------------------------
+        # SonarView does not render at a fixed ground-sample distance and
+        # neither do we any more: "Auto" follows the sonar's own sample
+        # spacing (range / num_results), which is where most of the
+        # apparent sharpness difference came from.
+        self._resolution = QComboBox()
+        self._resolution.addItem("Auto (from data)", 0.0)
+        for cm in (2, 5, 10, 15, 25, 50):
+            self._resolution.addItem(f"{cm} cm", cm / 100.0)
+        self._resolution.setToolTip(
+            "Mosaic ground-sample distance.\n"
+            "Auto keeps the best cell size the sonar's across-track\n"
+            "sample spacing supports, refining as data allows.\n"
+            "Changing it resamples the existing mosaic — nothing is\n"
+            "cleared; older data keeps its native resolution.")
+        self._resolution.currentIndexChanged.connect(
+            lambda i: self.resolution_changed.emit(
+                float(self._resolution.itemData(i))))
+        form.addRow("Resolution", self._resolution)
+
+        # ---- depth compensation -------------------------------------------------
+        # Same control SonarView exposes: the altitude used for
+        # slant-range correction. "Off" == their Manual/0 m mode, which
+        # is the robust choice when bottom detection is unreliable.
+        self._depth_mode = QComboBox()
+        for label, key in (("Auto (bottom detect)", "auto"),
+                           ("Manual", "manual"),
+                           ("Off (no correction)", "off")):
+            self._depth_mode.addItem(label, key)
+        self._depth_mode.setToolTip(
+            "Altitude used for slant-range correction.\n"
+            "Auto: track the first bottom return.\n"
+            "Manual: fixed value below.\n"
+            "Off: plot slant range directly (SonarView 'Manual 0 m').")
+        self._depth_manual = QSlider(Qt.Horizontal)
+        self._depth_manual.setRange(0, 300)          # 0.0 .. 30.0 m
+        self._depth_manual.setValue(0)
+        self._depth_manual_lbl = QLabel("0.0 m")
+        self._depth_mode.currentIndexChanged.connect(self._emit_depth)
+        self._depth_manual.valueChanged.connect(self._emit_depth)
+        form.addRow("Depth comp.", self._depth_mode)
+        form.addRow("Manual depth",
+                    self._wrap(self._depth_manual, self._depth_manual_lbl, ""))
+
+        # Dynamic range is ALWAYS derived from the data: the display
+        # model's window (core/display_model.py) — no manual dB sliders
+        # (real Omniscan data spans per-gain min/max_pwr_db, so a fixed
+        # window is meaningless). Contrast is the model's transfer
+        # exponent gamma (1 = linear power, SonarView; 0.5 = amplitude),
+        # seeded from config display.gamma so the on-screen waterfall and
+        # the AI pictures start on the same transfer; Brightness is an
+        # offset on the unit brightness. Visualization only.
+        gamma0 = (self._cfg.display.gamma if self._cfg is not None
+                  else DisplaySettings().gamma)
+        self._gamma = self._slider(30, 300, int(round(gamma0 * 100)))  # 0.3 … 3.0
         self._gamma_lbl = QLabel()
+        self._gamma.setToolTip(
+            "Display-model transfer control (core/display_model.py).\n"
+            "transfer = power (default): the exponent γ of the power law\n"
+            "  u = 10^(γ·(e − hi)/10)  — 1 = SonarView's linear power,\n"
+            "  0.5 = amplitude, 0.7 = the shipped default.\n"
+            "transfer = db_window: the window is window_db / γ dB wide\n"
+            "  below hi — a larger value narrows the window (more contrast).\n"
+            "The same value is applied to the on-screen waterfall, the\n"
+            "mosaic and the AI pictures written by this window.")
         form.addRow("Contrast", self._wrap(self._gamma, self._gamma_lbl))
 
         self._bright = self._slider(-50, 50, 0)      # /100 -> -0.5 … +0.5
@@ -170,7 +282,19 @@ class RightPanel(QWidget):
         for s in (self._gamma, self._bright):
             s.valueChanged.connect(self._emit_display)
         reset.clicked.connect(self._reset_display)
+        # Seed the combos to the field defaults from config (they start on
+        # their first item otherwise). Done after wiring so the services —
+        # connected by the window later — pick these up on first change,
+        # while the services themselves already default from the same config.
+        if self._cfg is not None:
+            i = self._depth_mode.findData(self._cfg.depth.mode)
+            if i >= 0:
+                self._depth_mode.setCurrentIndex(i)
+            i = self._priority.findData(self._cfg.mosaic.priority_mode)
+            if i >= 0:
+                self._priority.setCurrentIndex(i)
         self._emit_display()
+        self._emit_depth()
         self._emit_opacity(self._opacity.value())
         return box
 
@@ -195,15 +319,38 @@ class RightPanel(QWidget):
 
     def _reset_display(self) -> None:
         d = DisplaySettings()
+        gamma0 = (self._cfg.display.gamma if self._cfg is not None
+                  else d.gamma)
         self._cmap.setCurrentText(d.colormap)
-        self._gamma.setValue(int(d.gamma * 100))
+        self._gamma.setValue(int(round(gamma0 * 100)))
         self._bright.setValue(int(d.brightness * 100))
         self._opacity.setValue(100)
         self._emit_display()
 
+    def _emit_depth(self, *_a) -> None:
+        mode = self._depth_mode.currentData()
+        manual = self._depth_manual.value() / 10.0
+        self._depth_manual_lbl.setText(f"{manual:.1f} m")
+        self._depth_manual.setEnabled(mode == "manual")
+        self.depth_mode_changed.emit(mode, manual)
+
     def _emit_opacity(self, value: int) -> None:
         self._opacity_lbl.setText(f"{value} %")
         self.sss_opacity_changed.emit(value / 100.0)
+
+    def emit_display(self) -> None:
+        """Re-emit the current display settings.
+
+        The box emits once at construction, before the window has
+        connected anything, so that first emission reaches nobody: the
+        services started on ``DisplaySettings()`` (γ 1.0) while the
+        slider showed ``display.gamma`` (0.7) and the AI pictures used
+        the config value — three different transfers on screen, in the
+        metadata and in the dataset. The window calls this right after
+        wiring ``display_changed`` so every consumer starts on the value
+        the slider shows.
+        """
+        self._emit_display()
 
     def _emit_display(self, *_args) -> None:
         gamma = self._gamma.value() / 100.0

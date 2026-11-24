@@ -6,8 +6,10 @@ One implementation serves both consumers:
   every ``stride`` pings it emits a ``SeabedImage`` covering the last
   ``rows`` pings and (while a recording session is active) saves it under
   ``<session>/seabed_images/`` with metadata in an inner ``metadata/``
-  folder; each image is passed to the analyzer (dummy for now) and the
-  result is published (see main_window / ros_manager);
+  folder; every image is published for BlueBoat-Perception (pixels +
+  metadata, ``core/perception_bridge.py``), which is the station's **one
+  detection source** since 2026-10-16 -- the imager itself detects nothing
+  (``detections`` is always ``[]``; see main_window / ros_manager);
 * **from a log** — ``generate_from_pings`` runs the identical code over a
   decoded mission (replay window's "Save pictures from the log").
 
@@ -15,6 +17,19 @@ Domain: waterfall only — matches the SSS detection literature
 (Sethuraman et al. 2024 IJRR; CMRE MCM work), avoids renderer artifacts
 (densification/blending are survey-geometry-correlated), and loses no
 georeferencing because pixel→world is exact per ping row (see metadata).
+
+The pictures are **raw waterfall** in the native slant-bin domain
+(SonarView's convention): one column per device range bin, values
+verbatim, no resampling and no interpolation — hole-free by
+construction. The dark centre band is the physical water column (bins
+below the tracked altitude, cut upstream), whose width follows from the
+per-ping geometry. Image width adapts to the acquisition; a range
+change ends the current window (a training image must be one
+homogeneous grid) and the next window adopts the new layout.
+
+**The AI feed is these pictures + their JSON metadata.** The companion
+``_world.npz`` (per-pixel world grids + float dB) is an auxiliary
+georeferencing/analysis record, not the training input.
 
 Windowing: ``rows`` = 256, ``stride`` = 128 (50 % overlap) by default.
 At 28 Hz / 0.8 m s⁻¹ (≈ 2.9 cm per row) 256 rows span ≈ 7.3 m
@@ -27,41 +42,189 @@ stride. Both values are configurable (``config seabed`` block).
 
 Artifacts per image ``seabed_{id:05d}``:
 
-* ``seabed_XXXXX.png``          — 8-bit grayscale, per-image 2–98 %
-  normalization (annotation-tool friendly);
+* ``seabed_XXXXX.png``          — 8-bit grayscale through the window's ONE
+  display model (``core/display_model``): two-way transmission loss
+  removed, the mission's seabed curve in normalised slant range divided
+  out, then the power-law transfer — the same mapping the live waterfall
+  and the mosaic use, one model for every tile of a mission (a detector
+  needs the same seabed to read the same everywhere). Nothing is erased:
+  the water column and the ringing core are kept and darken by physics.
+  The model is recorded (JSON + ``_world.npz``) so the picture is
+  losslessly invertible back to dB;
 * ``metadata/seabed_XXXXX.json``      — the pixel→world contract:
-  per-row pose/time/speed/altitude, per-row swath half-range, the
+  per-row pose/time/speed/altitude/source ping, the display model, the
   closed-form pixel→world formula, boat summary;
 * ``metadata/seabed_XXXXX_world.npz`` — precomputed per-pixel
   ``world_x``/``world_y`` float32 grids (H×W) + the raw float dB image
-  (``intensity_db``) — a YOLO bbox center maps to the world with one
-  array lookup, and the raw radiometry is preserved for training.
+  (``intensity_db``) + the model curves — a YOLO bbox center maps to the
+  world with one array lookup, and the raw radiometry is preserved.
 
-Pixel convention (identical to the live waterfall view): row 0 = oldest
-ping, last row = newest; column 0 = +max range **port**, last column =
-−max range starboard; each row is scaled to its own swath. Pixel→world:
+Row geometry (``seabed.row_geometry``, decision 2026-09-05, PROVISIONAL):
 
-    y_local(i, j) = r_i * (1 - 2 j / (W-1))
-    world_x(i, j) = x_i - sin(yaw_i) * y_local
-    world_y(i, j) = y_i + cos(yaw_i) * y_local
+* ``"square"`` (default) — a picture row is one across-track bin pitch of
+  along-track distance, so a pixel is the same size along- and across-
+  track and an object keeps its shape at any boat speed (the "speed
+  correction" of the sidescan literature; SonarView draws true scale).
+  Each row copies exactly one ping's bins verbatim (nearest ping to the
+  row's along-track position; ``ping_index`` per row in the JSON); when
+  the boat outruns the pitch some pings are not represented in the
+  *picture* (they stay in ``waterfall_raw.npz``), when it is slower a
+  ping fills several rows. Row poses are interpolated along-track so the
+  world grids stay continuous. ``rows``/``stride`` count picture rows.
+* ``"ping"`` — one row per ping, the previous contract. **This is the
+  revert switch** if detector results are worse with square pixels.
+
+Pixel convention (identical to the live waterfall view): row 0 = newest,
+last row = oldest; column 0 = far range **port**, last column = far
+range starboard, transducer at the centre seam; every column is one
+slant bin of ``bin_pitch_m`` metres. Pixel→world, **georef convention 3**
+(2026-11-15: the processor's ``project_side`` geometry, placed from the
+transducers' point):
+
+    k(j)         = (W/2 - 1 - j) if j < W/2 else (j - W/2)
+    s(j)         = (k + 0.5) * bin_pitch_m
+    y_local(i,j) = ±(lever_side + sqrt(max(s² - bottom_i², 0)))   (+ port, − starboard)
+    world_x(i,j) = x_i + cos(yaw_i) * a - sin(yaw_i) * y_local
+    world_y(i,j) = y_i + sin(yaw_i) * a + cos(yaw_i) * y_local
+
+with ``bottom_i`` the row's tracked transducer altitude (``bottom_m``),
+``lever_side`` the transducer's lateral offset (``core/svlog.py``
+``TRANSDUCER_Y_OFFSET_*``, 0.285 m) and ``a`` the fore/aft arm of the
+transducers from the row pose, + forward (``georef.lever_arm_m.x``; the
+pings' own ``SonarPing.x_offset_m``, -0.345 m). ``(x_i, y_i, yaw_i)`` stays
+the NAVIGATION pose (``rows_data`` ``x_m`` / ``y_m`` / ``yaw_rad``): the arm
+is in the grids and in ``georef``, never folded into the row pose.
+
+**Convention 2** (schema 5, 2026-10-16) is the same with ``a = 0`` and is
+what a picture built from pings without an arm still says -- its
+``georef`` and grids are unchanged bit for bit (``georef_for``). Schema
+<= 4 pictures (no ``georef`` key) used **convention 1**: lever 0 and
+``altitude_m`` (the correction altitude + submersion) in place of
+``bottom_m`` -- their stored world grids stay valid as written.
 """
 
 from __future__ import annotations
 
+import bisect
 import json
 import math
+import secrets
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Tuple
+from typing import (Callable, Iterable, List, Optional, Sequence, Tuple)
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from ..config.settings import AppConfig
-from ..models.sonar import SonarPing
+from ..models.sonar import (SonarPing, build_slant_row, native_bins,
+                            sensor_point, slant_col_to_y_local)
+from .along_track import AlongTrackEstimator
+from .display_model import DisplayModel, DisplayModelSnapshot
+from .svlog import TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M
 
-SCHEMA_VERSION = 1
+#: 5 since 2026-10-16: georef convention 2 (world grids), ``stream_id``,
+#: per-row attitude and device ping numbers (all additive keys).
+SCHEMA_VERSION = 5
+#: The transducer lateral offsets [m] (port, starboard) the world grids,
+#: the waterfall clicks and the detection overlay apply.
+LEVER_ARM_M = (TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M)
+#: ``metadata()["georef"]``: how the world grids were computed. Absent on
+#: schema <= 4 pictures, which used convention 1 (no lever, altitude_m).
+GEOREF = {"convention": 2, "altitude": "bottom_m",
+          "lever_arm_m": {"x": 0.0, "y_port": float(LEVER_ARM_M[0]),
+                          "y_stbd": float(LEVER_ARM_M[1])}}
+#: The convention a picture declares when its pings carry a fore/aft arm
+#: (2026-11-15): convention 2 placed from the transducers' point.
+GEOREF_CONVENTION_FORE_AFT = 3
+
+
+def georef_for(lever_x: float) -> dict:
+    """``metadata()["georef"]`` of a picture whose pings carry the
+    fore/aft arm ``lever_x`` [m, + forward].
+
+    No arm (0.0) is ``GEOREF`` itself, convention 2, so a recording
+    re-processed with the old value says exactly what it said then. With an
+    arm: the same keys, ``convention`` 3 and ``lever_arm_m.x`` = the arm.
+    """
+    g = dict(GEOREF, lever_arm_m=dict(GEOREF["lever_arm_m"]))
+    if lever_x != 0.0:
+        g["convention"] = GEOREF_CONVENTION_FORE_AFT
+        g["lever_arm_m"]["x"] = float(lever_x)
+    return g
+
+
+#: The pixel->world formula text of each convention, written into every
+#: picture's ``pixel_convention.formula``. Convention 2's is verbatim what
+#: schema 5 has carried since 2026-10-16.
+_FORMULA_HEAD = ("k = (W/2-1-j) if j < W/2 else (j-W/2); "
+                 "s = (k+0.5)*bin_pitch_m; "
+                 "y_local(i,j) = sign * (lever_side + sqrt(max(s^2 - "
+                 "bottom_m[i]^2, 0))) (+ port, - starboard; "
+                 "lever_side = georef.lever_arm_m.y_port / y_stbd); ")
+_FORMULA_TAIL = ("or use the "
+                 "precomputed world_x/world_y grids in the "
+                 "companion _world.npz. Schema <= 4 (no georef): "
+                 "convention 1, lever 0 and altitude_m[i]")
+FORMULA_CONVENTION_2 = ("georef convention 2: " + _FORMULA_HEAD
+                        + "world = (x_i - sin(yaw_i)*y_local, "
+                          "y_i + cos(yaw_i)*y_local); " + _FORMULA_TAIL)
+FORMULA_CONVENTION_3 = ("georef convention 3: " + _FORMULA_HEAD
+                        + "a = georef.lever_arm_m.x (fore/aft arm of the "
+                          "transducers from the row pose, + forward; the "
+                          "row pose x_m/y_m/yaw_rad stays the navigation "
+                          "pose); "
+                          "world = (x_i + cos(yaw_i)*a - sin(yaw_i)*y_local, "
+                          "y_i + sin(yaw_i)*a + cos(yaw_i)*y_local); "
+                        + _FORMULA_TAIL
+                        + ". Convention 2 = convention 3 with a = 0")
+
+
+def new_stream_id() -> str:
+    """``gcs-<UTC YYYYmmddTHHMMSSZ>-<4 hex>``: names one imaging stream
+    (generated at every :meth:`SeabedImager.reset`, i.e. every START);
+    ``image_id`` restarts at 0 in each, so ``<stream_id>/<image_id>`` is
+    the image's key for BlueBoat-Perception."""
+    return "gcs-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + \
+        "-" + secrets.token_hex(2)
+
+
+def waterfall_pixel_to_world(x, y, yaw, depth, pitch_m, col, width: int,
+                             lever_port: float = 0.0, lever_stbd: float = 0.0,
+                             lever_x: float = 0.0):
+    """Waterfall pixel -> world position (the documented formula).
+
+    Native slant-bin layout: the column's slant range is
+    ``(k + 0.5) · pitch`` about the centre seam, the row's altitude
+    turns it into ``y_local = ±(lever + sqrt(max(s² − depth², 0)))``
+    (+ port, − starboard), then rotate/translate by the row pose from the
+    transducers' point ``(sx, sy) = (x, y) + R(yaw)·(lever_x, 0)``:
+    ``wx = sx − sin(yaw)·y_local``, ``wy = sy + cos(yaw)·y_local``.
+
+    Georef convention 3 (2026-11-15) passes ``depth`` = the row's tracked
+    bottom, ``*LEVER_ARM_M`` and ``lever_x`` = the row's fore/aft arm
+    (``SonarPing.x_offset_m``). ``lever_x = 0`` is convention 2 (the
+    pictures, clicks and overlay since 2026-10-16) bit for bit, and the
+    defaults (no lever at all) are convention 1 bit for bit.
+
+    Accepts scalars (a waterfall click) or broadcasting numpy arrays
+    (the per-pixel world grids of a whole seabed image). This is the
+    single definition; the waterfall service's detection overlay applies
+    its exact inverse (which no fore/aft arm changes: the arm lies along
+    the heading, the overlay's column is the across-track component).
+    """
+    y_local = slant_col_to_y_local(col, width, pitch_m, depth,
+                                   lever_port, lever_stbd)
+    sx, sy = sensor_point(x, y, yaw, lever_x)
+    return sx - np.sin(yaw) * y_local, sy + np.cos(yaw) * y_local
+
+
+def _opt(v) -> Optional[float]:
+    """JSON value of an optional float: None for NaN / unknown."""
+    v = float(v)
+    return v if math.isfinite(v) else None
 
 
 # ---------------------------------------------------------------------------
@@ -79,19 +242,68 @@ class SeabedImage:
     row_pose: np.ndarray                # (H, 3) x, y, yaw per row
     row_range: np.ndarray               # (H,) swath half-range [m]
     row_speed: np.ndarray               # (H,) boat speed estimate [m/s]
-    row_altitude: np.ndarray            # (H,) water depth / altitude [m]
+    row_altitude: np.ndarray            # (H,) correction altitude [m] (world grid)
+    bin_pitch_m: float = 0.0            # slant metres per column
     detections: List[dict] = field(default_factory=list)
+    #: Tracked bottom per row [m] — the ``h`` of the display model.
+    row_bottom: Optional[np.ndarray] = None
+    #: Source ping of each picture row (index within the imager's window,
+    #: newest-first) and its along-track position [m] from the oldest
+    #: ping of the window; identity / cumulative for "ping" geometry.
+    row_ping_index: Optional[np.ndarray] = None
+    row_along_m: Optional[np.ndarray] = None
+    row_geometry: str = "ping"
+    #: Receive-gain offsets [dB] per row, (H, 2) = (port, starboard): what
+    #: the display model removed (``20·log10(analog_gain / reference)``);
+    #: None / zeros = nothing removed (gain unknown).
+    row_gain_db: Optional[np.ndarray] = None
+    #: The mission display model that maps this tile to pixels (frozen
+    #: snapshot: safe on the save thread). None -> legacy per-image
+    #: 2-98 % stretch of the raw dB (nadir_contrast off).
+    display: Optional[DisplayModelSnapshot] = None
+    #: The imaging stream this picture belongs to (``new_stream_id``).
+    stream_id: str = ""
+    #: How ``world_x``/``world_y`` were computed (``GEOREF``); None =
+    #: convention 1 (a picture assembled by older code).
+    georef: Optional[dict] = None
+    #: Per row (H, 4): roll, pitch, yaw rate, attitude age of the row's
+    #: source ping (NaN = unknown); None = not recorded.
+    row_attitude: Optional[np.ndarray] = None
+    #: Per row (H, 2): the source ping's port / starboard device ping
+    #: numbers (0 = side absent); None = not recorded.
+    row_ping_numbers: Optional[np.ndarray] = None
 
     # ---- derived -------------------------------------------------------------
     def pixel_to_world(self, row: int, col: int) -> Tuple[float, float]:
         return float(self.world_x[row, col]), float(self.world_y[row, col])
 
+    def _bottoms(self) -> np.ndarray:
+        if self.row_bottom is not None:
+            return np.asarray(self.row_bottom, dtype=np.float64)
+        return np.asarray(self.row_altitude, dtype=np.float64)
+
+    def _gains(self) -> np.ndarray:
+        n = self.intensity_db.shape[0]
+        if self.row_gain_db is None:
+            return np.zeros((n, 2), np.float32)
+        return np.asarray(self.row_gain_db, dtype=np.float32).reshape(n, 2)
+
+    def normalised(self) -> np.ndarray:
+        """The model's normalised level ``e`` (raw dB untouched); the raw
+        dB itself when no model applies."""
+        if self.display is None or not self.display.ready:
+            return self.intensity_db
+        return self.display.normalise(self.intensity_db, self.bin_pitch_m,
+                                      self._bottoms(), self._gains())
+
     def to_png8(self) -> np.ndarray:
+        if self.display is not None and self.display.ready:
+            return self.display.to_png8(self.normalised())
         img = self.intensity_db
         finite = np.isfinite(img)
         if not finite.any():
             return np.zeros(img.shape, np.uint8)
-        lo, hi = np.percentile(img[finite], (2.0, 98.0))
+        lo, hi = np.percentile(img[finite], (2.0, 98.0))   # legacy fallback
         hi = max(hi, lo + 1e-6)
         out = np.zeros(img.shape, np.float32)
         out[finite] = np.clip((img[finite] - lo) / (hi - lo), 0, 1)
@@ -99,20 +311,51 @@ class SeabedImage:
 
     def metadata(self) -> dict:
         H, W = self.intensity_db.shape
-        return {
+        n = H
+        ping_index = (self.row_ping_index if self.row_ping_index is not None
+                      else np.arange(n))
+        along = (self.row_along_m if self.row_along_m is not None
+                 else np.zeros(n))
+        bottoms = self._bottoms()
+        gains = self._gains()
+        att = (self.row_attitude if self.row_attitude is not None
+               else np.full((n, 4), np.nan))
+        pns = (self.row_ping_numbers if self.row_ping_numbers is not None
+               else np.zeros((n, 2), np.int64))
+        meta = {
             "schema": SCHEMA_VERSION,
             "image_id": self.image_id,
             "rows": H, "cols": W,
             "t_start_s": float(self.row_t[0]),
             "t_end_s": float(self.row_t[-1]),
+            "bin_pitch_m": float(self.bin_pitch_m),
+            "row_geometry": self.row_geometry,
+            "row_geometry_note": (
+                "square: each row spans one bin_pitch_m along-track and copies "
+                "the nearest ping's bins verbatim (ping_index); its pose is "
+                "interpolated along-track. ping: one row per ping. "
+                "Revert switch: seabed.row_geometry in config/default.yaml."),
+            "display_model": (None if self.display is None or not self.display.ready
+                              else self.display.to_json()),
+            "display_note": (
+                "pixel = round(255*clip(10^(gamma*(e-hi_db)/10),0,1)) with "
+                "e = db + TL(r) - A_side(r/h) from display_model (curves also in "
+                "the companion _world.npz); h = rows_data[i].bottom_m, r = the "
+                "column's slant range. None -> legacy per-image 2-98 % stretch. "
+                "NaN (no sample) -> 0. The raw float dB is in the _world.npz."),
             "pixel_convention": {
-                "row0": "oldest ping", "last_row": "newest ping",
-                "col0": "+range (PORT)", "last_col": "-range (STARBOARD)",
-                "formula": ("y_local(i,j) = row_range[i] * (1 - 2*j/(W-1)); "
-                            "world = (x_i - sin(yaw_i)*y_local, "
-                            "y_i + cos(yaw_i)*y_local); "
-                            "or use the precomputed world_x/world_y grids "
-                            "in the companion _world.npz"),
+                "row0": "newest ping", "last_row": "oldest ping",
+                "col0": "far range (PORT)",
+                "last_col": "far range (STARBOARD)",
+                "domain": "native slant bins (raw waterfall, SonarView "
+                          "convention); centre seam = transducer; the "
+                          "dark centre band is the physical water column, "
+                          "kept in the data and darkened by the display "
+                          "model (not erased)",
+                "formula": (FORMULA_CONVENTION_3
+                            if int((self.georef or {}).get("convention", 0))
+                            >= GEOREF_CONVENTION_FORE_AFT
+                            else FORMULA_CONVENTION_2),
             },
             "rows_data": [
                 {"t_s": float(self.row_t[i]),
@@ -121,12 +364,27 @@ class SeabedImage:
                  "yaw_rad": float(self.row_pose[i, 2]),
                  "range_m": float(self.row_range[i]),
                  "speed_mps": float(self.row_speed[i]),
-                 "altitude_m": float(self.row_altitude[i])}
-                for i in range(H)
+                 "altitude_m": float(self.row_altitude[i]),
+                 "bottom_m": float(bottoms[i]),
+                 "ping_index": int(ping_index[i]),
+                 "along_track_m": float(along[i]),
+                 "gain_port_db": float(gains[i, 0]),
+                 "gain_stbd_db": float(gains[i, 1]),
+                 "roll_rad": _opt(att[i, 0]),
+                 "pitch_rad": _opt(att[i, 1]),
+                 "yaw_rate_rad_s": _opt(att[i, 2]),
+                 "attitude_age_s": _opt(att[i, 3]),
+                 "port_ping_number": int(pns[i, 0]),
+                 "stbd_ping_number": int(pns[i, 1])}
+                for i in range(n)
             ],
             "boat": self.boat_summary(),
             "detections": self.detections,
         }
+        meta["stream_id"] = self.stream_id
+        if self.georef is not None:
+            meta["georef"] = self.georef
+        return meta
 
     def boat_summary(self) -> dict:
         return {
@@ -139,7 +397,9 @@ class SeabedImage:
     def analysis_json(self, png_path: Optional[str],
                       metadata_path: Optional[str]) -> str:
         """The /sss_ai/seabed_analysis payload: metadata + detections,
-        never the pixels (schema documented in HANDOVER)."""
+        never the pixels (schema documented in HANDOVER). ``detections``
+        is always ``[]`` since 2026-10-16: the station's detections come
+        from BlueBoat-Perception on ``/sss_ai/detections``."""
         return json.dumps({
             "schema": SCHEMA_VERSION,
             "image": {
@@ -166,29 +426,36 @@ class SeabedImage:
         cv2.imwrite(str(png), self.to_png8())
         with open(meta_dir / f"{stem}.json", "w", encoding="utf-8") as f:
             json.dump(self.metadata(), f, indent=1)
+        extra = ({} if self.display is None or not self.display.ready
+                 else self.display.npz_items())
         np.savez_compressed(meta_dir / f"{stem}_world.npz",
                             world_x=self.world_x, world_y=self.world_y,
-                            intensity_db=self.intensity_db)
+                            intensity_db=self.intensity_db,
+                            row_altitude_m=np.asarray(self.row_altitude, np.float32),
+                            row_bottom_m=self._bottoms().astype(np.float32),
+                            row_gain_db=self._gains(),
+                            row_ping_index=(np.asarray(self.row_ping_index, np.int32)
+                                            if self.row_ping_index is not None
+                                            else np.arange(self.intensity_db.shape[0],
+                                                           dtype=np.int32)),
+                            **extra)
         return png, meta_dir / f"{stem}.json"
 
 
-# ---------------------------------------------------------------------------
-# Analyzer (dummy until the model exists)
-# ---------------------------------------------------------------------------
-def dummy_center_analyzer(image: SeabedImage) -> List[dict]:
-    """Placeholder AI: 'detects' the center pixel of every image.
+class _SaveJob(QRunnable):
+    """Write one seabed image off the GUI thread (the image is never
+    mutated after emission, so no copy is needed)."""
 
-    Replace with the real model here — the contract is: take a
-    SeabedImage, return a list of detection dicts with at least
-    pixel [row, col], world [x, y], class_name, confidence. Everything
-    downstream (topic payload, map markers, dataset alignment) already
-    consumes this contract.
-    """
-    h, w = image.intensity_db.shape
-    row, col = h // 2, w // 2
-    wx, wy = image.pixel_to_world(row, col)
-    return [{"pixel": [row, col], "world": [wx, wy],
-             "class_name": "dummy_center", "confidence": 0.5}]
+    def __init__(self, image: "SeabedImage", out_dir: Path) -> None:
+        super().__init__()
+        self._image, self._out_dir = image, out_dir
+        self.setAutoDelete(True)
+
+    def run(self) -> None:  # noqa: D401
+        try:
+            self._image.save(self._out_dir)
+        except Exception as exc:  # pragma: no cover - reported, never raised
+            print(f"seabed image save failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -197,150 +464,406 @@ def dummy_center_analyzer(image: SeabedImage) -> List[dict]:
 class SeabedImager(QObject):
     """Sliding-window waterfall imager (live service + offline function)."""
 
-    image_ready = Signal(object)        # SeabedImage (after analysis/save)
+    image_ready = Signal(object)        # SeabedImage (after its save is queued)
 
     def __init__(self, config: AppConfig,
-                 analyzer: Callable[[SeabedImage], List[dict]]
-                 = dummy_center_analyzer) -> None:
+                 model: Optional[DisplayModel] = None) -> None:
         super().__init__()
         self._rows = int(config.seabed.rows)
         self._stride = int(config.seabed.stride)
-        self._cols = int(config.seabed.columns)
-        self._analyzer = analyzer
+        geometry = str(getattr(config.seabed, "row_geometry", "ping")).lower()
+        if geometry not in ("square", "ping"):
+            raise ValueError(f"seabed.row_geometry must be square|ping, got {geometry!r}")
+        self._geometry = geometry
+        # Native slant-bin layout, adopted from the data (seabed.columns
+        # is deprecated: nothing is forced onto a fixed grid any more).
+        self._pitch = 0.0
+        self._half = 0
+        # Fore/aft arm of the buffered pings [m] (SonarPing.x_offset_m):
+        # one value per picture, as the layout is.
+        self._lever_x = 0.0
+        # The window's display model (shared with the waterfall and the
+        # mosaic). Owned only when nothing is injected — then this imager
+        # feeds it itself; a shared model is fed by the waterfall service
+        # (feeding it twice would double-count every row).
+        self._nadir_contrast = bool(config.mosaic.nadir_contrast)
+        self._model = model if model is not None else DisplayModel(config)
+        self._owns_model = model is None
         self._out_dir: Optional[Path] = None
+        self._stream_id = new_stream_id()
         self._next_id = 0
-        self._since_last = 0
+        self._since_last = 0                 # pings since the last emission
         self._buf_rows: List[np.ndarray] = []
-        self._buf_meta: List[tuple] = []    # (t, x, y, yaw, range, depth)
-        self._last_pose: Optional[Tuple[float, float, float]] = None
+        #: per buffered ping: (t, x, y, yaw, range, depth, speed, h, along_m,
+        #: gain_port_db, gain_stbd_db, roll, pitch, yaw_rate, attitude_age_s,
+        #: port_ping_number, stbd_ping_number)
+        self._buf_meta: List[tuple] = []
+        # The one along-track estimator (core/along_track.py): the same
+        # ground speed × ping period the waterfall draws at true scale,
+        # integrated into the cumulative position the square rows sample.
+        self._track = AlongTrackEstimator.from_config(config)
+        self._along = 0.0                    # cumulative along-track [m]
+        self._s_emit: Optional[float] = None # along position of the last emission
         self._emitted_any = False
 
     # ---- live control -----------------------------------------------------------
+    @property
+    def model(self) -> DisplayModel:
+        return self._model
+
     def set_output_dir(self, out_dir: Optional[Path]) -> None:
         """Images are written to disk only while a directory is set
         (i.e. while a recording session is active)."""
         self._out_dir = Path(out_dir) if out_dir is not None else None
 
+    @property
+    def stream_id(self) -> str:
+        """The current imaging stream (new at every :meth:`reset`)."""
+        return self._stream_id
+
+    @property
+    def along_track(self) -> AlongTrackEstimator:
+        """The imager's along-track estimator (the same class, fed the
+        same pings, as the waterfall's — so pitch and speed agree)."""
+        return self._track
+
     def reset(self) -> None:
         self._buf_rows.clear()
         self._buf_meta.clear()
         self._since_last = 0
-        self._last_pose = None
+        self._track.reset()
+        self._along = 0.0
+        self._s_emit = None
         self._next_id = 0
         self._emitted_any = False
+        self._pitch = 0.0
+        self._half = 0
+        self._lever_x = 0.0
+        self._stream_id = new_stream_id()
+        if self._owns_model:
+            self._model.reset()
 
     # ---- ingestion --------------------------------------------------------------
     def on_sonar_ping(self, ping: SonarPing) -> None:
-        y = ping.y_local
-        if y.size < 2:
+        nb = native_bins(ping)
+        if nb is None or nb.extent_bins == 0:
             return
-        r = float(np.abs(y).max())
-        if r <= 0:
+        # One fore/aft arm per picture (its ``georef`` states one): pings
+        # carrying another arm end the current window, as a layout change
+        # does. In practice the arm is constant for a whole stream.
+        arm = float(getattr(ping, "x_offset_m", 0.0))
+        if not math.isfinite(arm):
+            arm = 0.0
+        if arm != self._lever_x:
+            if self._buf_rows:
+                self.break_window()
+            self._lever_x = arm
+        # A training image must be one homogeneous grid: a change of
+        # acquisition (bin pitch or extent) ends the current window and
+        # the next one adopts the new layout.
+        mismatch = (self._pitch > 0.0
+                    and (abs(nb.bin_size_m - self._pitch) > 1e-6 * self._pitch
+                         or nb.extent_bins > self._half))
+        if mismatch:
+            self.break_window()
+        if self._pitch == 0.0 or mismatch:
+            self._pitch = nb.bin_size_m
+            self._half = nb.extent_bins
+        row = build_slant_row(nb, self._pitch, self._half)
+        h = float(ping.bottom_slant_m)
+        if h <= 0.0:
+            h = max(float(ping.water_depth), 0.0)
+        gains = self._model.gain_offsets(ping)
+        if self._owns_model:
+            self._model.observe_row(row, self._pitch, h, gains)
+        # Along-track: ground speed × ping period, integrated (the same
+        # estimate the waterfall draws at true scale, never the raw
+        # per-ping displacement, which repeated poses zero and jitter
+        # inflates — project_review.md §3.1).
+        self._track.observe(float(ping.t), float(ping.robot_x),
+                            float(ping.robot_y))
+        self._along = self._track.advance(float(ping.t))
+        speed = self._track.speed_mps
+        meta = (ping.t, ping.robot_x, ping.robot_y, ping.yaw,
+                self._half * self._pitch, ping.water_depth,
+                speed, h, self._along, gains[0], gains[1],
+                getattr(ping, "roll", math.nan),
+                getattr(ping, "pitch", math.nan),
+                getattr(ping, "yaw_rate", math.nan),
+                getattr(ping, "attitude_age_s", math.nan),
+                getattr(ping, "port_ping_number", 0),
+                getattr(ping, "stbd_ping_number", 0))
+        late = self._late_index(float(ping.t))
+        if late is None:
+            self._buf_rows.append(row)
+            self._buf_meta.append(meta)
+        else:
+            # A ping delivered after newer ones (a late burst over the WiFi
+            # hop, measured 2026-11-02 on the 10-28 pool sessions: ~20 pings
+            # ~1 s late). Appended, it took the NEWEST along-track position
+            # and the nearest-ping pick mixed it into the newest rows (ping
+            # numbers ran ~21 back inside a picture). It goes in at its time
+            # order, its along-track position interpolated in time between
+            # its neighbours, so rows stay chronological.
+            i, s_late = late
+            self._buf_rows.insert(i, row)
+            self._buf_meta.insert(i, meta[:8] + (s_late,) + meta[9:])
+        self._since_last += 1
+        if self._geometry == "ping":
+            # Bound memory to one window.
+            if len(self._buf_rows) > self._rows:
+                self._buf_rows.pop(0)
+                self._buf_meta.pop(0)
+            if (self._since_last >= self._stride
+                    and len(self._buf_rows) >= self._rows):
+                self._since_last = 0
+                self._emitted_any = True
+                self._emit_window(self._rows)
             return
-        col = np.clip(((r - y) / (2 * r) * (self._cols - 1)).astype(np.int32),
-                      0, self._cols - 1)
-        row = np.full(self._cols, np.nan, np.float32)
-        row[col] = ping.intensity_db
-        self._buf_rows.append(row)
-        speed = 0.0
-        if self._last_pose is not None:
-            dt = ping.t - self._last_pose[0]
-            if dt > 1e-3:
-                speed = math.hypot(ping.robot_x - self._last_pose[1],
-                                   ping.robot_y - self._last_pose[2]) / dt
-        self._last_pose = (ping.t, ping.robot_x, ping.robot_y)
-        self._buf_meta.append((ping.t, ping.robot_x, ping.robot_y, ping.yaw,
-                               r, ping.water_depth, speed))
-        # Bound memory to one window.
-        if len(self._buf_rows) > self._rows:
+        # Square geometry: windows are measured in along-track metres.
+        span = self._rows * self._pitch
+        # Bound memory to one window: drop the oldest ping only while the
+        # next one still covers a full window (+ a margin for the nearest
+        # selection at the far end), so the buffer never falls short of
+        # a window between two emissions.
+        while (len(self._buf_meta) > 2
+               and self._along - self._buf_meta[1][8] >= span + 2 * self._pitch):
             self._buf_rows.pop(0)
             self._buf_meta.pop(0)
-        self._since_last += 1
-        if (self._since_last >= self._stride
-                and len(self._buf_rows) >= self._rows):
+        covered = self._along - self._buf_meta[0][8]
+        since = (self._along if self._s_emit is None
+                 else self._along - self._s_emit)
+        if covered >= span and since >= self._stride * self._pitch:
+            self._s_emit = self._along
             self._since_last = 0
             self._emitted_any = True
-            self._emit_window(self._rows)
+            self._emit_square(self._along, self._rows)
+
+    def break_window(self) -> None:
+        """End the current window at a session boundary and start clean.
+
+        A ``.svlog`` may hold several recording sessions. A window that
+        straddles the dead time between two of them produces a single image
+        whose rows are minutes apart, with a fictitious speed spike where the
+        boat "jumped" — a corrupt training sample, and one that looks perfectly
+        ordinary in an annotation tool. Flushing the tail and clearing the
+        buffer keeps every image inside one session. ``_next_id`` is deliberately
+        *not* reset, so image ids stay unique and ordered across the whole log.
+        """
+        self.flush()
+        self._buf_rows.clear()
+        self._buf_meta.clear()
+        self._since_last = 0
+        self._track.reset()
+        self._along = 0.0
+        self._s_emit = None
 
     def flush(self) -> None:
         """Emit the final, possibly truncated picture — no data wasted.
 
         Everything acquired after the last full window ended (or the
         whole buffer if no full window was ever emitted, e.g. a mission
-        shorter than ``rows`` pings) becomes one last image with fewer
-        than ``rows`` rows. Called on Record OFF / STOP (live) and at
-        the end of every offline generation / Run-AI pass.
+        shorter than one window) becomes one last image with fewer rows.
+        Called on Record OFF / STOP (live) and at the end of every offline
+        generation / Run-AI pass.
         """
-        tail = (self._since_last if self._emitted_any
-                else len(self._buf_rows))
-        tail = min(tail, len(self._buf_rows))
-        if tail >= 2:                       # a 1-row "image" is noise
-            self._emit_window(tail)
+        if self._geometry == "ping":
+            tail = (self._since_last if self._emitted_any
+                    else len(self._buf_rows))
+            tail = min(tail, len(self._buf_rows))
+            if tail >= 2:                       # a 1-row "image" is noise
+                self._emit_window(tail)
+            self._since_last = 0
+            return
+        if not self._buf_meta or self._pitch <= 0.0:
+            return
+        since = (self._along - self._buf_meta[0][8] if self._s_emit is None
+                 else self._along - self._s_emit)
+        n = min(int(since / self._pitch) + (1 if self._s_emit is None else 0),
+                self._rows)
+        if n >= 2:
+            self._emit_square(self._along, n)
+        self._s_emit = self._along
         self._since_last = 0
 
     # ---- window assembly -----------------------------------------------------------
     def _emit_window(self, n_rows: int) -> None:
-        image = self._build(self._buf_rows[-n_rows:],
-                            self._buf_meta[-n_rows:], self._next_id)
-        self._next_id += 1
-        image.detections = self._analyzer(image)
-        for det in image.detections:
-            # Timestamp each detection with ITS pixel row's ping time —
-            # this is what lets the waterfall view place the marker on
-            # the exact ping line the object was seen on.
-            r = int(min(max(det["pixel"][0], 0),
-                        image.intensity_db.shape[0] - 1))
-            det["t_s"] = float(image.row_t[r])
-        png_path = meta_path = None
-        if self._out_dir is not None:
-            p, m = image.save(self._out_dir)
-            png_path, meta_path = str(p), str(m)
-        image._png_path = png_path              # transported for publishers
-        image._metadata_path = meta_path
-        self.image_ready.emit(image)
-
-    def _build(self, rows: List[np.ndarray], meta: List[tuple],
-               image_id: int) -> SeabedImage:
-        H, W = len(rows), self._cols
-        arr = np.vstack(rows)
+        """"ping" geometry: the last ``n_rows`` pings, newest first."""
+        rows = self._buf_rows[-n_rows:][::-1]
+        meta = self._buf_meta[-n_rows:][::-1]
+        n = len(meta)
         t = np.array([m[0] for m in meta], np.float64)
         pose = np.array([[m[1], m[2], m[3]] for m in meta], np.float64)
         rng = np.array([m[4] for m in meta], np.float64)
         depth = np.array([m[5] for m in meta], np.float32)
         speed = np.array([m[6] for m in meta], np.float32)
-        # Per-pixel world grids (vectorized over the whole window).
+        bottoms = np.array([m[7] for m in meta], np.float64)
+        along = np.array([m[8] for m in meta], np.float64)
+        along = along - along.min()
+        gains = np.array([[m[9], m[10]] for m in meta], np.float32)
+        att = np.array([m[11:15] for m in meta], np.float64).reshape(n, 4)
+        pns = np.array([m[15:17] for m in meta], np.int64).reshape(n, 2)
+        self._finish(np.vstack(rows), t, pose, rng, depth, speed, bottoms,
+                     np.arange(n), along, gains, att, pns)
+
+    def _late_index(self, t: float) -> Optional[Tuple[int, float]]:
+        """``(insert index, along-track position)`` for a ping older than the
+        newest buffered one, else None (the normal, in-order case)."""
+        if not self._buf_meta or not math.isfinite(t) or t >= self._buf_meta[-1][0]:
+            return None
+        ts = [m[0] for m in self._buf_meta]
+        i = bisect.bisect_right(ts, t)
+        if i == 0:
+            return 0, float(self._buf_meta[0][8])
+        t0, s0 = self._buf_meta[i - 1][0], self._buf_meta[i - 1][8]
+        t1, s1 = self._buf_meta[i][0], self._buf_meta[i][8]
+        f = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
+        return i, float(s0 + f * (s1 - s0))
+
+    def _emit_square(self, s_top: float, n_rows: int) -> None:
+        """"square" geometry: picture row k (0 = newest) sits at along-track
+        position ``s_top - k * pitch`` and copies the nearest ping's bins;
+        pose and time are interpolated along-track between the two pings
+        bracketing it, so the world grids stay continuous."""
+        s = np.array([m[8] for m in self._buf_meta], np.float64)
+        targets = s_top - np.arange(n_rows) * self._pitch
+        targets = np.maximum(targets, s[0])
+        hi = np.clip(np.searchsorted(s, targets), 1, len(s) - 1)
+        lo = hi - 1
+        # nearest ping for the verbatim bins
+        nearest = np.where(np.abs(s[hi] - targets) < np.abs(targets - s[lo]),
+                           hi, lo)
+        arr = np.vstack([self._buf_rows[i] for i in nearest])
+        meta = np.array(self._buf_meta, np.float64)      # (n, 17)
+        span = np.maximum(s[hi] - s[lo], 1e-9)
+        f = np.clip((targets - s[lo]) / span, 0.0, 1.0)
+        f = np.where(s[hi] > s[lo], f, 0.0)
+        def lerp(col):
+            return meta[lo, col] + f * (meta[hi, col] - meta[lo, col])
+        t = lerp(0)
+        x, y = lerp(1), lerp(2)
+        yaw_lo, yaw_hi = meta[lo, 3], meta[hi, 3]
+        dyaw = (yaw_hi - yaw_lo + math.pi) % (2 * math.pi) - math.pi
+        yaw = yaw_lo + f * dyaw
+        pose = np.stack([x, y, yaw], axis=1)
+        rng = meta[nearest, 4]
+        depth = meta[nearest, 5].astype(np.float32)
+        speed = meta[nearest, 6].astype(np.float32)
+        bottoms = meta[nearest, 7]
+        gains = meta[nearest, 9:11].astype(np.float32)
+        # Attitude and ping numbers of each row's source ping (the ping
+        # whose bins the row copies), never interpolated.
+        att = meta[nearest, 11:15]
+        pns = meta[nearest, 15:17].astype(np.int64)
+        self._finish(arr, t, pose, rng, depth, speed, bottoms,
+                     nearest - int(nearest.min()) if nearest.size else nearest,
+                     targets - s[0], gains, att, pns)
+
+    def _finish(self, arr, t, pose, rng, depth, speed, bottoms, ping_index,
+                along, gains, att=None, pns=None) -> None:
+        image = self._build(arr, t, pose, rng, depth, speed, bottoms,
+                            ping_index, along, gains, self._next_id, att, pns)
+        self._next_id += 1
+        png_path = meta_path = None
+        if self._out_dir is not None:
+            # Paths are deterministic (image id), so publishers get them
+            # now; the PNG + npz write (50 ms, 36 ms of it zlib) runs on a
+            # pool thread instead of hitching the GUI every 128 pings.
+            out_dir = Path(self._out_dir)
+            stem = f"seabed_{image.image_id:05d}"
+            png_path = str(out_dir / f"{stem}.png")
+            meta_path = str(out_dir / "metadata" / f"{stem}.json")
+            QThreadPool.globalInstance().start(_SaveJob(image, out_dir))
+        image._png_path = png_path              # transported for publishers
+        image._metadata_path = meta_path
+        self.image_ready.emit(image)
+
+    def _build(self, arr, t, pose, rng, depth, speed, bottoms, ping_index,
+               along, gains, image_id: int, att=None, pns=None) -> SeabedImage:
+        """Assemble the picture (arrays already newest-first)."""
+        W = arr.shape[1]
+        # Per-pixel world grids (vectorized over the whole window), georef
+        # convention 3 (2 when the pings carry no fore/aft arm): each row's
+        # tracked bottom turns its slant columns into ground ranges from
+        # the transducer, which sits the lateral lever arm off the centre
+        # line (the processor's project_side geometry) and the fore/aft arm
+        # along the heading from the row's navigation pose.
         j = np.arange(W, dtype=np.float64)
-        y_local = rng[:, None] * (1.0 - 2.0 * j[None, :] / (W - 1))
-        wx = pose[:, 0:1] - np.sin(pose[:, 2:3]) * y_local
-        wy = pose[:, 1:2] + np.cos(pose[:, 2:3]) * y_local
+        wx, wy = waterfall_pixel_to_world(
+            pose[:, 0:1], pose[:, 1:2], pose[:, 2:3],
+            np.maximum(np.asarray(bottoms, np.float64)[:, None], 0.0),
+            self._pitch, j[None, :], W, *LEVER_ARM_M, lever_x=self._lever_x)
+        # The model snapshot is immutable: safe on the save thread.
+        snap = (self._model.snapshot()
+                if self._nadir_contrast and self._model.ready else None)
         return SeabedImage(
-            image_id=image_id, intensity_db=arr,
+            image_id=image_id, intensity_db=np.ascontiguousarray(arr, np.float32),
             world_x=wx.astype(np.float32), world_y=wy.astype(np.float32),
-            row_t=t, row_pose=pose, row_range=rng,
-            row_speed=speed, row_altitude=depth)
+            row_t=np.asarray(t, np.float64), row_pose=np.asarray(pose, np.float64),
+            row_range=np.asarray(rng, np.float64),
+            row_speed=np.asarray(speed, np.float32),
+            row_altitude=np.asarray(depth, np.float32),
+            bin_pitch_m=self._pitch,
+            row_bottom=np.asarray(bottoms, np.float64),
+            row_ping_index=np.asarray(ping_index, np.int32),
+            row_along_m=np.asarray(along, np.float64),
+            row_geometry=self._geometry,
+            row_gain_db=np.asarray(gains, np.float32).reshape(-1, 2),
+            display=snap,
+            stream_id=self._stream_id,
+            georef=georef_for(self._lever_x),
+            row_attitude=(None if att is None
+                          else np.asarray(att, np.float64).reshape(-1, 4)),
+            row_ping_numbers=(None if pns is None
+                              else np.asarray(pns, np.int64).reshape(-1, 2)))
 
 
 # ---------------------------------------------------------------------------
 # Offline generation (replay window "Save pictures from the log")
 # ---------------------------------------------------------------------------
-def generate_from_pings(pings: Iterable[SonarPing], out_dir: Path,
-                        config: AppConfig,
-                        progress: Optional[Callable[[float], None]] = None,
-                        run_analyzer: bool = False) -> int:
-    """Run the identical imaging code over a decoded log; returns the
-    number of images written to ``out_dir`` (+ inner ``metadata/``)."""
-    imager = SeabedImager(config)
-    imager.set_output_dir(out_dir)
-    if not run_analyzer:
-        imager._analyzer = lambda img: []        # dataset mode: raw images
-    written = []
-    imager.image_ready.connect(lambda img: written.append(img.image_id))
-    pings = list(pings)
+def feed_pings(imager: SeabedImager, pings: Sequence[SonarPing],
+               breaks: Sequence[float] = (),
+               progress: Optional[Callable[[float], None]] = None) -> None:
+    """Feed a decoded log through an imager, breaking at each session boundary.
+
+    ``breaks`` is mission times at which a session ended — normally
+    ``SvlogMission.gap_times``. Every consumer that replays a whole log goes
+    through here so the break rule has one implementation: the offline dataset
+    export and the replay window's AI pass would otherwise drift apart.
+    """
+    pending = sorted(float(b) for b in breaks)
     for k, ping in enumerate(pings):
+        while pending and ping.t > pending[0]:
+            pending.pop(0)
+            imager.break_window()
         if progress is not None and k % 200 == 0:
             progress(k / max(len(pings), 1))
         imager.on_sonar_ping(ping)
     imager.flush()                       # truncated tail: no data wasted
     if progress is not None:
         progress(1.0)
+
+
+def generate_from_pings(pings: Iterable[SonarPing], out_dir: Path,
+                        config: AppConfig,
+                        progress: Optional[Callable[[float], None]] = None,
+                        breaks: Sequence[float] = (),
+                        model: Optional[DisplayModel] = None) -> int:
+    """Run the identical imaging code over a decoded log; returns the
+    number of images written to ``out_dir`` (+ inner ``metadata/``).
+
+    ``model``: the window's fitted display model, so the pictures use the
+    very mapping the replay waterfall shows; fitted here in one pass over
+    the log when not given (the offline export)."""
+    pings = list(pings)
+    if model is None and config.mosaic.nadir_contrast:
+        model = DisplayModel.fit(config, pings)
+    imager = SeabedImager(config, model=model)
+    imager.set_output_dir(out_dir)
+    written = []
+    imager.image_ready.connect(lambda img: written.append(img.image_id))
+    feed_pings(imager, pings, breaks, progress)
+    # Saves run on the pool; an offline export must have its files on
+    # disk when it returns (the caller lists / packages them next).
+    QThreadPool.globalInstance().waitForDone()
     return len(written)

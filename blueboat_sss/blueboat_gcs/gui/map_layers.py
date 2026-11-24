@@ -1,8 +1,17 @@
 """QGraphicsScene layers composing the central map.
 
-Scene convention (see gui/map_view.py): scene = (x_world, -y_world), so
-world +y (North-ish) points up on screen. Every layer converts through
-the module-level ``w2s``/``s2w`` helpers to keep the flip in one place.
+Scene convention (GPS-anchored, ported from BlueBoat-MCS): the scene is
+**local east/north metres about the first accepted GPS fix**, north-up,
+never rotated; scene = (east, -north) so north points up on screen.
+Every layer converts through the module-level ``w2s``/``s2w`` helpers to
+keep the y-flip in one place.
+
+World-anchored layers (mosaic, trajectory, planned path, swath,
+detections, pinger) keep drawing in the robot's world/odom metres but
+live under one :class:`WorldRoot` group whose scene position IS the
+odom->EN translation (``EN = world + t``, mapping/geo.py) — a refit
+moves everything coherently in O(1), and nothing is shown until the
+anchor is valid. Tiles and measurements live directly in the EN scene.
 
 Layer stacking (z-values): satellite tiles are always *below* the SSS
 mosaic — the sonar data remains the primary layer per the specification —
@@ -12,19 +21,20 @@ and annotations (trajectory, detections, pinger, measurements) sit above.
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt
 from PySide6.QtGui import (QBrush, QColor, QFont, QImage, QPainterPath, QPen,
                            QPixmap, QPolygonF, QTransform)
-from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsItemGroup,
-                               QGraphicsLineItem, QGraphicsPathItem,
-                               QGraphicsPixmapItem, QGraphicsPolygonItem,
-                               QGraphicsScene, QGraphicsSimpleTextItem)
+from PySide6.QtWidgets import (QGraphicsEllipseItem, QGraphicsItem,
+                               QGraphicsItemGroup, QGraphicsLineItem,
+                               QGraphicsPathItem, QGraphicsPixmapItem,
+                               QGraphicsPolygonItem, QGraphicsScene,
+                               QGraphicsSimpleTextItem)
 
-from ..mapping.coordinate_converter import CoordinateConverter
+from ..mapping.geo import latlon_to_local_en, local_en_to_latlon
 from ..mapping.tiles import (TILE_SIZE_PX, TileFetcher, TileKey,
-                             latlon_to_tile, tile_to_latlon,
+                             MIN_ZOOM, latlon_to_tile, tile_to_latlon,
                              zoom_for_resolution)
 from ..models.detection import Detection, PingerFix
 from . import theme
@@ -38,6 +48,7 @@ Z_ROBOT = 15.0
 Z_DETECTIONS = 20.0
 Z_PINGER = 25.0
 Z_MEASURE = 30.0
+Z_SELECTION = 35.0       # waterfall-selected point, above everything
 
 
 def w2s(x: float, y: float) -> QPointF:
@@ -50,15 +61,56 @@ def s2w(p: QPointF) -> Tuple[float, float]:
     return p.x(), -p.y()
 
 
+def _attach(scene: QGraphicsScene, item: "QGraphicsItem",
+            parent: Optional["QGraphicsItem"]) -> None:
+    """Add ``item`` to the scene, under ``parent`` when one is given."""
+    if parent is not None:
+        item.setParentItem(parent)
+    else:
+        scene.addItem(item)
+
+
+# ---------------------------------------------------------------------------
+class WorldRoot:
+    """One parent item for every world-anchored layer.
+
+    Its scene position IS the geo-fit translation: ``EN = world + t``
+    (mapping/geo.py) becomes ``setPos(tx, -ty)`` under the scene's
+    y-flip, so children keep drawing in plain world metres through
+    ``w2s`` and a refit moves the mosaic, trajectory, detections,
+    pinger, swath and planned path coherently in O(1).
+
+    Its visibility is the map's readiness gate: hidden (with everything
+    under it) until the GPS anchor is valid.
+    """
+
+    def __init__(self, scene: QGraphicsScene) -> None:
+        self._group = QGraphicsItemGroup()
+        self._group.setHandlesChildEvents(False)
+        self._group.setVisible(False)      # gated until the anchor opens
+        scene.addItem(self._group)
+
+    @property
+    def item(self) -> QGraphicsItemGroup:
+        return self._group
+
+    def set_translation(self, tx: float, ty: float) -> None:
+        self._group.setPos(tx, -ty)
+
+    def set_ready(self, ready: bool) -> None:
+        self._group.setVisible(ready)
+
+
 # ---------------------------------------------------------------------------
 class MosaicLayer:
     """The processed SSS raster — primary layer of the application."""
 
-    def __init__(self, scene: QGraphicsScene) -> None:
+    def __init__(self, scene: QGraphicsScene,
+                 parent: Optional[QGraphicsItem] = None) -> None:
         self._item = QGraphicsPixmapItem()
         self._item.setZValue(Z_MOSAIC)
         self._item.setTransformationMode(Qt.SmoothTransformation)
-        scene.addItem(self._item)
+        _attach(scene, self._item, parent)
 
     def update(self, image: QImage,
                extent: Tuple[float, float, float, float],
@@ -89,14 +141,15 @@ class TrajectoryLayer:
     _MARKER = QPolygonF([QPointF(1.4, 0.0), QPointF(-0.9, 0.7),
                          QPointF(-0.5, 0.0), QPointF(-0.9, -0.7)])
 
-    def __init__(self, scene: QGraphicsScene) -> None:
+    def __init__(self, scene: QGraphicsScene,
+                 parent: Optional[QGraphicsItem] = None) -> None:
         pen = QPen(theme.COLOR_TRAJECTORY, 0)  # cosmetic: 1 px at any zoom
         pen.setCosmetic(True)
         pen.setWidthF(1.6)
         self._path_item = QGraphicsPathItem()
         self._path_item.setPen(pen)
         self._path_item.setZValue(Z_TRAJECTORY)
-        scene.addItem(self._path_item)
+        _attach(scene, self._path_item, parent)
 
         self._marker = QGraphicsPolygonItem(self._MARKER)
         self._marker.setBrush(QBrush(theme.COLOR_ROBOT))
@@ -105,7 +158,7 @@ class TrajectoryLayer:
         mpen.setWidthF(1.5)
         self._marker.setPen(mpen)
         self._marker.setZValue(Z_ROBOT)
-        scene.addItem(self._marker)
+        _attach(scene, self._marker, parent)
 
         self._points: List[Tuple[float, float]] = []
         self._visible = True
@@ -170,11 +223,12 @@ class DetectionLayer:
     """AI detection markers. Fully functional; fed by the placeholder
     listener (ros/detections_listener.py) or the simulator."""
 
-    def __init__(self, scene: QGraphicsScene) -> None:
+    def __init__(self, scene: QGraphicsScene,
+                 parent: Optional[QGraphicsItem] = None) -> None:
         self._scene = scene
         self._group = QGraphicsItemGroup()
         self._group.setZValue(Z_DETECTIONS)
-        scene.addItem(self._group)
+        _attach(scene, self._group, parent)
         self._items: Dict[int, QGraphicsItemGroup] = {}
 
     def upsert(self, det: Detection) -> None:
@@ -220,10 +274,11 @@ class DetectionLayer:
 class PingerLayer:
     """Last known USBL pinger position (single highlighted marker)."""
 
-    def __init__(self, scene: QGraphicsScene) -> None:
+    def __init__(self, scene: QGraphicsScene,
+                 parent: Optional[QGraphicsItem] = None) -> None:
         self._group = QGraphicsItemGroup()
         self._group.setZValue(Z_PINGER)
-        scene.addItem(self._group)
+        _attach(scene, self._group, parent)
 
         pen = QPen(theme.COLOR_PINGER, 0)
         pen.setCosmetic(True)
@@ -266,6 +321,55 @@ class PingerLayer:
     def set_visible(self, visible: bool) -> None:
         self._enabled = visible
         self._group.setVisible(visible and self._has_fix)
+
+
+# ---------------------------------------------------------------------------
+class SelectionLayer:
+    """The point picked in the waterfall view, shown on the world map.
+
+    One diamond + crosshair marker with a lat/lon label, parented to
+    WorldRoot so it takes plain world metres (same convention as
+    PingerLayer) and follows anchor refits for free.
+    """
+
+    _COLOR = QColor(80, 220, 255)      # matches the waterfall crosshair
+
+    def __init__(self, scene: QGraphicsScene,
+                 parent: Optional[QGraphicsItem] = None) -> None:
+        self._group = QGraphicsItemGroup()
+        self._group.setZValue(Z_SELECTION)
+        _attach(scene, self._group, parent)
+
+        pen = QPen(self._COLOR, 0)
+        pen.setCosmetic(True)
+        pen.setWidthF(2.0)
+        s = 1.0                        # diamond half-size, metres
+        self._diamond = QGraphicsPolygonItem(QPolygonF(
+            [QPointF(0, -s), QPointF(s, 0), QPointF(0, s), QPointF(-s, 0)]))
+        self._diamond.setPen(pen)
+        self._diamond.setBrush(QBrush(QColor(80, 220, 255, 40)))
+        self._cross_h = QGraphicsLineItem(-1.8 * s, 0, 1.8 * s, 0)
+        self._cross_v = QGraphicsLineItem(0, -1.8 * s, 0, 1.8 * s)
+        for line in (self._cross_h, self._cross_v):
+            line.setPen(pen)
+        self._label = QGraphicsSimpleTextItem()
+        self._label.setBrush(QBrush(self._COLOR))
+        self._label.setFont(QFont("DejaVu Sans", 8))
+        self._label.setFlag(QGraphicsItem.ItemIgnoresTransformations)
+        self._label.setPos(1.4 * s, -2.2 * s)
+        for item in (self._diamond, self._cross_h, self._cross_v,
+                     self._label):
+            self._group.addToGroup(item)
+        self._group.setVisible(False)
+
+    def show_at(self, x: float, y: float, label: str = "") -> None:
+        """Place the marker at world (x, y) with an optional text label."""
+        self._group.setPos(w2s(x, y))
+        self._label.setText(label)
+        self._group.setVisible(True)
+
+    def clear(self) -> None:
+        self._group.setVisible(False)
 
 
 # ---------------------------------------------------------------------------
@@ -324,8 +428,10 @@ class MeasureLayer:
 
 # ---------------------------------------------------------------------------
 class SwathLayer:
-    """Current sonar acquisition range: a thin white line through the robot,
-    perpendicular to its heading, spanning ±range.
+    """Current sonar acquisition range: a thin white line through the
+    transducers' point (the caller passes ``SonarPing.sensor_x/y``, the
+    navigation point moved by the fore/aft arm), perpendicular to the
+    heading, spanning ±range.
 
     The extent is derived from the actual samples of every ping
     (max |y_local|), so it always reflects the *current* sonar
@@ -333,7 +439,8 @@ class SwathLayer:
     — no configuration duplication in the GUI.
     """
 
-    def __init__(self, scene: QGraphicsScene) -> None:
+    def __init__(self, scene: QGraphicsScene,
+                 parent: Optional[QGraphicsItem] = None) -> None:
         pen = QPen(QColor(255, 255, 255, 210), 0)
         pen.setCosmetic(True)          # thin (1 px) at any zoom level
         pen.setWidthF(1.0)
@@ -341,7 +448,7 @@ class SwathLayer:
         self._line.setPen(pen)
         self._line.setZValue(Z_SWATH)
         self._line.setVisible(False)   # nothing to show until a ping arrives
-        scene.addItem(self._line)
+        _attach(scene, self._line, parent)
         self._enabled = True
         self._has_data = False
 
@@ -376,23 +483,29 @@ class PlannedPathLayer:
     previous path.
     """
 
-    def __init__(self, scene: QGraphicsScene) -> None:
+    def __init__(self, scene: QGraphicsScene,
+                 parent: Optional[QGraphicsItem] = None) -> None:
         pen = QPen(theme.COLOR_PLANNED_PATH, 0)
         pen.setCosmetic(True)
         pen.setWidthF(1.2)
         self._item = QGraphicsPathItem()
         self._item.setPen(pen)
         self._item.setZValue(Z_PLANNED_PATH)
-        scene.addItem(self._item)
+        _attach(scene, self._item, parent)
+        self._last_points = None
 
     def set_path(self, points) -> None:
         """Replace the displayed path with ((x, y), ...) in world metres."""
+        if points == self._last_points:
+            return                # verbatim re-send: no rebuild, no repaint
+        self._last_points = points
         path = QPainterPath()
         for i, (x, y) in enumerate(points):
             (path.moveTo if i == 0 else path.lineTo)(w2s(x, y))
         self._item.setPath(path)
 
     def clear(self) -> None:
+        self._last_points = None
         self._item.setPath(QPainterPath())
 
     def set_visible(self, visible: bool) -> None:
@@ -401,89 +514,122 @@ class PlannedPathLayer:
 
 # ---------------------------------------------------------------------------
 class TileLayer:
-    """Satellite / street background, placed in the local metric frame.
+    """Satellite / street background, pinned to the geographic origin.
 
-    Only active once the GPS origin is bound (before that there is nothing
-    to georeference). Tiles for the current zoom level replace tiles of the
+    Placed directly in the EN scene from ``(lat0, lon0)`` alone — never
+    through the odom translation ``t`` — so imagery never slides when
+    the anchor refits (the MCS rule). Only active once the anchor
+    exists. Tiles for the current zoom level replace tiles of the
     previous one as they arrive, which keeps zoom transitions smooth.
+
+    Where the provider has no imagery at the wanted zoom (HTTP 4xx or its
+    grey placeholder, flagged by the fetcher), the layer falls back to the
+    finest coarser zoom and magnifies it; coarser tiles also stay underneath
+    the current zoom while it loads.
     """
 
     MAX_TILES_PER_UPDATE = 96
 
     def __init__(self, scene: QGraphicsScene, fetcher: TileFetcher,
-                 converter: CoordinateConverter) -> None:
+                 origin_provider: Callable[[], Optional[Tuple[float, float]]]
+                 ) -> None:
         self._scene = scene
         self._fetcher = fetcher
-        self._converter = converter
+        self._origin = origin_provider     # () -> (lat0, lon0) | None
         self._items: Dict[TileKey, QGraphicsPixmapItem] = {}
         self._zoom: Optional[int] = None
         self._visible = True
+        self._last_view: Optional[Tuple[QRectF, float]] = None
         fetcher.tile_ready.connect(self._on_tile_ready)
+        fetcher.tile_missing.connect(self._on_tile_missing)
 
     # -- viewport driven update ------------------------------------------------
-    def update_viewport(self, world_rect: QRectF, metres_per_px: float) -> None:
-        """Ensure tiles covering ``world_rect`` (world metres, y-up) exist."""
-        if not (self._visible and self._converter.ready):
+    def update_viewport(self, en_rect: QRectF, metres_per_px: float) -> None:
+        """Ensure tiles covering ``en_rect`` (EN metres, y-up) exist."""
+        origin = self._origin()
+        if not (self._visible and origin is not None):
             return
-        origin = self._converter.origin
-        assert origin is not None
-        z = zoom_for_resolution(origin[0], metres_per_px)
+        self._last_view = (en_rect, metres_per_px)
+        lat0, lon0 = origin
+        z = zoom_for_resolution(lat0, metres_per_px)
+
+        def needed(zoom: int) -> list:
+            # EN rect corners -> lat/lon -> tile index range.
+            corners = [(en_rect.left(), en_rect.top()),
+                       (en_rect.right(), en_rect.bottom())]
+            txs, tys = [], []
+            for east, north in corners:
+                lat, lon = local_en_to_latlon(east, north, lat0, lon0)
+                tx, ty = latlon_to_tile(lat, lon, zoom)
+                txs.append(tx)
+                tys.append(ty)
+            x0, x1 = int(math.floor(min(txs))), int(math.floor(max(txs)))
+            y0, y1 = int(math.floor(min(tys))), int(math.floor(max(tys)))
+            n = 2 ** zoom
+            return [(zoom, tx, ty)
+                    for tx in range(max(0, x0), min(n - 1, x1) + 1)
+                    for ty in range(max(0, y0), min(n - 1, y1) + 1)
+                    ][:self.MAX_TILES_PER_UPDATE]
+
+        # Every tile of this view known to be missing: use the next coarser
+        # zoom, whose loaded tiles are simply magnified.
+        keys = needed(z)
+        while z > MIN_ZOOM and keys and all(
+                self._fetcher.is_missing(k) for k in keys):
+            z -= 1
+            keys = needed(z)
 
         if z != self._zoom:
-            self._drop_other_zooms(z)
             self._zoom = z
+            self._drop_far_zooms()
+            for key, item in self._items.items():
+                item.setVisible(self._visible and self._shown(key[0]))
 
-        # World rect corners -> lat/lon -> tile index range.
-        corners = [(world_rect.left(), world_rect.top()),
-                   (world_rect.right(), world_rect.bottom())]
-        txs, tys = [], []
-        for wx, wy in corners:
-            gps = self._converter.local_to_gps(wx, wy)
-            if gps is None:
-                return
-            tx, ty = latlon_to_tile(gps[0], gps[1], z)
-            txs.append(tx)
-            tys.append(ty)
-        x0, x1 = int(math.floor(min(txs))), int(math.floor(max(txs)))
-        y0, y1 = int(math.floor(min(tys))), int(math.floor(max(tys)))
-        n = 2 ** z
+        for key in keys:
+            if key in self._items or self._fetcher.is_missing(key):
+                continue
+            img = self._fetcher.request(key)
+            if img is not None:
+                self._place_tile(key, img)
 
-        count = 0
-        for tx in range(max(0, x0), min(n - 1, x1) + 1):
-            for ty in range(max(0, y0), min(n - 1, y1) + 1):
-                if count >= self.MAX_TILES_PER_UPDATE:
-                    return
-                count += 1
-                key = (z, tx, ty)
-                if key in self._items:
-                    continue
-                img = self._fetcher.request(key)
-                if img is not None:
-                    self._place_tile(key, img)
+    def _shown(self, z: int) -> bool:
+        # Coarser tiles stay underneath (finer ones cover them), so the view
+        # is never blank while a finer zoom loads or has no imagery.
+        return self._zoom is not None and self._zoom - 3 <= z <= self._zoom
 
     def _on_tile_ready(self, z: int, x: int, y: int, img: QImage) -> None:
-        if z == self._zoom and (z, x, y) not in self._items:
+        if self._shown(z) and (z, x, y) not in self._items:
             self._place_tile((z, x, y), img)
 
+    def _on_tile_missing(self, z: int, x: int, y: int) -> None:
+        item = self._items.pop((z, x, y), None)      # a placeholder drawn early
+        if item is not None:
+            self._scene.removeItem(item)
+        if self._last_view is not None:
+            self.update_viewport(*self._last_view)
+
     def _place_tile(self, key: TileKey, img: QImage) -> None:
-        z, tx, ty = key
-        nw = self._converter.gps_to_local(*tile_to_latlon(tx, ty, z))
-        se = self._converter.gps_to_local(*tile_to_latlon(tx + 1, ty + 1, z))
-        if nw is None or se is None:
+        origin = self._origin()
+        if origin is None:
             return
+        lat0, lon0 = origin
+        z, tx, ty = key
+        nw = latlon_to_local_en(*tile_to_latlon(tx, ty, z), lat0, lon0)
+        se = latlon_to_local_en(*tile_to_latlon(tx + 1, ty + 1, z),
+                                lat0, lon0)
         item = QGraphicsPixmapItem(QPixmap.fromImage(img))
-        item.setZValue(Z_TILES)
+        item.setZValue(Z_TILES + 0.01 * z)       # finer tiles over coarser
         item.setTransformationMode(Qt.SmoothTransformation)
-        item.setPos(w2s(nw[0], nw[1]))  # NW corner; world y decreases southward
+        item.setPos(w2s(nw[0], nw[1]))  # NW corner; north decreases southward
         sx = (se[0] - nw[0]) / TILE_SIZE_PX
         sy = (nw[1] - se[1]) / TILE_SIZE_PX  # scene y grows downward
         item.setTransform(QTransform.fromScale(sx, sy))
-        item.setVisible(self._visible)
+        item.setVisible(self._visible and self._shown(z))
         self._scene.addItem(item)
         self._items[key] = item
 
-    def _drop_other_zooms(self, keep_zoom: int) -> None:
-        for key in [k for k in self._items if k[0] != keep_zoom]:
+    def _drop_far_zooms(self) -> None:
+        for key in [k for k in self._items if not self._shown(k[0])]:
             self._scene.removeItem(self._items.pop(key))
 
     def set_visible(self, visible: bool) -> None:

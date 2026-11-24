@@ -5,9 +5,16 @@ Side Scan Sonar processor node for the BlueBoat.
 Two responsibilities, both consumers of the side scan sonar streams:
 
 1. **Processing.** Consume parsed `OmniscanProfile` packets from the port +
-   starboard transducers and produce one merged `ProcessedSSSPing` per
-   matched pair: dB-scaled samples, FBR-based altitude tracking, slant-range
+   starboard transducers and produce one `ProcessedSSSPing` per acquired
+   ping: dB-scaled samples, FBR-based altitude tracking, slant-range
    correction, water-column drop, robot pose snapped from /blueboat/odom.
+
+   Rows are assembled by `ping_number`, normalised across the two devices
+   (they are independent units with independent counters). A row is emitted
+   with whichever sides arrived; one-sided rows are published rather than
+   discarded, and no ping is withheld while the altitude tracker bootstraps
+   (NON-NEGOTIABLE #2). The only ping that does not reach the output is one
+   with no `/blueboat/odom` pose to place it at.
 
 2. **SonarView .svlog logging.** Consume the raw framed packets published
    on `~/raw` topics by `sss_node`, interleave them with mavlink wrapper
@@ -33,19 +40,44 @@ Sub  /mavros/imu/data                      sensor_msgs/Imu
 Sub  /mavros/global_position/global        sensor_msgs/NavSatFix
 Sub  /mavros/global_position/rel_alt       std_msgs/Float64
 Sub  /mavros/global_position/compass_hdg   std_msgs/Float64
+Sub  /mavros/state                         mavros_msgs/State       (HEARTBEAT)
+Sub  /mavros/statustext/recv               mavros_msgs/StatusText  (STATUSTEXT)
 Sub  ~/log/enable                          std_msgs/Bool
 Pub  ~/processed                           blueboat_interfaces/ProcessedSSSPing
+Cli  /mavros/set_message_interval          mavros_msgs/MessageInterval
+
+Mavlink rates (2026-10-27). While the sonar streams, the node asks the
+autopilot for SonarView's exact message-interval set (DEFAULT_PERIODIC_MESSAGES:
+ATTITUDE, LOCAL_POSITION_NED, GLOBAL_POSITION_INT at 30 Hz, ...) and repeats
+the request every 30 s, because an autopilot reboot resets intervals. Since
+2026-11-03 it is also renewed as soon as the measured pose rate falls below
+POSE_RATE_WARN_HZ: on the 2026-10-28 water run the 30 Hz held only ~9 s of
+every 30 s period (something resets the intervals; not identified). The
+request is autopilot-wide: every /mavros/* consumer, BlueBoat-Control's
+/blueboat/odom included, gets the higher rate (about 13 Hz delivered,
+measured with SonarView). Absent the service (simulation) it is skipped.
+
+Parameters
+----------
+transducer_x_offset_m   float, default TRANSDUCER_X_OFFSET_M (-0.345). Fore/aft
+    arm of the two transducers from the pose /blueboat/odom reports, in metres,
+    + forward. Published unchanged in every ProcessedSSSPing.transducer_x_offset
+    so a consumer places the ping from the transducers' point
+    (pose + R(yaw) . (arm, 0)) without knowing this node's constants. A bag of
+    a session processed before 2026-11-15 is re-processed as it was then with
+    ``transducer_x_offset_m:=0.0`` (SSS_processing_launch.py forwards it).
 """
 
 from __future__ import annotations
 
 import math
 import os
+import struct
 import sys
 from datetime import datetime
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from pathlib import Path
 from typing import Deque, Optional, Tuple
 
@@ -58,13 +90,17 @@ from typing import Deque, Optional, Tuple
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from builtin_interfaces.msg import Time as TimeMsg
 from geographic_msgs.msg import GeoPointStamped
 from geometry_msgs.msg import PoseStamped, TwistStamped
-from mavros_msgs.msg import HomePosition, VfrHud
+from mavros_msgs.msg import HomePosition, State, StatusText, VfrHud
+from mavros_msgs.srv import MessageInterval
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, NavSatFix
 from std_msgs.msg import Bool, Float64, UInt8MultiArray
@@ -73,18 +109,23 @@ from blueboat_interfaces.msg import OmniscanProfile, ProcessedSSSPing
 
 from svlog_helper import (
     DEFAULT_MAVLINK_FILTER,
+    DEFAULT_PERIODIC_MESSAGES,
     DEVICE_ID_PORT,
     DEVICE_ID_STBD,
+    OS_MONO_PROFILE_ID,
     SvlogWriter,
     build_mavlink_wrapper,
     build_session_metadata,
+    build_view_config,
     retag_packet_src_device_id,
 )
 from sss_helper import (
     FBRTracker,
+    PingCounterOffset,
     detect_fbr_slant_m,
     project_side,
     scale_to_db,
+    side_from_fields,
 )
 
 from math_helper import (
@@ -94,14 +135,35 @@ from math_helper import (
 
 
 # ---------------------------------------------------------------------------
-# Transducer geometry -- measure on the physical BlueBoat and fill in.
-# All in meters, expressed in base_link (REP-103: +x forward, +y left = port,
-# +z up). y offsets are positive magnitudes; port/starboard sign is in code.
+# OS_MONO_PROFILE frame offsets, used to read side identity straight out of the
+# raw framed packet (8-byte Ping-Protocol header + payload offset).
+# NON-NEGOTIABLE #1: side identity comes from the packet, never from the topic
+# it arrived on nor from the src tag already in the frame.
 # ---------------------------------------------------------------------------
-TRANSDUCER_X_OFFSET_M:      float = 0.0  # TODO: forward offset (probably negative)
-TRANSDUCER_Y_OFFSET_PORT_M: float = 0.0  # TODO: lateral offset of port transducer
-TRANSDUCER_Y_OFFSET_STBD_M: float = 0.0  # TODO: lateral offset of starboard transducer
-TRANSDUCER_SUBMERSION_M:    float = 0.0  # TODO: depth below the waterline
+CHANNEL_BYTE: int = 34   # payload offset 26, uint8: 0 = port, 1 = starboard
+HEADING_BYTE: int = 52   # payload offset 44, float32 LE: transducer_heading_deg
+
+
+# ---------------------------------------------------------------------------
+# Transducer geometry. All in meters, expressed in base_link (REP-103: +x
+# forward, +y left = port, +z up). y offsets are positive magnitudes;
+# port/starboard sign is in code.
+#
+# One set of values in the processor, the GCS (blueboat_gcs/core/svlog.py)
+# and the simulator (BlueBoat-SSS-Sim config/default_sonar.yaml `model:`,
+# the single source of every profile); tests/test_fore_aft_arm.py holds the
+# three together. Status 2026-11-15: ADOPTED from the simulator's file, not
+# measured on the boat (~/ros2_ws/sim_runs/sim_acceptance/
+# owner_measurements.yaml says so; the pool corpus read -0.60 m from the
+# navigation fix against -0.345 m on the drawing, unresolved).
+#
+# TRANSDUCER_X_OFFSET_M is the DEFAULT of the node parameter
+# `transducer_x_offset_m`; the other three are constants.
+# ---------------------------------------------------------------------------
+TRANSDUCER_X_OFFSET_M:      float = -0.345  # ADOPTED 2026-11-15 = sim model.mount_x_m (rear-most hull mounting holes, 0.345 m aft of the hull centre, BlueBoat.dae); was 0.0 ("assumed amidships")
+TRANSDUCER_Y_OFFSET_PORT_M: float = 0.285  # hull centreline, BR-101447: 570 mm / 2
+TRANSDUCER_Y_OFFSET_STBD_M: float = 0.285  # same, magnitude (sign is in code)
+TRANSDUCER_SUBMERSION_M:    float = 0.22  # MEASURED 2026-11-02 (SSS-Sim field-calibration pass 3: rear-most hull holes 0.030 m above the keel, waterline 0.216-0.241 m at 16-22 kg, the 0.90 m pool reproduces the FBR altitude to +-0.03 m) = sim sensor_depth_m; was 0.15 (estimate)
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +173,9 @@ NOISE_FLOOR_WINDOW:       int   = 20    # samples used to estimate noise floor
 FBR_THRESHOLD_DELTA_DB:   float = 8.0   # dB above noise floor
 WITHIN_PING_PERSISTENCE:  int   = 3     # consecutive samples above threshold
 
-RINGING_SEARCH_MAX:       int   = 60    # search horizon in samples (1.5 m at 25 mm/sample)
+RINGING_SEARCH_MAX:       int   = 60    # search horizon in SAMPLES, not metres: its physical
+                                        # reach scales with range_length_mm / num_results.
+                                        # 2.0 m at the 33.3 mm/sample default (20 m / 600).
 RINGING_DROP_DB:          float = 10.0  # how far below the ringing peak counts as 'settled'
 RINGING_PERSISTENCE:      int   = 5     # consecutive samples below target
 
@@ -120,8 +184,99 @@ ALTITUDE_AGREEMENT_TOL_M: float = 0.30  # max spread within a side's bootstrap w
 ALTITUDE_OUTLIER_TOL_M:   float = 1.0   # post-lock per-ping jump rejected as outlier
 ALTITUDE_RELOCK_AFTER:    int   = 15    # consecutive rejects force a side to re-bootstrap
 
-TIME_MATCH_TOLERANCE_NS:  int   = 50_000_000  # port-vs-starboard pairing window
 ODOM_BUFFER_SECONDS:      float = 5.0
+# Maximum |odom stamp - profile stamp| for a pose to be usable. Without
+# it, a dead or clock-mismatched /blueboat/odom left the buffer's last
+# sample latched and EVERY ping was stamped with that one stale pose --
+# the "pings pile on one point" field bug. Past the tolerance the ping
+# takes the sanctioned missing-pose drop (NON-NEGOTIABLE #2) with a
+# warning naming the measured skew, instead of a silently wrong pose.
+# 1 s = ~20 odom periods: generous against jitter, tiny against the
+# minutes-scale skews of a genuine clock mismatch.
+ODOM_NEAREST_TOLERANCE_S: float = 1.0
+
+# ---------------------------------------------------------------------------
+# Row assembly (NON-NEGOTIABLE #2: never drop a ping).
+#
+# Rows are keyed on `ping_number`, normalised across the two devices by
+# `PingCounterOffset`. The two Omniscan units are independent devices with
+# independent counters whose relative offset is arbitrary but constant per
+# power-up (0, -1 and +60 all measured in the field corpus -- see
+# blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md), so the raw counter is not a
+# usable cross-side key on its own.
+#
+# A group is emitted as soon as both sides are in it. An incomplete group is
+# emitted ONE-SIDED once it falls too far behind, by ping number or by wall
+# clock, whichever comes first -- never discarded, and never held forever.
+# ---------------------------------------------------------------------------
+ASSEMBLY_MAX_LAG_PINGS:   int   = 128          # 2x the worst measured in-flight lag (63)
+ASSEMBLY_MAX_LAG_NS:      int   = 1_000_000_000
+ASSEMBLY_MAX_GROUPS:      int   = 256          # hard cap; oldest is force-flushed
+ASSEMBLY_FLUSH_PERIOD_S:  float = 0.2          # tail flush when the stream stops
+OFFSET_VOTE_WINDOW:       int   = 64
+OFFSET_VOTE_DEFER:        int   = 4            # below this the estimator goes bimodal
+# The estimator needs a few pings before it has voted at all. Pings that
+# arrive first are held rather than keyed at a provisional offset, because
+# keying them wrongly splits their rows -- and the start of the mission is
+# exactly what NON-NEGOTIABLE #2 exists to protect. The cap bounds the hold
+# for a single-transducer run, where no vote is ever cast.
+OFFSET_MIN_VOTES:         int   = 8
+OFFSET_PREROLL_MAX:       int   = 24
+# A key that falls this far *behind* the newest one seen is not a late
+# arrival (the worst measured in-flight lag is 63): a device restarted its
+# counter (power cycle, or the simulator relaunched under a running
+# processor). The stale high-water mark would otherwise evict every new
+# group on its next arrival and tear every row in two -- measured on
+# 2026-09-03: 7464 one-sided rows, every device ping published twice as a
+# half-row -- so the assembly re-bases: pending groups are drained, the
+# counter offset is re-learned through the pre-roll, and the mark restarts.
+COUNTER_RESTART_PINGS:    int   = ASSEMBLY_MAX_LAG_PINGS
+# Torn-row alarm: share of one-sided rows over this many recent emissions
+# above which the node warns once (a healthy two-sided stream sits near 0;
+# a single lost half here and there never reaches it).
+TORN_WINDOW_ROWS:         int   = 100
+TORN_WARN_SHARE:          float = 0.25
+
+# ---------------------------------------------------------------------------
+# SonarView parity (2026-10-27): mavlink rates, burst stamps, rate watchdog.
+# ---------------------------------------------------------------------------
+MAVLINK_RATE_SERVICE:      str   = "/mavros/set_message_interval"
+MAVLINK_RATE_REASSERT_S:   float = 30.0   # an autopilot reboot resets intervals
+SONAR_ACTIVE_WINDOW_S:     float = 5.0    # "the sonar is streaming" = a profile this recent
+# mavros stamps 0 on a real launch (use_sim_time, no /clock). Messages whose
+# arrivals fall within this window of the first share one time_boot_ms, the
+# way one autopilot burst does -- SonarView pairs ATTITUDE /
+# GLOBAL_POSITION_INT / LOCAL_POSITION_NED on equal values.
+MAVLINK_BURST_WINDOW_NS:   int   = 5_000_000
+RATE_WATCH_PERIOD_S:       float = 10.0
+# A watchdog window shorter than this (the first one after Record ON, which
+# opens at the first logged envelope) is carried into the next tick instead
+# of being judged: one message in 0.3 s is no rate.
+RATE_WATCH_MIN_S:          float = 5.0
+# Follow a /clock that appears after start-up (2026-11-09, _follow_clock):
+# checked on the steady clock; wall time again after this long without one.
+CLOCK_FOLLOW_PERIOD_S:     float = 1.0
+CLOCK_FOLLOW_LOST_S:       float = 5.0
+# SonarView's recordings carry ~12.8 Hz of each pose message for its 30 Hz
+# request; the autopilot default without a request is 4 Hz.
+POSE_RATE_WARN_HZ:         float = 10.0
+# Renewal of the rate request (2026-11-03): on the 2026-10-28 water run the
+# autopilot delivered 30 Hz for ~9 s of every 30 s re-assert period and 4 Hz
+# for the rest -- something resets the intervals (cause not identified,
+# TODO.md). The slowest of ATTITUDE / GPI / LPN is measured over a trailing
+# POSE_RENEW_WINDOW_S, recording or not, and the request is renewed when it
+# is below POSE_RATE_WARN_HZ, at most once per POSE_RENEW_HOLDOFF_S (longer
+# than the window, so the rate judged was measured after the last request).
+# MAVLINK_RATE_REASSERT_S stays the fallback.
+POSE_RENEW_WINDOW_S:       float = 3.0
+POSE_RENEW_HOLDOFF_S:      float = 5.0
+POSE_MESSAGES:             Tuple[str, ...] = (
+    "ATTITUDE", "GLOBAL_POSITION_INT", "LOCAL_POSITION_NED")
+# Ping period SonarView commands: max(50 ms, 2R/c + ~3 ms).
+SONARVIEW_MSEC_PER_PING:   float = 50.0
+DEVICE_PROCESSING_MS:      float = 3.0
+SOUND_SPEED_MPS:           float = 1500.0
+PING_RATE_TOLERANCE:       float = 0.10
 
 # ---------------------------------------------------------------------------
 # Odom buffer
@@ -131,14 +286,54 @@ class _OdomBuffer:
     lookup. A linear scan is fine: at 20 Hz odom + 5 s window, ~100 entries.
     """
 
-    def __init__(self, max_age_ns: int) -> None:
+    def __init__(self, max_age_ns: int,
+                 tolerance_ns: int = int(ODOM_NEAREST_TOLERANCE_S * 1e9)
+                 ) -> None:
         self._max_age_ns = max_age_ns
+        self._tolerance_ns = tolerance_ns
         self._samples: Deque[Tuple[int, Odometry]] = deque()
         self._lock = threading.Lock()
+        #: |odom - profile| of the last refused lookup [ns]; the caller
+        #: reads it to name the measured skew in its warning.
+        self.last_refused_dt_ns: Optional[int] = None
+        #: samples ever pushed / pushed with a zero header stamp. Lets the
+        #: caller tell "never received" from "received, then pruned".
+        self.pushed = 0
+        self.zero_stamped = 0
+        #: samples discarded because the clock went back by more than the
+        #: window (a new time epoch; see push()).
+        self.epoch_dropped = 0
 
-    def push(self, msg: Odometry) -> None:
+    def push(self, msg: Odometry, arrival_ns: Optional[int] = None) -> None:
+        """Buffer one sample under its header stamp.
+
+        A zero stamp is keyed on ``arrival_ns`` instead (when given): on a
+        real-robot launch mavros runs with ``use_sim_time`` and no /clock,
+        so ``/blueboat/odom`` is stamped 0 while the sonar profiles carry
+        the node's wall clock. Keyed on 0, the sample was pruned by the
+        first lookup and every ping was dropped.
+
+        A sample more than the window *behind* the newest one opens a new
+        time epoch, and the samples outside the window around it are
+        discarded. Seen in a replay (2026-10-28): one zero-stamped odom
+        before /clock was keyed on wall time (~1.79e18 ns), every later one
+        on sim time; the wall sample sat at the head of the deque, the
+        head-only pruning here and in nearest() never got past it, and the
+        buffer grew without bound. The keying rules above are unchanged:
+        only a sample that can no longer be compared with the new clock goes.
+        """
         ts = stamp_to_ns(msg.header.stamp)
         with self._lock:
+            self.pushed += 1
+            if ts == 0:
+                self.zero_stamped += 1
+                if arrival_ns is not None:
+                    ts = arrival_ns
+            if self._samples and ts < self._samples[-1][0] - self._max_age_ns:
+                kept = deque(s for s in self._samples
+                             if abs(s[0] - ts) <= self._max_age_ns)
+                self.epoch_dropped += len(self._samples) - len(kept)
+                self._samples = kept
             self._samples.append((ts, msg))
             cutoff = ts - self._max_age_ns
             while self._samples and self._samples[0][0] < cutoff:
@@ -149,7 +344,20 @@ class _OdomBuffer:
             return bool(self._samples)
 
     def nearest(self, target_ns: int) -> Optional[Odometry]:
+        """The sample nearest ``target_ns``, or None when nothing lies
+        within the tolerance.
+
+        Pruning also happens here, against the *lookup* stamp: ``push``
+        prunes against arrival, so a topic that went silent kept its
+        last samples forever and served the same stale pose to every
+        later ping. A ping whose nearest pose is farther than the
+        tolerance is unplaceable and takes the sanctioned drop instead
+        (NON-NEGOTIABLE #2 — a missing pose is the one legitimate drop).
+        """
         with self._lock:
+            cutoff = target_ns - self._max_age_ns
+            while self._samples and self._samples[0][0] < cutoff:
+                self._samples.popleft()
             if not self._samples:
                 return None
             best_ts, best_msg = self._samples[0]
@@ -158,7 +366,136 @@ class _OdomBuffer:
                 dt = abs(ts - target_ns)
                 if dt < best_dt:
                     best_ts, best_msg, best_dt = ts, msg, dt
+            if best_dt > self._tolerance_ns:
+                self.last_refused_dt_ns = best_dt
+                return None
             return best_msg
+
+    def pose_at(self, target_ns: int) -> Optional[Odometry]:
+        """The pose at ``target_ns``, interpolated between the two samples
+        that bracket it; ``nearest()`` (same tolerance, same refusal) when
+        none do.
+
+        The real /blueboat/odom arrives at 4 Hz without a rate request and
+        ~13 Hz with SonarView's: snapping a 20 Hz ping to the nearest sample
+        stepped the track by up to 25 cm at 1 m/s. Position is linear,
+        orientation a normalised lerp along the shorter arc -- exact enough
+        across one odom period.
+        """
+        with self._lock:
+            before = after = None
+            for ts, msg in self._samples:
+                if ts <= target_ns:
+                    if before is None or ts >= before[0]:
+                        before = (ts, msg)
+                elif after is None or ts < after[0]:
+                    after = (ts, msg)
+            if (before is None or after is None
+                    or target_ns - before[0] > self._tolerance_ns
+                    or after[0] - target_ns > self._tolerance_ns):
+                pair = None
+            else:
+                pair = (before, after)
+        if pair is None:
+            return self.nearest(target_ns)
+        (t0, m0), (t1, m1) = pair
+        w = (target_ns - t0) / (t1 - t0) if t1 > t0 else 0.0
+        p0, p1 = m0.pose.pose.position, m1.pose.pose.position
+        q0, q1 = m0.pose.pose.orientation, m1.pose.pose.orientation
+        a = (q0.x, q0.y, q0.z, q0.w)
+        b = (q1.x, q1.y, q1.z, q1.w)
+        if sum(x * y for x, y in zip(a, b)) < 0.0:
+            b = tuple(-x for x in b)
+        q = [x + w * (y - x) for x, y in zip(a, b)]
+        norm = math.sqrt(sum(x * x for x in q)) or 1.0
+        out = Odometry()
+        out.header = m0.header
+        out.child_frame_id = m0.child_frame_id
+        out.pose.pose.position.x = p0.x + w * (p1.x - p0.x)
+        out.pose.pose.position.y = p0.y + w * (p1.y - p0.y)
+        out.pose.pose.position.z = p0.z + w * (p1.z - p0.z)
+        (out.pose.pose.orientation.x, out.pose.pose.orientation.y,
+         out.pose.pose.orientation.z, out.pose.pose.orientation.w) = (
+            q[0] / norm, q[1] / norm, q[2] / norm, q[3] / norm)
+        out.twist = m1.twist if w >= 0.5 else m0.twist
+        return out
+
+
+class _PoseRateMeter:
+    """Arrival rate of the slowest pose message over a trailing window.
+
+    ``count(name)`` on every arrival (recording or not); ``sample(now)`` once
+    per timer tick returns the slowest of POSE_MESSAGES in Hz over the last
+    ``window_s``, or None until the ticks span a whole window. ROS-free.
+    """
+
+    def __init__(self, window_s: float = POSE_RENEW_WINDOW_S) -> None:
+        self._window_s = window_s
+        self._counts = {name: 0 for name in POSE_MESSAGES}
+        self._snaps: Deque[Tuple[float, dict]] = deque()
+
+    def count(self, name: str) -> None:
+        self._counts[name] += 1
+
+    def sample(self, now: float) -> Optional[float]:
+        self._snaps.append((now, dict(self._counts)))
+        while len(self._snaps) > 1 and now - self._snaps[1][0] >= self._window_s:
+            self._snaps.popleft()
+        t0, c0 = self._snaps[0]
+        if now - t0 < self._window_s:
+            return None
+        return min((self._counts[k] - c0[k]) / (now - t0) for k in self._counts)
+
+
+class _BurstClock:
+    """``time_boot_ms`` for mavros messages that arrive stamped 0.
+
+    Arrivals within ``window_ns`` of the burst's first arrival share its
+    value, as one autopilot burst does; the next arrival after that opens a
+    new burst. Without it every pose of a real-robot .svlog carried one
+    frozen value, 4288904828 = (0 - node boot) mod 2^32.
+    """
+
+    def __init__(self, window_ns: int = MAVLINK_BURST_WINDOW_NS) -> None:
+        self._window_ns = window_ns
+        self._burst_start_ns: Optional[int] = None
+        self._burst_ns: int = 0
+
+    def burst_ns(self, arrival_ns: int) -> int:
+        if (self._burst_start_ns is None
+                or arrival_ns - self._burst_start_ns > self._window_ns
+                or arrival_ns < self._burst_start_ns):
+            self._burst_start_ns = arrival_ns
+            self._burst_ns = arrival_ns
+        return self._burst_ns
+
+
+def sonarview_ping_hz(range_max_m: float) -> float:
+    """Ping rate SonarView's 50 ms command yields at ``range_max_m``."""
+    period_ms = max(SONARVIEW_MSEC_PER_PING,
+                    2000.0 * range_max_m / SOUND_SPEED_MPS + DEVICE_PROCESSING_MS)
+    return 1000.0 / period_ms
+
+
+# mavlink2rest names, as SonarView records them.
+_MAV_STATE = ("MAV_STATE_UNINIT", "MAV_STATE_BOOT", "MAV_STATE_CALIBRATING",
+              "MAV_STATE_STANDBY", "MAV_STATE_ACTIVE", "MAV_STATE_CRITICAL",
+              "MAV_STATE_EMERGENCY", "MAV_STATE_POWEROFF",
+              "MAV_STATE_FLIGHT_TERMINATION")
+_MAV_SEVERITY = ("MAV_SEVERITY_EMERGENCY", "MAV_SEVERITY_ALERT",
+                 "MAV_SEVERITY_CRITICAL", "MAV_SEVERITY_ERROR",
+                 "MAV_SEVERITY_WARNING", "MAV_SEVERITY_NOTICE",
+                 "MAV_SEVERITY_INFO", "MAV_SEVERITY_DEBUG")
+# ArduPilot Rover custom modes (mavros_msgs/State.mode -> HEARTBEAT.custom_mode).
+_ROVER_MODES = {"MANUAL": 0, "ACRO": 1, "STEERING": 3, "HOLD": 4,
+                "LOITER": 5, "FOLLOW": 6, "SIMPLE": 7, "DOCK": 8,
+                "CIRCLE": 9, "AUTO": 10, "RTL": 11, "SMART_RTL": 12,
+                "GUIDED": 15, "INITIALISING": 16}
+_MAV_MODE_FLAG_CUSTOM_MODE_ENABLED = 1
+_MAV_MODE_FLAG_GUIDED_ENABLED = 8
+_MAV_MODE_FLAG_MANUAL_INPUT_ENABLED = 64
+_MAV_MODE_FLAG_SAFETY_ARMED = 128
+STATUSTEXT_LEN = 50
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +508,30 @@ class SSSProcessorNode(Node):
         super().__init__("sss_processor")
 
         # ---- Processing state ---------------------------------------------
-        self._port_buf: Deque[OmniscanProfile] = deque()
-        self._stbd_buf: Deque[OmniscanProfile] = deque()
+        # ping_number (normalised onto the port counter) -> group.
+        # Insertion-ordered, and the keys are monotone in acquisition order,
+        # so the oldest group is always the first one.
+        self._groups: "OrderedDict[int, dict]" = OrderedDict()
+        self._offset = PingCounterOffset(window=OFFSET_VOTE_WINDOW,
+                                         defer=OFFSET_VOTE_DEFER)
+        # Arrivals held until the counter offset is known; None once drained.
+        self._preroll: Optional[list] = []
+        self._max_key_seen: Optional[int] = None
         self._buf_lock = threading.Lock()
-        self._tol_ns = TIME_MATCH_TOLERANCE_NS
+        # Wall-clock instant of the last profile arrival. The flush timer
+        # compares wall time only with this, never with a message stamp:
+        # stamps are sim time under Gazebo (and device time on a rosbag),
+        # and wall-vs-stamp arithmetic made every group look 1.8e9 s stale.
+        self._last_arrival_wall_ns: Optional[int] = None
+        self._counter_restarts = 0
+        self._max_key_before: Optional[int] = None
+        self._torn_recent: Deque[bool] = deque(maxlen=TORN_WINDOW_ROWS)
+        self._torn_warned = False
+        # Packets whose side neither channel_number nor the transducer
+        # bearing resolved (bearing 0 / non-finite): routed by the arrival
+        # topic instead, counted, warned once per run.
+        self._unresolved_side = 0
+        self._unresolved_warned = False
 
         self._odom_buf = _OdomBuffer(int(ODOM_BUFFER_SECONDS * 1e9))
         self._fbr = FBRTracker(
@@ -185,21 +542,64 @@ class SSSProcessorNode(Node):
         )
 
         self._dropped_no_odom = 0
-        self._dropped_bootstrap = 0
+        # Pings emitted while the FBR tracker was not locked. These are
+        # EMITTED, not dropped (NON-NEGOTIABLE #2); the counter reports
+        # altitude quality, never data loss.
+        self._unlocked_pings = 0
+        self._emitted = 0
+        self._one_sided = 0
         self._already_bootstrapped_logged = False
+
+        # Fore/aft arm of the transducers [m, + forward], published in every
+        # ProcessedSSSPing.transducer_x_offset. A parameter so a session
+        # recorded before 2026-11-15 re-processes as it was (":=0.0").
+        # Dynamic typing: a launch line writing ":=0" sends an integer.
+        self.declare_parameter(
+            "transducer_x_offset_m", TRANSDUCER_X_OFFSET_M,
+            ParameterDescriptor(
+                dynamic_typing=True,
+                description="Fore/aft arm of the transducers from the "
+                            "/blueboat/odom pose [m], + forward; published "
+                            "in ProcessedSSSPing.transducer_x_offset"))
+        self._transducer_x_offset_m = self._read_x_offset()
+        self.get_logger().info(
+            f"transducer fore/aft arm: {self._transducer_x_offset_m:+.3f} m "
+            "(+ forward of the /blueboat/odom pose; parameter "
+            "transducer_x_offset_m)"
+            + ("" if self._transducer_x_offset_m == TRANSDUCER_X_OFFSET_M
+               else f" -- NOT the default {TRANSDUCER_X_OFFSET_M:+.3f} m"))
 
         # ---- Logging + mavlink envelope state ------------------------------
 
         #self.date = datetime.today().strftime('%Y_%m_%d-%H_%M')
         #self.declare_parameter("log_folder", self.date)
         #self.folder_name = self.get_parameter("log_folder").value
-        self.log_root = Path(os.path.expanduser("../../../data/SSS_data")) #/ self.folder_name
-        #self.log_root.mkdir(parents=True, exist_ok=True)
-
+        # Relative to the launch working directory, and resolved once here so
+        # that every path this node reports afterwards is absolute -- "where
+        # did my recording go?" must not need the reader to know the cwd.
+        self.log_root = Path(
+            os.path.expanduser("../../../../data/SSS_data")  #/ self.folder_name
+        ).resolve()
+        # Created at startup so a bad log path is known before the mission
+        # rather than at Record ON. Failing is not fatal: processing and
+        # logging are independent, and a processor that refused to start
+        # would drop pings over a recording problem. SvlogWriter.start()
+        # retries it.
+        try:
+            self.log_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.get_logger().error(
+                f"cannot create the log directory {self.log_root}: {exc}; "
+                "processing continues, recording will fail until this is fixed"
+            )
         self.get_logger().info(f"log directory: {self.log_root}")
         self._svlog = SvlogWriter(
             log_dir=self.log_root,
             metadata_provider=self._build_metadata,
+            # svlog_helper is ROS-free by contract, so it cannot reach a ROS
+            # logger itself; this is how a write failure reaches /rosout and
+            # the GCS console.
+            error_reporter=lambda message: self.get_logger().error(message),
         )
 
         # Aux mavros signals used to enrich GLOBAL_POSITION_INT.
@@ -216,6 +616,44 @@ class SSSProcessorNode(Node):
         self._mav_seq = 0
         self._mav_seq_lock = threading.Lock()
         self._node_boot_ns = time.monotonic_ns()
+        # Arrival clock of the stream-stopped check and the rate watchdog
+        # (2026-11-07): wall monotonic in every real launch (as before); the
+        # node clock when launched with use_sim_time (the GCS does in a
+        # simulation graph, one with a /clock publisher), so a simulation
+        # slowed below real time -- the ray-cast sonar -- neither tears rows
+        # nor reports rates at the wall pace.
+        self._sim_clock = bool(self.get_parameter('use_sim_time').value)
+        # Follow /clock when it appears AFTER start-up (2026-11-09): the GCS
+        # starts this node before Gazebo, so 'auto' resolved to wall time and
+        # a slowed ray-cast run reported wall-paced rates ("2.0 pings/s" for
+        # 20 Hz of sim time). Managed only when launched without sim time;
+        # back to wall time once /clock has had no publisher for
+        # CLOCK_FOLLOW_LOST_S (a later real-robot run has none).
+        self._clock_auto = not self._sim_clock
+        self._clock_lost_s = 0.0
+        self._watch_reset = False
+        self._burst_clock = _BurstClock()
+        self._zero_stamp_warned = False
+        self._zero_odom_warned = False
+
+        # SonarView's mavlink rate request (see the module docstring).
+        self._rate_request_mono: Optional[float] = None
+        self._rate_service_missing_logged = False
+        self._rates_announced = False
+        self._rate_failures_logged: set = set()
+        # Pose arrivals, recording or not: renews the request when the
+        # autopilot falls back below POSE_RATE_WARN_HZ.
+        self._pose_rate = _PoseRateMeter()
+        self._rate_renewals = 0
+        # Rate watchdog: arrivals per RATE_WATCH_PERIOD_S window while
+        # recording; a warned condition is re-armed once it recovers. The
+        # window opens at the first logged pose envelope (None = not open),
+        # so the time before the .svlog opened does not dilute the rate.
+        self._watch_counts = {name: 0 for name in POSE_MESSAGES}
+        self._watch_pings = [0, 0]
+        self._watch_range_m: Optional[float] = None
+        self._watch_t0: Optional[float] = None   # on the arrival clock
+        self._watch_warned: set = set()
 
         # ---- QoS -----------------------------------------------------------
         sonar_qos = QoSProfile(
@@ -241,18 +679,36 @@ class SSSProcessorNode(Node):
         # Mavros telemetry -> svlog mavlink wrappers.
         self.create_subscription(Imu,             "/mavros/imu/data",                       self._on_mavros_imu,           sonar_qos)
         self.create_subscription(NavSatFix,       "/mavros/global_position/global",         self._on_mavros_navsat,        sonar_qos)
-        self.create_subscription(Float64,         "/mavros/global_position/rel_alt",        self._on_mavros_rel_alt,       10)
-        self.create_subscription(Float64,         "/mavros/global_position/compass_hdg",    self._on_mavros_compass_hdg,   10)
+        self.create_subscription(Float64,         "/mavros/global_position/rel_alt",        self._on_mavros_rel_alt,       sonar_qos)
+        self.create_subscription(Float64,         "/mavros/global_position/compass_hdg",    self._on_mavros_compass_hdg,   sonar_qos)
         self.create_subscription(TwistStamped,    "/mavros/local_position/velocity_local",  self._on_mavros_local_vel,     sonar_qos)
         self.create_subscription(PoseStamped,     "/mavros/local_position/pose",            self._on_mavros_local_pose,    sonar_qos)
         self.create_subscription(HomePosition,    "/mavros/home_position/home",             self._on_mavros_home_position, 10)
         self.create_subscription(GeoPointStamped, "/mavros/global_position/gp_origin",      self._on_mavros_gp_origin,     10)
         self.create_subscription(VfrHud,          "/mavros/vfr_hud",                        self._on_mavros_vfr_hud,       sonar_qos)
+        # Best-effort subscribers match a reliable or best-effort publisher
+        # alike, whichever QoS the mavros plugin uses.
+        self.create_subscription(State,           "/mavros/state",                          self._on_mavros_state,         sonar_qos)
+        self.create_subscription(StatusText,      "/mavros/statustext/recv",                self._on_mavros_statustext,    sonar_qos)
         self.get_logger().info("mavros telemetry subscriptions active")
+        # SonarView's message-interval request, while the sonar streams.
+        self._rate_client = self.create_client(MessageInterval, MAVLINK_RATE_SERVICE)
+        self._rate_timer = self.create_timer(1.0, self._assert_mavlink_rates)
+        self._watch_timer = self.create_timer(RATE_WATCH_PERIOD_S, self._check_rates)
+        if self._clock_auto:
+            # On the steady clock: it must tick whatever the node clock does.
+            self._clock_follow_timer = self.create_timer(
+                CLOCK_FOLLOW_PERIOD_S, self._follow_clock,
+                clock=Clock(clock_type=ClockType.STEADY_TIME))
         # Logging toggle.
         self.create_subscription(Bool, "~/log/enable", self._on_log_enable, 10)
 
         self._pub = self.create_publisher(ProcessedSSSPing, "~/processed", sonar_qos)
+
+        # Emits groups the arrival path can no longer reach, so the tail of a
+        # run is not stranded when the stream stops (NON-NEGOTIABLE #2).
+        self._flush_timer = self.create_timer(ASSEMBLY_FLUSH_PERIOD_S,
+                                              self._flush_pending)
 
         self.get_logger().info(
             "sss_processor ready (log OFF):\n"
@@ -262,8 +718,11 @@ class SSSProcessorNode(Node):
             "  stbd raw  ← /side_scan_sonar/starboard/raw\n"
             "  odom  ← /blueboat/odom\n"
             "  out   → ~/processed\n"
+            "  rows assembled by ping_number (offset-normalised across the two\n"
+            "  devices); one-sided rows are emitted, never dropped\n"
             f"  bootstrap: {BOOTSTRAP_PINGS} self-consistent pings per side within "
-            f"{ALTITUDE_AGREEMENT_TOL_M*100:.0f} cm (either side suffices)\n"
+            f"{ALTITUDE_AGREEMENT_TOL_M*100:.0f} cm (either side suffices); pings are\n"
+            "  emitted with a provisional altitude until then\n"
             "  Toggle logging with:\n"
             "  ros2 topic pub --once /sss_processor/log/enable std_msgs/msg/Bool 'data: true'"
         )
@@ -271,22 +730,56 @@ class SSSProcessorNode(Node):
     # ----- shutdown ---------------------------------------------------------
     def shutdown(self) -> None:
         self.get_logger().info("stopping sss_processor")
+        # Anything still buffered is emitted rather than discarded.
+        self._flush_pending(drain_all=True)
+        self.get_logger().info(
+            f"emitted {self._emitted} row(s), {self._one_sided} one-sided, "
+            f"{self._unlocked_pings} with a provisional altitude, "
+            f"{self._dropped_no_odom} dropped for missing odom; "
+            f"ping-counter offset {self._offset.offset:+d} "
+            f"({self._offset.confidence * 100:.0f}% of {self._offset.votes} votes), "
+            f"{self._counter_restarts} counter restart(s) re-based"
+        )
+        if self._rate_renewals or self._odom_buf.epoch_dropped:
+            self.get_logger().info(
+                f"mavlink rate request renewed {self._rate_renewals} time(s) "
+                f"on a low pose rate; {self._odom_buf.epoch_dropped} odom "
+                f"sample(s) dropped on a clock epoch change")
         self._svlog.stop()
 
     # ----- sonar subscribers ------------------------------------------------
     def _on_port(self, msg: OmniscanProfile) -> None:
-        with self._buf_lock:
-            self._port_buf.append(msg)
-            self._drain_matches()
+        self._watch_ping(msg, 0)
+        self._accept(msg, topic_side=0)
 
     def _on_starboard(self, msg: OmniscanProfile) -> None:
-        with self._buf_lock:
-            self._stbd_buf.append(msg)
-            self._drain_matches()
+        self._watch_ping(msg, 1)
+        self._accept(msg, topic_side=1)
+
+    def _watch_ping(self, msg: OmniscanProfile, side: int) -> None:
+        if self._watch_t0 is not None:          # counted only in an open window
+            self._watch_pings[side] += 1
+        self._watch_range_m = (msg.start_mm + msg.length_mm) / 1000.0
+
+    def _watch_pose(self, name: str) -> None:
+        """Count one logged pose envelope; the first opens the window."""
+        if self._watch_t0 is None:
+            self._watch_t0 = self._arrival_s()
+        self._watch_counts[name] += 1
 
     def _on_odom(self, msg: Odometry) -> None:
-        self._odom_buf.push(msg)
+        self._odom_buf.push(msg, self.get_clock().now().nanoseconds)
+        # Once: `zero_stamped` stays at 1 after a single zero stamp, so the
+        # old `== 1` test warned on every later odom (1339 times in one
+        # replay where one odom arrived before /clock).
+        if self._odom_buf.zero_stamped and not self._zero_odom_warned:
+            self._zero_odom_warned = True
+            self.get_logger().warn(
+                "/blueboat/odom is stamped 0 (mavros on sim time without "
+                "/clock): placing poses by arrival time instead (warned once)")
 
+    # The device id passed here is only the fallback: _write_raw_with_src_tag
+    # tags each frame from the packet's own channel_number (NON-NEGOTIABLE #1).
     def _on_port_raw(self, msg: UInt8MultiArray) -> None:
         self._write_raw_with_src_tag(msg, DEVICE_ID_PORT)
 
@@ -295,12 +788,29 @@ class SSSProcessorNode(Node):
 
     def _on_log_enable(self, msg: Bool) -> None:
         if msg.data:
-            self._svlog.start()
-            self.get_logger().info(f"logging -> {self.log_root}")
+            # start() reports its own reason and returns None on failure. The
+            # GCS has no feedback topic, so this error line on /rosout is what
+            # tells the operator the Record button is lying.
+            path = self._svlog.start()
+            # The watchdog's window restarts with the recording.
+            self._watch_t0 = None
+            self._watch_counts = {name: 0 for name in POSE_MESSAGES}
+            self._watch_pings = [0, 0]
+            if path is None:
+                self.get_logger().error(
+                    f"RECORDING FAILED: nothing is being written to "
+                    f"{self.log_root}"
+                )
+            else:
+                self.get_logger().info(f"logging -> {path}")
         else:
-            self._svlog.current_path
+            # Read the path before stop() clears it, so the operator is told
+            # which file was closed rather than only which directory.
+            path = self._svlog.current_path
             self._svlog.stop()
-            self.get_logger().info(f"stopped logging ({self.log_root})")
+            self.get_logger().info(
+                f"stopped logging ({path if path is not None else self.log_root})"
+            )
 
     # ----- mavros subscribers -----------------------------------------------
     def _on_mavros_rel_alt(self, msg: Float64) -> None:
@@ -318,8 +828,10 @@ class SSSProcessorNode(Node):
             self._latest_compass_hdg_cdeg = cdeg
 
     def _on_mavros_imu(self, msg: Imu) -> None:
+        self._pose_rate.count("ATTITUDE")
         if not self._svlog.active:
             return
+        self._watch_pose("ATTITUDE")
         envelope = self._build_attitude_envelope(msg)
         if envelope is None:
             return
@@ -329,8 +841,10 @@ class SSSProcessorNode(Node):
             self.get_logger().warn(f"mavlink ATTITUDE write failed: {exc}")
 
     def _on_mavros_navsat(self, msg: NavSatFix) -> None:
+        self._pose_rate.count("GLOBAL_POSITION_INT")
         if not self._svlog.active:
             return
+        self._watch_pose("GLOBAL_POSITION_INT")
         envelope = self._build_global_position_envelope(msg)
         if envelope is None:
             return
@@ -346,8 +860,10 @@ class SSSProcessorNode(Node):
             self._latest_local_twist = msg
 
     def _on_mavros_local_pose(self, msg: PoseStamped) -> None:
+        self._pose_rate.count("LOCAL_POSITION_NED")
         if not self._svlog.active:
             return
+        self._watch_pose("LOCAL_POSITION_NED")
         with self._aux_lock:
             twist = self._latest_local_twist
         try:
@@ -383,6 +899,189 @@ class SSSProcessorNode(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warn(f"mavlink VFR_HUD write failed: {exc}")
 
+    def _on_mavros_state(self, msg: State) -> None:
+        if not self._svlog.active or not msg.connected:
+            return
+        try:
+            self._svlog.write(build_mavlink_wrapper(
+                self._build_heartbeat_envelope(msg)))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"mavlink HEARTBEAT write failed: {exc}")
+
+    def _on_mavros_statustext(self, msg: StatusText) -> None:
+        if not self._svlog.active:
+            return
+        try:
+            self._svlog.write(build_mavlink_wrapper(
+                self._build_statustext_envelope(msg)))
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"mavlink STATUSTEXT write failed: {exc}")
+
+    # ----- SonarView's mavlink rates + rate watchdog -------------------------
+    def _arrival_ns(self) -> int:
+        """Now on the arrival clock: ``time.monotonic_ns()`` (real launches),
+        the node clock under ``use_sim_time`` (see ``_sim_clock``)."""
+        if self._sim_clock:
+            return self.get_clock().now().nanoseconds
+        return time.monotonic_ns()
+
+    def _arrival_s(self) -> float:
+        return self._arrival_ns() * 1e-9
+
+    def _follow_clock(self) -> None:
+        """Switch the arrival clock to sim time when a /clock publisher
+        appears, and back to wall time once it has been gone for
+        CLOCK_FOLLOW_LOST_S (only when launched without use_sim_time)."""
+        has_clock = self.count_publishers("/clock") > 0
+        if has_clock and not self._sim_clock:
+            self._set_sim_clock(True)
+            self._clock_lost_s = 0.0
+        elif not has_clock and self._sim_clock:
+            self._clock_lost_s += CLOCK_FOLLOW_PERIOD_S
+            if self._clock_lost_s >= CLOCK_FOLLOW_LOST_S:
+                self._set_sim_clock(False)
+        else:
+            self._clock_lost_s = 0.0
+
+    def _set_sim_clock(self, on: bool) -> None:
+        self.set_parameters([Parameter("use_sim_time", Parameter.Type.BOOL, bool(on))])
+        with self._buf_lock:
+            self._sim_clock = bool(on)
+            # Arrival times on the old clock mean nothing on the new one.
+            self._last_arrival_wall_ns = None
+            self._watch_reset = True
+        self.get_logger().info(
+            "a /clock publisher appeared: arrival clock, stream-stopped check and "
+            "rate watchdog now on sim time (use_sim_time true)" if on else
+            "/clock has had no publisher for "
+            f"{CLOCK_FOLLOW_LOST_S:g} s: back on the wall clock (use_sim_time false)")
+
+    def _sonar_streaming(self) -> bool:
+        last = self._last_arrival_wall_ns
+        return (last is not None
+                and self._arrival_ns() - last < SONAR_ACTIVE_WINDOW_S * 1e9)
+
+    def _assert_mavlink_rates(self) -> None:
+        """Ask the autopilot for SonarView's message intervals.
+
+        Sent as soon as the sonar streams (checked every second), again
+        every MAVLINK_RATE_REASSERT_S while it does, and earlier -- at most
+        once per POSE_RENEW_HOLDOFF_S -- when the pose rate measured over the
+        last POSE_RENEW_WINDOW_S is below POSE_RATE_WARN_HZ (the intervals
+        did not hold on the 2026-10-28 water run). Asynchronous: the
+        executor is never blocked waiting for mavros.
+        """
+        now = time.monotonic()
+        pose_hz = self._pose_rate.sample(now)   # every tick, streaming or not
+        if not self._sonar_streaming():
+            return
+        renew = False
+        if self._rate_request_mono is not None:
+            since = now - self._rate_request_mono
+            renew = (since >= POSE_RENEW_HOLDOFF_S and pose_hz is not None
+                     and pose_hz < POSE_RATE_WARN_HZ)
+            if since < MAVLINK_RATE_REASSERT_S and not renew:
+                return
+        self._rate_request_mono = now
+        if not self._rate_client.service_is_ready():
+            if not self._rate_service_missing_logged:
+                self._rate_service_missing_logged = True
+                self.get_logger().info(
+                    f"{MAVLINK_RATE_SERVICE} is not available (simulation, or "
+                    "mavros not up): autopilot message rates left as they are")
+            return
+        for entry in DEFAULT_PERIODIC_MESSAGES:
+            req = MessageInterval.Request()
+            req.message_id = int(entry["message_id"])
+            req.message_rate = float(entry["frequency_hz"])
+            future = self._rate_client.call_async(req)
+            future.add_done_callback(
+                lambda f, mid=req.message_id: self._on_rate_answer(mid, f))
+        if renew:
+            self._rate_renewals += 1
+            if self._rate_renewals == 1:
+                self.get_logger().info(
+                    f"pose at {pose_hz:.1f} Hz (< {POSE_RATE_WARN_HZ:g} Hz) "
+                    "after the rate request: renewed it; renewing whenever "
+                    "the pose rate drops again (announced once)")
+        if not self._rates_announced:
+            self._rates_announced = True
+            self.get_logger().info(
+                "requested SonarView's mavlink rates from the autopilot: " +
+                ", ".join(f"id {e['message_id']} @ {e['frequency_hz']:g} Hz"
+                          for e in DEFAULT_PERIODIC_MESSAGES) +
+                " (autopilot-wide: /blueboat/odom speeds up too)")
+
+    def _on_rate_answer(self, message_id: int, future) -> None:
+        try:
+            ok = bool(future.result().success)
+        except Exception:  # noqa: BLE001
+            ok = False
+        if not ok and message_id not in self._rate_failures_logged:
+            self._rate_failures_logged.add(message_id)
+            self.get_logger().warn(
+                f"autopilot refused the message-interval request for mavlink "
+                f"id {message_id}")
+
+    def _check_rates(self) -> None:
+        """Warn when a recording falls short of SonarView's rates.
+
+        Timed on the arrival clock (`_arrival_s`: wall, or sim time under
+        use_sim_time / a followed /clock). The window opens at the first
+        logged pose envelope (`_watch_pose`), not at the previous tick: the
+        time before the .svlog opened diluted the first window (2.8 Hz
+        reported, 2026-10-28). If a whole tick passes while recording with
+        nothing logged, the window opens at that tick, so a pose that never
+        arrives is still reported (0 Hz). A window shorter than
+        RATE_WATCH_MIN_S is carried into the next tick. A change of arrival
+        clock (_set_sim_clock) closes the window; it reopens as above.
+        """
+        now = self._arrival_s()
+        if self._watch_reset:
+            self._watch_reset = False
+            self._watch_t0 = None
+        if not self._svlog.active or self._watch_t0 is None:
+            for k in self._watch_counts:
+                self._watch_counts[k] = 0
+            self._watch_pings = [0, 0]
+            self._watch_t0 = now if self._svlog.active else None
+            return
+        elapsed = now - self._watch_t0
+        if elapsed < RATE_WATCH_MIN_S:
+            return
+        counts, pings, range_m = (dict(self._watch_counts),
+                                  list(self._watch_pings), self._watch_range_m)
+        for k in self._watch_counts:
+            self._watch_counts[k] = 0
+        self._watch_pings = [0, 0]
+        self._watch_t0 = now
+        problems = {}
+        for name, n in counts.items():
+            hz = n / elapsed
+            if hz < POSE_RATE_WARN_HZ:
+                problems[name] = f"{name} {hz:.1f} Hz"
+        if range_m is not None and any(pings):
+            want = sonarview_ping_hz(range_m)
+            for side, n in enumerate(pings):
+                hz = n / elapsed
+                if abs(hz - want) > PING_RATE_TOLERANCE * want:
+                    key = f"ping{side}"
+                    problems[key] = (f"{('port', 'starboard')[side]} sonar "
+                                     f"{hz:.1f} pings/s (SonarView's law "
+                                     f"gives {want:.1f} at {range_m:g} m)")
+        new = [text for key, text in problems.items()
+               if key not in self._watch_warned]
+        if new:
+            self.get_logger().warn(
+                "recording below SonarView's rates: " + "; ".join(new) +
+                f" (pose wants >= {POSE_RATE_WARN_HZ:g} Hz)")
+        recovered = self._watch_warned - set(problems)
+        if recovered:
+            self.get_logger().info(
+                "recording back at SonarView's rates: " +
+                ", ".join(sorted(recovered)))
+        self._watch_warned = set(problems)
+
     # ----- mavlink envelope builders ----------------------------------------
     def _next_seq(self) -> int:
         with self._mav_seq_lock:
@@ -402,9 +1101,26 @@ class SSSProcessorNode(Node):
 
         The offset (relative to node start, modulo 2^32) is arbitrary --
         SonarView only looks at value equality, not absolute meaning.
+
+        A zero stamp (real-robot launch: mavros on use_sim_time with no
+        /clock) is replaced by the arrival time, grouped into bursts by
+        `_BurstClock` so the pairing survives. Keyed on 0 it was one frozen
+        value for the whole recording (every 2026-10-27 field log).
         """
         stamp_ns = stamp.sec * 1_000_000_000 + stamp.nanosec
+        if stamp_ns == 0:
+            if not self._zero_stamp_warned:
+                self._zero_stamp_warned = True
+                self.get_logger().warn(
+                    "mavros messages are stamped 0 (sim time without /clock): "
+                    "the .svlog's time_boot_ms comes from arrival time instead")
+            stamp_ns = self._burst_clock.burst_ns(self.get_clock().now().nanoseconds)
         return ((stamp_ns - self._node_boot_ns) // 1_000_000) & 0xFFFFFFFF
+
+    def _time_usec(self) -> int:
+        """`time_usec` for the 1 Hz origin/home messages, on the same clock."""
+        now_ns = self.get_clock().now().nanoseconds
+        return ((now_ns - self._node_boot_ns) // 1_000) & 0xFFFFFFFFFFFFFFFF
 
     def _mavlink_header(self) -> dict:
         return {
@@ -451,6 +1167,19 @@ class SSSProcessorNode(Node):
         with self._aux_lock:
             rel_alt_mm = self._latest_rel_alt_mm or 0
             hdg_cdeg = self._latest_compass_hdg_cdeg or 0
+            twist = self._latest_local_twist
+        # GLOBAL_POSITION_INT carries ground velocity in cm/s, NED. The same
+        # /mavros/local_position/velocity_local the LOCAL_POSITION_NED
+        # envelope uses supplies it; it was hard-coded to zero, which made
+        # every .svlog this node writes claim a stationary boat -- and the
+        # along-track scale of a replayed waterfall is read from exactly
+        # these fields (2026-09-18 review G10). Absent velocity still means
+        # zeros, which the schema allows.
+        vx_cms = vy_cms = vz_cms = 0
+        if twist is not None:
+            vx_cms = int(round(twist.twist.linear.y * 100.0))   # ENU -> NED
+            vy_cms = int(round(twist.twist.linear.x * 100.0))
+            vz_cms = int(round(-twist.twist.linear.z * 100.0))
         return {
             "header": self._mavlink_header(),
             "message": {
@@ -460,9 +1189,9 @@ class SSSProcessorNode(Node):
                 "lon":          int(round(fix.longitude * 1e7)),
                 "alt":          int(round(fix.altitude  * 1000.0)),  # mm AMSL
                 "relative_alt": int(rel_alt_mm),
-                "vx":           0,
-                "vy":           0,
-                "vz":           0,
+                "vx":           int(vx_cms),
+                "vy":           int(vy_cms),
+                "vz":           int(vz_cms),
                 "hdg":          int(hdg_cdeg),
             },
         }
@@ -496,6 +1225,7 @@ class SSSProcessorNode(Node):
             "header": self._mavlink_header(),
             "message": {
                 "type":      "HOME_POSITION",
+                "time_usec": self._time_usec(),
                 "latitude":  int(round(h.geo.latitude  * 1e7)),
                 "longitude": int(round(h.geo.longitude * 1e7)),
                 "altitude":  int(round(h.geo.altitude  * 1000.0)),
@@ -510,9 +1240,51 @@ class SSSProcessorNode(Node):
             "header": self._mavlink_header(),
             "message": {
                 "type":      "GPS_GLOBAL_ORIGIN",
+                "time_usec": self._time_usec(),
                 "latitude":  int(round(g.position.latitude  * 1e7)),
                 "longitude": int(round(g.position.longitude * 1e7)),
                 "altitude":  int(round(g.position.altitude  * 1000.0)),
+            },
+        }
+
+    def _build_heartbeat_envelope(self, s: 'State') -> dict:
+        """HEARTBEAT in SonarView's mavlink2rest shape, from /mavros/state."""
+        bits = _MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
+        if s.armed:
+            bits |= _MAV_MODE_FLAG_SAFETY_ARMED
+        if s.guided:
+            bits |= _MAV_MODE_FLAG_GUIDED_ENABLED
+        if s.manual_input:
+            bits |= _MAV_MODE_FLAG_MANUAL_INPUT_ENABLED
+        status = (_MAV_STATE[s.system_status]
+                  if s.system_status < len(_MAV_STATE) else "MAV_STATE_UNINIT")
+        return {
+            "header": self._mavlink_header(),
+            "message": {
+                "type":            "HEARTBEAT",
+                "autopilot":       {"type": "MAV_AUTOPILOT_ARDUPILOTMEGA"},
+                "base_mode":       {"bits": bits},
+                "custom_mode":     _ROVER_MODES.get(s.mode.upper(), 0),
+                "mavlink_version": 3,
+                "mavtype":         {"type": "MAV_TYPE_SURFACE_BOAT"},
+                "system_status":   {"type": status},
+            },
+        }
+
+    def _build_statustext_envelope(self, t: 'StatusText') -> dict:
+        """STATUSTEXT as SonarView records it: the text as a 50-char array."""
+        text = list(t.text[:STATUSTEXT_LEN])
+        text += ["\u0000"] * (STATUSTEXT_LEN - len(text))
+        severity = (_MAV_SEVERITY[t.severity]
+                    if t.severity < len(_MAV_SEVERITY) else "MAV_SEVERITY_INFO")
+        return {
+            "header": self._mavlink_header(),
+            "message": {
+                "type":      "STATUSTEXT",
+                "severity":  {"type": severity},
+                "text":      text,
+                "id":        0,
+                "chunk_seq": 0,
             },
         }
 
@@ -531,142 +1303,404 @@ class SSSProcessorNode(Node):
         }
 
     # ----- svlog helpers ----------------------------------------------------
-    def _write_raw_with_src_tag(self, msg: UInt8MultiArray, src_device_id: int) -> None:
+    def _src_from_packet(self, raw: bytes, fallback: int) -> int:
+        """Device id read out of the packet; the topic is only a fallback.
+
+        NON-NEGOTIABLE #1. `channel_number` is authoritative; where the device
+        leaves it outside (0, 1) the transducer bearing decides — wrapped,
+        sign only (`sss_helper.side_from_fields`, the same rule `_accept`
+        applies to the published row, so the `.svlog` `src` byte and the
+        row always agree). The two agree on 100 % of packets in every field
+        recording measured, so the fallback only ever fires where
+        `channel_number` carries nothing usable; a bearing that carries no
+        side either falls to the arrival topic and is counted.
+        """
+        if (len(raw) > CHANNEL_BYTE
+                and int.from_bytes(raw[4:6], "little") == OS_MONO_PROFILE_ID):
+            ch = raw[CHANNEL_BYTE]
+            heading = 0.0
+            if len(raw) >= HEADING_BYTE + 4:
+                heading, = struct.unpack_from("<f", raw, HEADING_BYTE)
+            side = side_from_fields(ch, heading)
+            if side is not None:
+                return DEVICE_ID_PORT if side == 0 else DEVICE_ID_STBD
+            self._note_unresolved_side("raw", fallback)
+        return fallback
+
+    def _note_unresolved_side(self, path: str, fallback) -> None:
+        self._unresolved_side += 1
+        if not self._unresolved_warned:
+            self._unresolved_warned = True
+            self.get_logger().warn(
+                f"side unresolved on a {path} packet (channel_number outside "
+                f"0/1 and transducer_heading_deg carries no sign): routed by "
+                f"the arrival topic ({fallback}); further cases are counted "
+                f"silently (total so far: {self._unresolved_side})")
+
+    def _write_raw_with_src_tag(self, msg: UInt8MultiArray, fallback_src: int) -> None:
         if not self._svlog.active:
             return
+        raw = bytes(bytearray(msg.data))
         try:
             tagged = retag_packet_src_device_id(
-                bytes(bytearray(msg.data)), src_device_id
+                raw, self._src_from_packet(raw, fallback_src)
             )
             self._svlog.write(tagged)
         except ValueError as exc:
             self.get_logger().warn(f"dropping malformed raw packet: {exc}")
 
     def _build_metadata(self) -> bytes:
-        """Called by SvlogWriter on each new file."""
+        """Called by SvlogWriter on each new file: SonarView's two header
+        packets, session metadata (id 10) then its view config (id 12)."""
         return build_session_metadata(
             port_url="tcp://192.168.2.92:51200",
             starboard_url="tcp://192.168.2.93:51200",
             mavlink_url="ws://blueos.local:6040/v1/ws/mavlink",
             mavlink_filter=DEFAULT_MAVLINK_FILTER,
-        )
+        ) + build_view_config()
 
-    # ----- two-pointer time matcher -----------------------------------------
-    def _drain_matches(self) -> None:
-        """Emit every possible match from the heads of both buffers.
+    # ----- row assembly -----------------------------------------------------
+    def _accept(self, msg: OmniscanProfile, topic_side: int = 0) -> None:
+        """Route one profile into its ping-number group and emit what is ready.
 
-        Called under self._buf_lock. Standard two-pointer merge: if the
-        oldest port and oldest starboard are within tolerance, match;
-        otherwise drop whichever is older (no partner left to find).
+        NON-NEGOTIABLE #2: nothing is discarded here. A group leaves either
+        complete (both sides) or one-sided via `_flush_stale`, and every
+        arriving ping belongs to exactly one group.
+
+        NON-NEGOTIABLE #1: the side comes from the packet's own
+        `channel_number`, not from the subscription that delivered it, so a
+        profile published on the wrong topic still lands on the right side.
         """
-        while self._port_buf and self._stbd_buf:
-            p = self._port_buf[0]
-            s = self._stbd_buf[0]
-            p_ns = stamp_to_ns(p.header.stamp)
-            s_ns = stamp_to_ns(s.header.stamp)
-            dt = p_ns - s_ns
-            if abs(dt) <= self._tol_ns:
-                self._port_buf.popleft()
-                self._stbd_buf.popleft()
-                self._emit_merged(p, s)
-            elif dt > 0:
-                self._stbd_buf.popleft()
+        channel = self._channel_of(msg)
+        if channel is None:
+            # Neither field carries a side: the arrival topic is the only
+            # information left (the same fallback the raw path takes, so
+            # the .svlog src byte and this row agree).
+            channel = int(topic_side)
+            self._note_unresolved_side("profile", topic_side)
+        stamp_ns = stamp_to_ns(msg.header.stamp)
+        ready = []
+        with self._buf_lock:
+            self._last_arrival_wall_ns = self._arrival_ns()
+            if self._preroll is None and self._counter_restarted(
+                    channel, int(msg.ping_number)):
+                # Re-base: everything pending belongs to the old numbering
+                # and can never complete; the offset is re-learned from a
+                # fresh pre-roll, exactly as at startup.
+                ready.extend(self._groups.values())
+                self._groups.clear()
+                self._offset = PingCounterOffset(window=OFFSET_VOTE_WINDOW,
+                                                 defer=OFFSET_VOTE_DEFER)
+                self._preroll = []
+                self._max_key_seen = None
+                self._counter_restarts += 1
+                self.get_logger().info(
+                    f"ping counter restarted on channel {channel} "
+                    f"(#{int(msg.ping_number)} after #{self._max_key_before}): "
+                    "re-basing row assembly and re-learning the device offset")
+            self._offset.observe(channel, int(msg.ping_number), stamp_ns)
+
+            if self._preroll is not None:
+                # Hold until the offset is established, then key the whole
+                # pre-roll at once. Keying a ping at a provisional offset
+                # would split its row when the real offset arrives.
+                self._preroll.append((channel, msg, stamp_ns))
+                if (self._offset.votes < OFFSET_MIN_VOTES
+                        and len(self._preroll) < OFFSET_PREROLL_MAX):
+                    return
+                held, self._preroll = self._preroll, None
+                for ch, held_msg, held_ns in held:
+                    ready.extend(self._insert(ch, held_msg, held_ns))
             else:
-                self._port_buf.popleft()
+                ready.extend(self._insert(channel, msg, stamp_ns))
+            ready.extend(self._collect_stale(stamp_ns))
+        # Publish outside the lock: _emit_group does the heavy numeric work
+        # and must not block the other side's callback.
+        for group in ready:
+            self._emit_group(group)
+
+    def _insert(self, channel: int, msg: OmniscanProfile, stamp_ns: int) -> list:
+        """Place one profile in its group; return the group if it is complete.
+
+        Called under self._buf_lock.
+        """
+        key = self._offset.key(channel, int(msg.ping_number))
+        self._max_key_seen = (key if self._max_key_seen is None
+                              else max(self._max_key_seen, key))
+        group = self._groups.get(key)
+        if group is None:
+            group = self._groups[key] = {"first_ns": stamp_ns}
+        group[channel] = msg
+        if 0 in group and 1 in group:
+            del self._groups[key]
+            return [group]
+        return []
+
+    def _counter_restarted(self, channel: int, ping_number: int) -> bool:
+        """True when this arrival's key sits far behind the newest key seen.
+
+        A late arrival lags by tens of pings at most (63 measured); a key
+        ``COUNTER_RESTART_PINGS`` or more behind means the device (or the
+        simulator) restarted its counter. Called under self._buf_lock.
+        """
+        if self._max_key_seen is None:
+            return False
+        key = self._offset.key(channel, ping_number)
+        self._max_key_before = self._max_key_seen
+        return key < self._max_key_seen - COUNTER_RESTART_PINGS
+
+    def _collect_stale(self, now_ns: int) -> list:
+        """Remove groups that have waited long enough to be emitted one-sided.
+
+        Called under self._buf_lock. ``now_ns`` is a *message stamp* (the
+        newest arrival), so the age test lives on the stream's own clock.
+        Bounded three ways, so no group is ever held indefinitely: by how
+        far its ping number has fallen behind the newest one seen, by
+        stream time, and by a hard cap on live groups.
+        """
+        out = []
+        while self._groups:
+            key, group = next(iter(self._groups.items()))
+            behind = (self._max_key_seen is not None
+                      and self._max_key_seen - key > ASSEMBLY_MAX_LAG_PINGS)
+            stale = now_ns - group["first_ns"] > ASSEMBLY_MAX_LAG_NS
+            over_cap = len(self._groups) > ASSEMBLY_MAX_GROUPS
+            if not (behind or stale or over_cap):
+                break
+            del self._groups[key]
+            out.append(group)
+        return out
+
+    def _flush_pending(self, drain_all: bool = False) -> None:
+        """Timer/shutdown path: emit groups the arrival path can no longer reach.
+
+        Without this the last group of a run would sit in the buffer until
+        the next ping, which may never come -- the stream stopping is exactly
+        when it must not be lost. "Stopped" is judged on the arrival clock
+        (wall; the node clock in a simulation graph, ``_arrival_ns``)
+        against the last *arrival* (``_last_arrival_wall_ns``), never
+        against a message stamp: stamps run on the stream's clock (Gazebo
+        sim time, a device clock on replay), and comparing them with wall
+        time tore pairs in flight on every timer tick. While the stream is
+        alive the arrival path ages groups in stream time (`_collect_stale`).
+        """
+        with self._buf_lock:
+            ready = []
+            idle = (self._last_arrival_wall_ns is not None
+                    and self._arrival_ns() - self._last_arrival_wall_ns
+                    > ASSEMBLY_MAX_LAG_NS)
+            if not (drain_all or idle):
+                return
+            # A run shorter than the pre-roll would otherwise strand every
+            # ping it produced. Only force it once the stream has stopped,
+            # though: draining a pre-roll that is still filling would key it
+            # at a half-learned offset, which is what it exists to avoid.
+            if self._preroll:
+                held, self._preroll = self._preroll, None
+                for ch, msg, ns in held:
+                    ready.extend(self._insert(ch, msg, ns))
+            ready.extend(self._groups.values())
+            self._groups.clear()
+        for group in ready:
+            self._emit_group(group)
 
     # ----- processing -------------------------------------------------------
-    def _emit_merged(self, port: OmniscanProfile, stbd: OmniscanProfile) -> None:
-        log = self.get_logger()
+    @staticmethod
+    def _channel_of(msg: OmniscanProfile) -> Optional[int]:
+        """Side identity (0 = port, 1 = starboard, None = unresolved) from
+        the message itself.
 
-        # 1. Odom must exist; if SSS started before robot_interface, drop early pings.
+        NON-NEGOTIABLE #1, and the same rule the svlog writer applies to raw
+        frames (`sss_helper.side_from_fields`): `channel_number` decides,
+        with the wrapped sign of the transducer bearing as the fallback for
+        devices that leave it outside (0, 1). `msg.side` is a label attached
+        by the acquisition worker that published it and is deliberately not
+        read; the topic it arrived on is used only when this returns None.
+        """
+        return side_from_fields(int(msg.channel_number),
+                                float(msg.transducer_heading_deg))
+
+    def _read_x_offset(self) -> float:
+        """The ``transducer_x_offset_m`` parameter as a finite float; the
+        default (with an error on the log) when it is not one."""
+        raw = self.get_parameter("transducer_x_offset_m").value
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = math.nan
+        if isinstance(raw, bool) or not math.isfinite(value):
+            self.get_logger().error(
+                f"transducer_x_offset_m = {raw!r} is not a finite number of "
+                f"metres; using the default {TRANSDUCER_X_OFFSET_M:+.3f} m")
+            return float(TRANSDUCER_X_OFFSET_M)
+        return value
+
+    @staticmethod
+    def _side_geometry(side: int) -> Tuple[float, float]:
+        """(side_sign, transducer y offset) of a resolved side — the group
+        key the row was assembled under, never re-derived from the message.
+
+        Sign convention on the wire is +y = port, -y = starboard.
+        """
+        if side == 0:
+            return +1.0, TRANSDUCER_Y_OFFSET_PORT_M
+        return -1.0, TRANSDUCER_Y_OFFSET_STBD_M
+
+    def _fbr_of(self, msg: Optional[OmniscanProfile]):
+        """(dB samples, FBR slant range) for one side, or (None, None)."""
+        if msg is None:
+            return None, None
+        db = scale_to_db(msg.pwr_results, msg.min_pwr_db, msg.max_pwr_db)
+        alt = detect_fbr_slant_m(
+            db, msg.start_mm, msg.length_mm, msg.num_results,
+            noise_floor_window=NOISE_FLOOR_WINDOW,
+            threshold_delta_db=FBR_THRESHOLD_DELTA_DB,
+            persistence=WITHIN_PING_PERSISTENCE,
+            ringing_search_max=RINGING_SEARCH_MAX,
+            ringing_drop_db=RINGING_DROP_DB,
+            ringing_persistence=RINGING_PERSISTENCE,
+        )
+        return db, alt
+
+    def _emit_group(self, group: dict) -> None:
+        """Publish one assembled row. May carry one side only.
+
+        ONE-SIDED ROW CONVENTION (the message type is fixed -- CM-1, so this
+        is expressed in the existing fields): the absent side has
+        `*_ping_number = 0`, a zeroed `*_stamp`, and empty `*_intensity_db` /
+        `*_y`. **A consumer tests presence with `*_ping_number != 0`**, not
+        with array length: `project_side` can legitimately return an empty
+        array for a side that IS present, when the altitude estimate exceeds
+        the whole swath.
+        """
+        log = self.get_logger()
+        port: Optional[OmniscanProfile] = group.get(0)
+        stbd: Optional[OmniscanProfile] = group.get(1)
+        ref = port if port is not None else stbd
+        if ref is None:                      # defensive; groups always hold one
+            return
+
+        # 1. Odom is a hard gate: a ping with no pose is unplaceable. This is
+        #    the one legitimate drop, and it is owned by BlueBoat-Control
+        #    (/blueboat/odom reads zero on the real boat) rather than here.
         if not self._odom_buf.has_data():
             self._dropped_no_odom += 1
             if self._dropped_no_odom == 1 or self._dropped_no_odom % 20 == 0:
+                seen = self._odom_buf.pushed
+                why = ("none received" if seen == 0 else
+                       f"{seen} received, all older than "
+                       f"{ODOM_BUFFER_SECONDS:g} s against the ping stamp")
                 log.warn(
-                    f"dropping ping pair: no /blueboat/odom yet "
-                    f"(total dropped: {self._dropped_no_odom})"
+                    f"dropping ping: no /blueboat/odom yet ({why}; "
+                    f"total dropped: {self._dropped_no_odom})"
                 )
             return
 
-        # 2. dB conversion.
-        port_db = scale_to_db(port.pwr_results, port.min_pwr_db, port.max_pwr_db)
-        stbd_db = scale_to_db(stbd.pwr_results, stbd.min_pwr_db, stbd.max_pwr_db)
+        # 2. dB conversion + FBR detection, per side that is present.
+        port_db, port_alt = self._fbr_of(port)
+        stbd_db, stbd_alt = self._fbr_of(stbd)
 
-        # 3. FBR detection per side.
-        port_alt = detect_fbr_slant_m(
-            port_db, port.start_mm, port.length_mm, port.num_results,
-            noise_floor_window=NOISE_FLOOR_WINDOW,
-            threshold_delta_db=FBR_THRESHOLD_DELTA_DB,
-            persistence=WITHIN_PING_PERSISTENCE,
-            ringing_search_max=RINGING_SEARCH_MAX,        
-            ringing_drop_db=RINGING_DROP_DB,             
-            ringing_persistence=RINGING_PERSISTENCE, 
-        )
-        stbd_alt = detect_fbr_slant_m(
-            stbd_db, stbd.start_mm, stbd.length_mm, stbd.num_results,
-            noise_floor_window=NOISE_FLOOR_WINDOW,
-            threshold_delta_db=FBR_THRESHOLD_DELTA_DB,
-            persistence=WITHIN_PING_PERSISTENCE,
-            ringing_search_max=RINGING_SEARCH_MAX,        
-            ringing_drop_db=RINGING_DROP_DB,             
-            ringing_persistence=RINGING_PERSISTENCE, 
-        )
-
-        # 4. Update the cross-ping altitude tracker.
+        # 3. Altitude. The tracker never withholds: locked, else provisional,
+        #    else last known. `None` means nothing has ever been detected, and
+        #    resolves to 0.0 -- no slant correction, ground range = slant
+        #    range. That is an identity transform, not a fabricated altitude,
+        #    and it matches the GCS "Depth comp. = off" value exactly.
+        #    NON-NEGOTIABLE #2: no ping is withheld while the tracker
+        #    bootstraps.
         altitude = self._fbr.update(port_alt, stbd_alt)
         if altitude is None:
-            self._dropped_bootstrap += 1
-            if self._dropped_bootstrap == 1 or self._dropped_bootstrap % BOOTSTRAP_PINGS == 0:
+            altitude = 0.0
+        if not self._fbr.locked:
+            self._unlocked_pings += 1
+            if self._unlocked_pings == 1 or self._unlocked_pings % 50 == 0:
                 log.info(
-                    f"FBR bootstrap in progress "
-                    f"({self._dropped_bootstrap} ping pairs dropped so far; "
-                    f"port_fbr={port_alt}, stbd_fbr={stbd_alt})"
+                    f"FBR not locked: {self._unlocked_pings} ping(s) emitted with a "
+                    f"provisional altitude so far (port_fbr={port_alt}, "
+                    f"stbd_fbr={stbd_alt}); none dropped"
                 )
-            return
-        if not self._already_bootstrapped_logged:
-            log.info(f"FBR bootstrapped: altitude = {altitude:.2f} m above seabed")
+        elif not self._already_bootstrapped_logged:
+            log.info(f"FBR locked: altitude = {altitude:.2f} m above seabed")
             self._already_bootstrapped_logged = True
 
-        # 5. Water depth = transducer altitude + submersion.
+        # 4. Water depth = transducer altitude + submersion.
         water_depth = altitude + TRANSDUCER_SUBMERSION_M
 
-        # 6. Slant-range correct each side; drop water-column samples.
-        port_y, port_int = project_side(
-            port_db, port.start_mm, port.length_mm, port.num_results,
-            altitude_m=altitude,
-            transducer_y_offset_m=TRANSDUCER_Y_OFFSET_PORT_M,
-            side_sign=+1.0,
-        )
-        stbd_y, stbd_int = project_side(
-            stbd_db, stbd.start_mm, stbd.length_mm, stbd.num_results,
-            altitude_m=altitude,
-            transducer_y_offset_m=TRANSDUCER_Y_OFFSET_STBD_M,
-            side_sign=-1.0,
-        )
+        # 5. Slant-range correct each present side; drop water-column samples.
+        #    The geometry comes from each message's own channel_number, not
+        #    from the subscription it arrived on (NON-NEGOTIABLE #1), so a
+        #    packet delivered to the wrong topic still lands on the right side.
+        port_y, port_int = [], []
+        stbd_y, stbd_int = [], []
+        if port is not None:
+            sign, offset = self._side_geometry(0)
+            port_y, port_int = project_side(
+                port_db, port.start_mm, port.length_mm, port.num_results,
+                altitude_m=altitude,
+                transducer_y_offset_m=offset,
+                side_sign=sign,
+            )
+        if stbd is not None:
+            sign, offset = self._side_geometry(1)
+            stbd_y, stbd_int = project_side(
+                stbd_db, stbd.start_mm, stbd.length_mm, stbd.num_results,
+                altitude_m=altitude,
+                transducer_y_offset_m=offset,
+                side_sign=sign,
+            )
 
-        # 7. Snap robot pose using port stamp (pair is within tolerance).
-        merged_ns = stamp_to_ns(port.header.stamp)
-        odom = self._odom_buf.nearest(merged_ns)
+        # 6. Robot pose at the ping, interpolated between the odom samples
+        #    that bracket it (nearest when none do). Both halves of a
+        #    complete row are the same acquisition instant, so either stamp
+        #    resolves to the same pose.
+        odom = self._odom_buf.pose_at(stamp_to_ns(ref.header.stamp))
         if odom is None:
             self._dropped_no_odom += 1
+            if self._dropped_no_odom == 1 or self._dropped_no_odom % 20 == 0:
+                dt = self._odom_buf.last_refused_dt_ns
+                detail = ("" if dt is None else
+                          f" (nearest odom is {dt / 1e9:.1f} s away — "
+                          "stale topic or a sonar/odom clock mismatch)")
+                log.warn(
+                    f"dropping ping: no usable /blueboat/odom pose{detail}; "
+                    f"total dropped: {self._dropped_no_odom}")
             return
 
-        # 8. Assemble + publish.
+        # 7. Assemble + publish.
+        zero_stamp = TimeMsg()
         out = ProcessedSSSPing()
-        out.port_stamp = port.header.stamp
-        out.starboard_stamp = stbd.header.stamp
-        out.port_ping_number = port.ping_number
-        out.starboard_ping_number = stbd.ping_number
+        out.port_stamp = port.header.stamp if port is not None else zero_stamp
+        out.starboard_stamp = stbd.header.stamp if stbd is not None else zero_stamp
+        out.port_ping_number = port.ping_number if port is not None else 0
+        out.starboard_ping_number = stbd.ping_number if stbd is not None else 0
         out.robot_x = float(odom.pose.pose.position.x)
         out.robot_y = float(odom.pose.pose.position.y)
         out.robot_orientation = odom.pose.pose.orientation
         out.water_depth = float(water_depth)
-        out.transducer_x_offset = float(TRANSDUCER_X_OFFSET_M)
+        out.transducer_x_offset = float(self._transducer_x_offset_m)
         out.port_intensity_db = port_int
         out.port_y = port_y
         out.starboard_intensity_db = stbd_int
         out.starboard_y = stbd_y
         self._pub.publish(out)
+
+        self._emitted += 1
+        torn = port is None or stbd is None
+        if torn:
+            self._one_sided += 1
+        self._torn_recent.append(torn)
+        if len(self._torn_recent) == TORN_WINDOW_ROWS:
+            share = sum(self._torn_recent) / TORN_WINDOW_ROWS
+            if share > TORN_WARN_SHARE and not self._torn_warned:
+                self._torn_warned = True
+                log.warn(
+                    f"{share * 100:.0f}% of the last {TORN_WINDOW_ROWS} rows are "
+                    "one-sided: port and starboard are not being paired. "
+                    "One transducer may be silent, or the two streams are on "
+                    "different clocks; if this started after relaunching the "
+                    "sonar node, the counter re-base should clear it within "
+                    f"{OFFSET_PREROLL_MAX} pings.")
+            elif share < TORN_WARN_SHARE / 2:
+                self._torn_warned = False
 
 
 # ---------------------------------------------------------------------------

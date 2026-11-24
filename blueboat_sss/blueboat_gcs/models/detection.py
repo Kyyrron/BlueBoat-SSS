@@ -43,9 +43,17 @@ class Detection:
 
 @dataclass(frozen=True, slots=True)
 class PingerFix:
-    """Last known USBL pinger position in the local odom frame."""
+    """Last known USBL pinger fix.
+
+    ``frame`` is the frame the coordinates were *received* in:
+    ``"body"`` = vehicle-relative (x forward, y port — the USBL's native
+    output, a 3-vector on the wire), ``"world"`` = local odom frame (the
+    ``fixed_pinger`` / corrected 2-vector). The GUI rotates body-frame
+    fixes through the robot pose before display.
+    """
 
     t: float
     x: float
     y: float
     accuracy_m: Optional[float] = None
+    frame: str = "world"

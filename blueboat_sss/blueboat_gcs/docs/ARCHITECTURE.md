@@ -89,9 +89,12 @@ mosaic itself never leaves the metric frame. The equirectangular math is the exi
 
 ### 2.6 Acquisition control
 `ros/pipeline_launcher.py` runs `ros2 launch blueboat_sss SSS_processing_launch.py`
-(new launch file, processor node only — the app **never** starts `sss_node.py`, which
-runs on the robot) in its own process group. START additionally publishes `true` on
-`/side_scan_sonar/ping/enable` and `/sss_processor/log/enable` after a bring-up delay;
+in its own process group — the processor node, plus `sss_node.py` when the toolbar's
+**Sonar** selector says *Real sonars* (`with_acquisition:=True`; refused, processor
+only, while a simulator or a hand-started driver already is `/side_scan_sonar` —
+`ros/sonar_source.py`). Everything runs on the operator laptop. START additionally
+publishes `true` on `/side_scan_sonar/ping/enable` (once the sonar node subscribes)
+and `/sss_processor/log/enable` after a bring-up delay;
 STOP publishes `false`, SIGINTs the launch group, escalates to SIGKILL after a grace
 period, and saves the mosaic + trajectory to `data/SSS_data/<date>/` (same artifacts as
 the legacy listener). All behaviour is configurable in `config/default.yaml`.
@@ -244,7 +247,7 @@ inversion of the pixel→world formula for the column).
 
 ### 2.17 Sea-trial pose alignment (update)
 Live trials showed every ping pinned at (0, 0) with GPS on, while waterfall and
-rosbag-replay were fine. Root cause is robot-side: `sss_processor_node` snaps its pose
+rosbag-replay were fine. Root cause is upstream: `sss_processor_node` snaps its pose
 from `/blueboat/odom`, and the live publisher of that topic either emits zeros or
 stamps on a clock different from the sonar profiles (the processor's tolerance-free
 nearest-stamp lookup then latches a boot-time zero). Rosbag replays are immune because
@@ -254,7 +257,7 @@ hence "bag works, live doesn't". Two GCS-side defenses live in
 (1) `FrozenPoseDetector` + `main_window._align_ping_pose` re-stamp pings from the
 GCS's own `RobotState` when embedded poses stay frozen at the origin though telemetry
 shows motion (`pose_source: auto|embedded|gcs`), emitting one console warning naming
-the robot-side cause; (2) `GpsPoseSynthesizer` in `telemetry_listener` dead-reckons a
+the upstream cause; (2) `GpsPoseSynthesizer` in `telemetry_listener` dead-reckons a
 pose from NavSatFix + compass when `/blueboat/odom` is silent or zero-frozen, so
 trajectory, origin binding and re-stamped pings all align on the satellite map even
 with a broken live odom.
@@ -267,6 +270,24 @@ GPS position for direct real-world checking. `WaterfallView` gained an in-view c
 strip — manual zoom −/+ (sharing the wheel-zoom math) and an "AI detections" checkbox
 gating the marker overlay — which, being children of the view, appear in both the main
 and replay windows with no extra wiring.
+
+### 2.19 Sonar stream integrity & adaptive rendering (update)
+Driven by measurements on paired SonarView/our-stack recordings
+(`docs/SONARVIEW_SVLOG_ANALYSIS.md`). Four decisions:
+(1) **the packet is authoritative, not its envelope** - side comes from
+`channel_number` (fallback: sign of `transducer_heading_deg`), because 19.8 % of real
+packets carried a wrong `src` tag and produced the mirrored mosaic;
+(2) **assemble, never pair-and-drop** - rows are grouped by `ping_number` and emitted
+even when one-sided, which recovered 10.4 % of discarded rows and made single-
+transducer logs loadable;
+(3) **never withhold a ping for lack of a depth lock** - the FBR tracker returns
+locked/provisional/last-known and `resolve_altitude` implements SonarView's
+auto|manual|off source selector;
+(4) **nothing is rendered at a fixed resolution** - `MosaicService` derives the
+ground-sample distance from the data's own across-track sample spacing, and
+`SonarPing.slant_range_m` gives the waterfall a column scale that does not move when
+the altitude estimate wobbles (live, it is recovered exactly as
+`hypot(ground_max, water_depth)`).
 
 ## 3. Module map
 
@@ -287,9 +308,10 @@ and replay windows with no extra wiring.
 | `ros/sonar_listener.py` | `/sss_processor/processed` → `SonarPing` |
 | `ros/telemetry_listener.py` | odom + NavSatFix + compass + VfrHud → `RobotState` (5 Hz); GPS dead-reckoning fallback |
 | `utils/pose_alignment.py` | frozen-pose detector, GPS pose synthesizer, robot→world (sea-trial fix) |
+| `ros/sonar_listener.py` | ProcessedSSSPing → SonarPing; stream-health counters, slant-range recovery |
 | `ros/detections_listener.py` | **placeholder** — AI detections integration point |
 | `ros/pinger_listener.py` | USBL pinger (Float32MultiArray [x, y] on /blueboat/pinger_coordinates) |
-| `ros/path_listener.py` | planned mission path (`nav_msgs/Path` from path_publisher.py) |
+| `ros/path_listener.py` | planned mission path: ONE `/path_request` over the running trajectory's duration (MCS's preview call; decisions in `core/deployed_path.py`), `/set_path` as the fallback |
 | `ros/pipeline_launcher.py` | acquisition state machine, shutdown escalation, leftover sweep |
 | `mapping/mosaic.py` | reused `MosaicGrid` + `project_to_world` + priority planes + bilinear splat |
 | `mapping/rasterizer.py` | across/along-track ping densification (SonarView-grade mosaics) |
@@ -315,7 +337,7 @@ and replay windows with no extra wiring.
 # bench / demo, no ROS required
 python -m blueboat_gcs.main --sim
 
-# field, on the basestation (blueboat_interfaces sourced)
+# field (blueboat_interfaces sourced)
 python -m blueboat_gcs.main
 python -m blueboat_gcs.main --config my_site.yaml
 ```

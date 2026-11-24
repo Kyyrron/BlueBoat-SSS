@@ -1,0 +1,552 @@
+# TODO — BlueBoat-SSS
+
+Open questions, unverified assumptions, and work not yet done. Nothing here is
+settled; nothing here is restated as fact in CLAUDE.md.
+
+Items checked against the repository carry the file and line where the condition was
+confirmed. Items that need a sourced ROS 2 environment, the corpus or a field session are
+marked with why.
+
+---
+
+## Transducer fore/aft arm (2026-11-15, CR-SSS-1 / CR-SSS-2; handoff `~/ros2_ws/sim_runs/sim_acceptance/06_sss/handoff_06.md`)
+
+Done 2026-11-15 (owner's decision of 2026-11-14):
+- **One set of values**: fore/aft −0.345 m in the processor (`TRANSDUCER_X_OFFSET_M`, the
+  default of the new node / launch parameter `transducer_x_offset_m`) and in the GCS
+  (`core/svlog.py`, `alignment.transducer_x_offset_m`), = the simulator's `model.mount_x_m`.
+  **Adopted, not measured.**
+- **The GCS places every ping from the transducers' point**: mosaic (both modes), swath
+  line, waterfall click, seabed-picture grids (georef convention 3 when the arm is not 0).
+- Effect on one object seen on two opposite headings (handoff, section 4): simulated tyres
+  0.70–0.72 m apart before, 0.01–0.03 m after; real mooring block A1 0.76 → 0.07 m, A2
+  1.31 → 0.62 m.
+
+Open:
+- [ ] **The arm is not measured** (CR-OWN-1). On the real boat it counts from the navigation
+  fix: the pool corpus read −0.60 m with the GPS near the bow, the drawing says −0.345 m from
+  the hull centre. Needs reciprocal passes over a point target, at equal range on both passes
+  so a heading error cancels. Then one value in `owner_measurements.yaml`, the simulator's
+  profile and the two defaults here (`tests/test_fore_aft_arm.py` fails until they agree).
+- [ ] **A2's residual of 0.6 m is not explained.** Its two passes are at 20.2 m and 9.4 m;
+  A1's, at 13.9 m and 10.3 m, close to 0.07 m. An arm or a clock lag acts the same on both
+  blocks, so the difference is range-dependent: a heading error is the candidate (not
+  established; one recording, frozen autopilot clock).
+- [x] **BlueBoat-Perception places detections with the arm** (2026-11-18 check: done in Perception
+  `0d55d76`, 2026-11-15, CR-PER-2; session 12 confirmed Perception's grids equal the station's `_world.npz`
+  bit for bit on 34/34 pictures, `~/ros2_ws/sim_runs/perception/handoff_12_cr_per_2.md`). Before it, the map
+  showed its markers 0.345 m along-track off the mosaic.
+- [ ] **A per-session arm on the real boat.** The value is now a parameter in both places;
+  nothing yet records where the GPS sat on the day.
+
+## From the pool corpus (SSS-Sim field-calibration pass 3; plan `~/calib/pass3/GCS_PLAN.md`)
+
+Done 2026-11-02 (operator's order):
+- **Bag replay records nothing in Simulation** — MCS's replay starts no sonar (owner,
+  2026-10-27); START now starts the simulator over the replay's world folder
+  (`ros/sonar_source.py`, `ros/pipeline_launcher.py`, `pipeline.replay_simulator*`), and the
+  replay window's "no usable pings" dialog tells "no sonar profile" from "no pose". Verified
+  end to end on `pool_1w` + the 12:13:18 pool bag (727 two-sided pings / 39 s, all placed).
+- **Submersion 0.22 m** (measured) in `sss_processor_node` and `core/svlog.py`.
+- **Late pings reordered picture rows** — inserted at their time order (`SeabedImager._late_index`).
+
+Open:
+- [ ] **Replay pose rate**: during the replay the processor received `/mavros/*` at 3–4 Hz
+  although the bag holds 10.7–13 Hz (`recording below SonarView's rates`), so a
+  replay svlog's pose is coarse (the simulator itself renders from the 100 Hz replay pose).
+  Find where the rate is lost (bag_replay republish, QoS, CPU).
+- [ ] **Square rows repeat pings at pivot turns** (30–65 % on `weight_1time`): the
+  navigation point (GPS near the bow) outruns the transducers. Needs along-track from the
+  transducers' own track. The arm now exists on every ping (`SonarPing.x_offset_m`,
+  `sensor_x` / `sensor_y`, 2026-11-15) and the pictures have a georef convention with it
+  (convention 3); what is left is to feed `AlongTrackEstimator` the transducers' point in
+  the imager and the waterfall. Not done on 2026-11-15 on purpose: it changes which ping
+  each square row copies, i.e. the detector's input, and the arm is adopted, not measured
+  (−0.345 m drawing vs −0.60 m from the pool's navigation fix).
+- [ ] **Display fit ignores seabed nearer than 1 m** (`mosaic.water_column_min_m`): at 0.6 m
+  altitude the 0.6–1 m band never enters the curve. An acquisition-derived bound
+  (`max(0.15 m, 11 bins)`, the measured ringing) was tried on 2026-11-02 and reverted: it
+  moves the Perception golden's display model, so it needs a deliberate golden rebaseline
+  (owner's call).
+- Not done, by design: freezing the display model per session (plan item 2) reverts the
+  2026-09-19 decision "re-published, never frozen"; a fixed waterfall vertical scale (item
+  3) reverts the 2026-09-18 true-scale decision. Both need the owner to reopen them.
+
+## From SSS-Sim calibration pass 4 (2026-11-02; report `~/calib/pass4/step1/D5b/REPORT.md`, owner's machine)
+
+Evidence: the 2026-10-28 water run (`fragmentation_evidence_8`) and a replay of it. The
+report is not readable from this repository; its numbers are carried, not re-derived.
+
+Done 2026-11-03 (`src/sss_processor_node.py`, tests in `tests/test_processor_assembly.py`):
+- **The 30 Hz rate request did not hold**: 30 Hz for ~9 s of every 30 s re-assert period,
+  4 Hz for the other ~21 s. The request is now also renewed when the slowest of ATTITUDE /
+  GPI / LPN, measured on arrival over the last 3 s (`_PoseRateMeter`, recording or not),
+  is below `POSE_RATE_WARN_HZ`, at most once per 5 s (`POSE_RENEW_HOLDOFF_S`); the 30 s
+  re-assert stays the fallback, and without the service (simulation) nothing is requested.
+  `MAVLINK_RATE_REASSERT_S` was left at 30 s: the trigger already renews within ~3–5 s of
+  a drop, so a shorter fixed period would only add requests while the rate holds. No
+  topic, type or QoS changed.
+- **Rate watchdog's first window diluted** (2.8 Hz reported): it started at the previous
+  tick, before the `.svlog` opened. It now opens at the first logged pose envelope (or at
+  the first tick of a recording with none, so a missing pose still reports 0 Hz); a window
+  under 5 s is carried into the next tick.
+- **1339 zero-stamp warnings in one replay**: `_on_odom` tested `zero_stamped == 1`, which
+  stays true after one zero stamp, so every later odom warned. Now warned once.
+- **Odom buffer never pruned after a zero-stamped first sample** (keyed on wall time
+  ~1.79e18 ns, later samples on sim time, so the head blocked both pruning loops).
+  `_OdomBuffer.push` now treats a sample more than the window behind the newest as a new
+  clock epoch and drops what lies outside the window around it (`epoch_dropped`); the
+  zero-stamp keying rule is unchanged.
+- Gates: the new node tests skip without ROS. In the cloud session that made the change
+  they were run against stubbed ROS modules only (21 pass; the 8 new ones fail on the old
+  code). **Re-run `tests/test_processor_assembly.py` with a sourced workspace.**
+
+Open:
+- [ ] **What resets the autopilot's message intervals ~9 s after each request?** Not
+      identified. Candidates, none checked: another MAVLink client on the boat (BlueOS
+      services, SonarLink or a ground station sending its own interval or stream-rate
+      requests), mavros itself, or the laptop side (`robot_interface`, MCS). Check with
+      the BlueOS MAVLink inspector on the boat: watch `SET_MESSAGE_INTERVAL` /
+      `REQUEST_DATA_STREAM` / `COMMAND_LONG` traffic and their source sys/comp ids around
+      the drop. **Needs the boat.**
+- [ ] **Does the renewal hold the pose rate on water?** Unverified. On the next real run:
+      `/mavros/local_position/odom` rate over time in the run bag, the processor's
+      "renewed" log line and its shutdown count, and the `.svlog`'s ATTITUDE / GPI / LPN
+      rates. If the rate still saws, the reset follows our own request and renewing cannot
+      outrun it; the cause above must be fixed instead. **Needs the boat.**
+
+## Node-side work (`blueboat_sss` ROS nodes) — still open
+
+Every item below is in `blueboat_sss` and is required before live/recorded data is
+correct at the source. All were re-confirmed present in the current code.
+
+- [ ] **Live re-check of the 2026-09-03 row-tearing fix.** Offline replay through
+  `_accept` and the 31 assembly tests pass; still to confirm on a live run: relaunch
+  the sonar node (sim or real) under a running `sss_processor` and check
+  `ros2 topic hz /sss_processor/processed` stays at the ping rate (not 2×) and
+  `starboard_ping_number` is non-zero on every message after ≤ 24 pings.
+- [ ] **Live 10-minute run after the 2026-09-03 GCS throughput fix.** The
+  benchmark is offline; confirm on a real 20 Hz two-sided stream that the app's
+  CPU and RSS stay flat (`top`), the waterfall follows without lag, the mosaic
+  cell size reads ~0.026 m at 15 m / 600 bins, no "display N pings behind" status
+  appears at rest, and Contrast-slider drags do not freeze the window.
+- [ ] **Field re-test of the SonarView-parity driver (2026-10-27 change set).** The
+      2026-10-27 logs lost 5.2 % (pool) and 30.9 / 60.6 / 4.0 % (harbour) of pings,
+      free-running at 34.5 Hz with 4 Hz frozen-stamp pose; SonarView lost 0 % at 20 Hz
+      with 12.8 Hz pose (`blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md` §11). The loss is
+      **before ROS** (the GCS's depth-200 `~/profile` records miss exactly the pings the
+      processor's depth-10 `~/raw` misses, all four sessions), so ROS QoS was never the
+      cause. Fixed here: own `OmniscanLink` per device (no brping, NC #3a), 50 ms per
+      ping, every device frame to `~/raw`, burst-coherent `time_boot_ms`, SonarView's
+      mavlink rate request, HEARTBEAT/STATUSTEXT, id-12, pose interpolation. On the boat,
+      pool run then harbour run, check: (1) `svlog_forensics` PRI median **50.0 ms**,
+      missing **< 0.5 %** near the base station; (2) the driver's per-side health lines
+      agree with the forensics (a loss there = device/WiFi, none = ROS); (3) ATTITUDE /
+      GPI / LPN at **12–13 Hz** in the `.svlog` and `/mavros/local_position/odom` at the
+      same rate in the run bag, no rate-watchdog warning (the 2026-10-28 run did not hold
+      it: see *calibration pass 4* above); (4) `time_boot_ms` advances;
+      (5) the `.svlog` census against a SonarView recording of the same water. What is
+      left after that is the WiFi link itself, which SonarLink (recording on the boat's
+      Pi) never crosses and nothing of ours may run on the boat (root CLAUDE.md §1.1).
+      **Needs the boat.**
+- [ ] **Does the device send status frames (id 2194) to our client unsolicited?**
+      SonarView's logs carry them at ~0.9 Hz per device; brping dropped any it got. The
+      driver now forwards them and logs the first of each id
+      (`device sends message id 2194`). If none arrive, SonarView requests them and the
+      request is unknown: capture it (the SonarLink↔Omniscan traffic is on the boat's
+      wired network, not visible from the laptop) or ask Cerulean. If they do arrive,
+      the simulator should emit them too (BlueBoat-SSS-Sim `TODO.md`, CM-2).
+      **Needs the boat.**
+- [ ] **`channel_number = 255` on every packet of our 2026-10-27 10:30 run**, 0/1 on
+      every later run that day, after SonarLink had run (10:44). Hypothesis: SonarLink
+      configures it on the device and it holds until power-off; our driver sends no such
+      command. Harmless — the side falls back to the transducer bearing (NC #1, CM-5) —
+      but it is acquisition state SonarView sets and we do not. Check: power-cycle the
+      sonars, run our stack first, read byte 34. The older "port emits
+      `channel_number=1`" item is closed by NC #3a: brping's shared receive buffer let
+      one worker parse the other device's frames. **Needs the boat.**
+- [ ] **`filter_duration_percent`: ours 0.0015 (pinned), SonarView's unknown** — it is a
+      command parameter and appears in no recorded packet. Same capture as above.
+- [ ] **The 15:07 driver process exited with code 1 at stop** (launch log of
+      2026-10-27, `sss_node.py-1: process has died`), after the brping
+      `pop from an empty deque` reconnect. The rewritten worker closes its own socket
+      and joins; confirm a clean exit on the next real stop.
+- [ ] **FBR fails in deep water** (deferred by the owner, 2026-10-27). Every harbour log
+      of 2026-10-27 has a bright near-surface band at 0.3–1 m slant (50–57 dB, the
+      median profile decaying to ~23 dB by 8 m, the seabed rise at ~10–15 m);
+      `find_noise_window_start` / `detect_fbr_slant_m` take it for the bottom
+      (detections 30–46 %, lock 33–59 %, p50 0.6–1.0 m in water several metres deep).
+      SonarView does no bottom tracking in its view (`altitude_m: 0`). Cause of the band
+      (surface reverberation and wake at roll ±10°, auto-gain 5–7) not established; a
+      lag-1 correlation test found no range-wrap echo. Study it against these four logs
+      before changing the detector (and its mirrors, NC #1-style).
+- [ ] **Fix `/blueboat/odom`** so it is non-zero and stamped on the same clock as the
+      sonar profiles. **Cause found live 2026-10-27:** `BlueBoat_launch.py` builds
+      `SimpleLauncher(use_sim_time=True)`, mavros inherits it and, with no `/clock`, stamps
+      `/mavros/local_position/odom` (hence `/blueboat/odom`) with sec 0 while the profiles carry
+      wall time; the processor's stamp-based buffer pruned every pose and dropped every ping
+      (4000+ in one session). **Processor side worked around** (`_OdomBuffer.push` keys a zero
+      stamp on arrival time, warns once; tests `test_odom_buffer_keys_a_zero_stamp_on_arrival`,
+      `test_zero_stamped_odom_places_pings_on_the_node`); the source fix (mavros
+      `use_sim_time: False`, or restamping in `robot_interface`) stays a Control item.
+      The GCS pose-alignment fallbacks are mitigations, not a fix. Note
+      the processor-side consequence is severe: the processor treats pose as a hard gate
+      and drops every ping that has no odom (`src/sss_processor_node.py`, `_emit_group`,
+      `_dropped_no_odom`). Since assembly now emits one-sided rows and no longer
+      withholds for bootstrap, this is the **only** remaining drop in the processor.
+      Owned by BlueBoat-Control. **Needs the boat: a zero-reading `/blueboat/odom` is a
+      robot_interface/hardware condition, not reproducible without a real-robot
+      run.**
+
+---
+
+## Closed on 2026-09-19 (live vs replay: "replay is way better")
+
+The operator reported the live waterfall and mosaic looking markedly worse
+than the same data on replay. Root cause and fixes, all O(1) per ping:
+
+- [x] **The live display model froze after `warmup_rows` and nothing unfroze
+  it** (`core/display_model.py`). Everything after the first ~15 s was drawn
+  through a curve fitted on the launch area — one altitude, one range
+  setting, one bottom type — while replay fitted the whole file
+  (`gui/replay_window.py` calls `DisplayModel.fit`). Worse, `observe_row`
+  returns immediately when frozen, so a session whose bottom tracker had not
+  locked during those first 300 rows froze an **empty** histogram and spent
+  the rest of its life on the raw 2/98-percentile fallback — the
+  near-white / far-black picture. It now **re-publishes** instead of
+  freezing: the histogram was always accumulated per row, and the solve
+  behind `version` is cached (`_snapshot`) and runs once per publish, once
+  every `warmup_rows` rows. Gated by `test_warmup_publishes_and_keeps_-
+  observing`, `test_a_late_regime_change_is_learned_live` and
+  `test_streaming_matches_a_whole_pass_fit` — the last is the parity every
+  existing test missed, because they all hold the model *fixed*.
+- [x] **The live mosaic kept the 55 dB transmit ringing that replay blanks.**
+  `depth.blank_nadir` / `nadir_blank_m` were read only by `core/svlog.py`,
+  and the robot's processor passes no blank (`sss_helper.py`), so the
+  ringing landed at ground range ≈ 0 and painted a saturated stripe down the
+  track. `attach_native` takes the blank now, wired from the config through
+  `SonarListener`. Gated by `test_live_nadir_blank_matches_replay`.
+- [x] **The mosaic's warm-up hold-back waited for a freeze that no longer
+  happens**, so it is released on readiness instead (`core/mosaic_service.py`).
+
+## Still open from the same review
+
+- [ ] **The two mosaics are not the same product.** Live is in **ground
+  range** (the processor corrects with its tracked altitude and deletes the
+  water column); replay defaults to **slant range** (`depth.mode: "off"`,
+  the SonarView convention) and keeps it. And `MosaicService._normalised`
+  reconstructs `r = hypot(|y|, h)`, which is exact live and *over-estimates*
+  on the replay path where `y` is already slant. Pick one geometry for both
+  deliberately and fix `_normalised` with it — the operator currently
+  prefers the replay one, which is the mis-normalised one.
+- [ ] **Fixed metres-per-pixel imagery.** The seabed pictures and the
+  waterfall are one column per device range bin, so their across-track scale
+  changes with `range_length_mm` (25.0 mm at 15 m, 33.3 at 20 m, 600 bins)
+  and two runs at different range settings are not comparable at the same
+  zoom. Resample each row onto a fixed ground pitch (`seabed.pixel_pitch_m`,
+  0.025 m) with `native` kept as an option. **This changes the seabed-image
+  contract** — the root `CLAUDE.md` §4.5 says "verbatim values, one column
+  per device range bin" — so the row there moves in the same change. It
+  stays CM-10-compliant (waterfall-domain, boat-relative).
+- [ ] **Cache misses degrade one side of the live waterfall only.** On a
+  miss `core/live_native.py` re-projects from the processor's ground samples:
+  the centre gap widens on that side, the pitch becomes a median estimate
+  and `analog_gain` is lost, so gain compensation silently switches off for
+  that row/side. Tolerated up to 5 % without a word.
+- [ ] **Cosmetic, live-only:** the render throttle above `ping_lag_throttle`;
+  only two stale tiles re-rendered per pass after a model publish; replay not
+  pushing the slider gamma onto `DisplayModel.gamma` (exported pictures only).
+
+## Closed on 2026-09-18 (the simulator review's Part 6, GCS + processor half)
+
+- [x] **`GLOBAL_POSITION_INT` velocities were hard-coded to zero** — so every
+      `.svlog` this node writes claimed a stationary boat, and the along-track
+      scale of a replayed waterfall is read from exactly those fields. They now
+      come from `/mavros/local_position/velocity_local` (ENU → NED, cm/s), which
+      the node already subscribed for its `LOCAL_POSITION_NED` twin; no velocity
+      still means zeros, which the schema allows.
+- [x] **The planned path was cut at 1000 s.** `path_publisher` (BlueBoat-Control,
+      frozen at v1.0) asks the path service for a fixed `total_time` window, so the
+      1317 s survey of 2026-09-07 drew as its first 1000 s. ~~The station now reads
+      the trajectory it deployed itself (the newest `.deployed/*.yaml`, placed
+      through the designer file's `geo_anchor`)~~ — **wrong on both counts, replaced
+      2026-09-28** (below).
+
+## Planned path (2026-09-28)
+
+- [x] **The GCS drew another mission, 24.5 m off, in World Builder simulations.**
+      The 2026-09-18 source read the *newest* `.deployed/*.yaml` once, at the first
+      GPS anchor, and then ignored `/set_path` for the session. MCS deletes the
+      current mission's deployed file at launch and rewrites it only after its GPS
+      fit converges, and the sim anchors first, so "newest" was an older mission
+      (`plage_lawnmower` during `plage_bathymetry2`). Even the right file was
+      re-projected through the designer's `geo_anchor` although `deploy_mission`
+      had already put its points in the run's world frame: a `design_offset`
+      shift. Now the listener does what MCS does for its preview: it reads
+      `path_generation`'s `trajectory` / `yaml_path` parameters and sizes ONE
+      `/path_request` by that file's duration. It asks again only when the file's
+      mtime changes, the server restarts or the overlay is cleared, and it draws the
+      world-frame answer directly. `/set_path` draws only when no server answers.
+      Code: `core/deployed_path.PlannedPathSource`, `ros/path_listener.py`,
+      `config.planned_path`. Test: `tests/test_deployed_path.py`. Checked live
+      against a real `path_generation` on an isolated domain: it waited for
+      deployment, then drew 2636 poses of the 1317.6 s loop, starting at (0, 0).
+- [x] **RViz drew the first 600 s (world mode) or 1000 s (empty Gazebo).**
+      `path_publisher` builds its window once, at startup, when the deployed file
+      does not exist yet. `blueboat_sss_sim`'s `full_mission_launch.py` and
+      (post-v1.0, ordered by the owner) `blueboat_control`'s `Sim_launch.py` now take
+      the duration from the designer file a `.deployed/` path names first.
+- [ ] **Live check in an MCS-launched world simulation**: the GCS status line
+      names the running mission, its first pose sits on the spawn point, and RViz
+      shows the whole loop. This needs
+      `colcon build --packages-select blueboat_sss_sim blueboat_control` first,
+      because both launch files are installed copies.
+- [x] **The waterfall's "True scale" toggle, and its silent fallback.** Removed:
+      the aspect is now taken from the rows on screen (so a mission that changed
+      range mid-survey is drawn in the scale of what you are looking at) and the
+      state is written in the corner — including "scale unavailable" and "mixed
+      scale", which were previously a silent reversion to square pixels.
+- [x] **The Contrast slider did not reach the saved AI pictures.** It drove the
+      screen, the mosaic and `metadata.json` but not `DisplayModel.gamma`, which is
+      what `SeabedImager.to_png8` renders through: the 2026-09-07 session ran at
+      γ 0.48 on screen and wrote its PNGs at 0.7. Fixed, and the shipped default
+      moved to 0.5. `tests/test_display_startup.py`.
+
+---
+
+## BlueBoat-Perception integration (2026-10-16, by the owner's order)
+
+What changed and what is pinned unchanged: `blueboat_gcs/docs/PERCEPTION_INTEGRATION.md`.
+
+- [x] **Baseline repair after `994a74b` (labelled, no behaviour change).** The gate was
+      red before any edit: 298 pass / **4 fail** / 50 skip. All four were stale
+      expectations written before `994a74b` set `TRANSDUCER_SUBMERSION_M = 0.15` and the
+      0.285 m lateral offsets; each was updated to the committed constants:
+      `test_live_native::test_attach_hit_is_the_verbatim_profile_bins` (bottom =
+      water_depth − 0.15), `test_nadir_blanking::test_off_mode_blanks_the_ringing_and_keeps_the_water_column`
+      (ground ranges measured from the transducer, i.e. minus the lever),
+      `test_processor_assembly::test_unlocked_altitude_is_an_identity_transform_not_a_guess`
+      (water_depth = the submersion, y = lever + slant) and
+      `test_seabed_pictures::test_live_and_replay_pings_give_identical_pictures` (both
+      rows given water_depth = altitude + 0.15). Gate after the repair: 302 / 0 / 50.
+- [x] **One detection source: Perception.** The in-process `dummy_center_analyzer`, the
+      imager's `analyzer` argument and `generate_from_pings(run_analyzer=…)` are gone;
+      `/sss_ai/seabed_analysis` keeps publishing with `detections: []`; Run AI uses
+      Perception's core. Golden: `tests/test_perception_golden.py` over
+      `tests/fixtures/perception_golden.json` (captured from the unmodified code).
+- [x] **Bug fix: the profile-miss fallback ignored the lever arm** (same root cause as
+      the four stale tests). `core/live_native.attach_native` now inverts with the
+      processor's altitude and lever; `tests/test_fallback_lever_arm.py` shows the row
+      position before (bin 83, far end 20.16 m) and after (bin 72, 20.0 m).
+- [ ] **The live listener's configured-range estimate ignores the lever arm.**
+      `ros/sonar_listener.py` recovers `slant_range_m = hypot(max|y_local|, water_depth)`;
+      since `994a74b` `max|y| = 0.285 + sqrt(R² − h²)` and `water_depth = h + 0.15`, so the
+      estimate is slightly long (+0.29 m at R = 20 m, h = 1.2 m). **Latent:** no GCS code
+      reads `SonarPing.slant_range_m` today (grep 2026-10-16; the waterfall and the
+      pictures use the native bins' own pitch and extent). Not changed here (not
+      ordered); fix with the inverse the fallback now uses before anything reads it.
+- [ ] **`native_bins`' reconstruction from `y_local` uses no lever arm**
+      (`models/sonar.py`, the path for a ping carrying no native payload — the bench
+      simulator, synthetic pings; live rows always get one from `attach_native`).
+      Exact for a producer projecting with no lever; wrong by the lever for one that
+      does. Check which producers still reach it.
+- [ ] **Station uids repeat across streams.** Both the old in-process range
+      (`1_000_000 + 16·image_id + k`) and Perception's (`2_000_000 + …`) restart with
+      `image_id` at every START, so a new stream's markers replace the previous stream's
+      on the map (`DetectionLayer.upsert` by uid). Behaviour kept as it was; a stream-
+      aware uid needs a contract change on both sides.
+- [x] **Along-track speed window 5 s → 2 s** (2026-10-16, BlueBoat-Perception decision
+      6.3): `config.along_track.window_s`, read in one place
+      (`AlongTrackEstimator.from_config`, used by the waterfall and the imager).
+      Per-picture along-track scale p5–p95 0.88–1.10 → 0.94–1.07 (real), 0.86–1.14 →
+      0.97–1.07 (sim), no added row jitter (Perception `PREPROCESSING_STUDY.md` §5 M2,
+      M2b). `tests/test_along_track.py`; the Perception golden pins the 5 s it was
+      captured with. **Open:** 1 s measured "not worse" but unvalidated on real data
+      (the reference is the autopilot's EKF pose) — check against RTK / USBL.
+- [ ] **TVG of the device: not identifiable from its output** (2026-10-16). The GCS's
+      "pre-TVG" reading and the simulator's `tvg_compensation: 0.30` describe the same
+      falloff (only `spreading · (1 − tvg)` is fitted). `docs/SCIENTIFIC_BACKGROUND.md`
+      §2 now says so (it claimed the simulator used 0). Settling it needs the vendor's
+      receiver documentation or a calibrated target at known ranges.
+- [ ] **Live and offline pictures differ in the first 0.75 m of slant range** (NaN live
+      from `attach_native`'s nadir blank, full dB offline). Perception treats NaN as "no
+      sample"; a detector trained offline sees the ringing there, one run live does not.
+      Perception's `near_range_mask_m: 0.75` (its decision 6.5) blanks the same span in the
+      detector input, making the two equal; its default stays 0.0 until a detector
+      comparison decides (Perception `PREPROCESSING_STUDY.md` §6.5).
+- [ ] **Bin convention: the GCS and the simulator differ by 0.08 %** (found 2026-10-16
+      by BlueBoat-Perception's dataset labels).
+      - `models/sonar.native_from_profile` puts sample i at `start + i·L/(N − 1)`.
+      - The simulator renders bin k over `[k·L/N, (k + 1)·L/N)`, centre `(k + 0.5)·L/N`
+        (`sss_sim_node._watercolumn_mask`).
+      - The seabed pictures' georeferencing therefore scales slant by `N/(N − 1)`: 1.7 cm
+        at 20 m with 1200 bins, under one bin.
+      - Which convention the real Omniscan follows is not documented here.
+      - Perception's labels use the simulator's. Not changed: not ordered.
+- [ ] **`t_start_s` is the newest row's time** (row 0 = newest). Correct and documented
+      now, but the name reads as "start"; consumers must not take it as the oldest.
+
+---
+
+## Code/doc drift found in the tree
+
+- [ ] **`docs/SCIENTIFIC_BACKGROUND.md` §2 says the simulator runs `tvg_compensation: 0`**;
+      it is 0.30 since 2026-09-18 (the simulator's `docs/sonar_model.md` §3), and §4's
+      "causally smoothed altitude" is not in the code. Found 2026-10-16, not changed.
+- [x] **Stale statements fixed 2026-10-16:** the transducer constants "all 0.0"
+      (`CLAUDE.md`, HANDOVER §4: 0.285 / 0.15 since `994a74b`); the live display model
+      "freezes after the warm-up" (GCS `CLAUDE.md`: re-published every 300 rows since
+      2026-09-19); the analysis payload "schema 1" (GCS `CLAUDE.md`, HANDOVER §3.1bis: it
+      follows the picture metadata, 4 then 5).
+
+- [x] **`with_acquisition:=True` can never start the acquisition node.** **Fixed
+      2026-09-15:** nested launch-time groups (`sl.group(unless_arg='will_use_rosbag')`
+      → `sl.group(if_arg='with_acquisition')`), verified by evaluating the launch
+      description under all four flag combinations. Original finding: confirmed by
+      running it: `SSS_processing_launch.py:55` guarded the node with
+      `if sl.arg('with_acquisition') and not sl.arg('will_use_rosbag')`, but outside an
+      opaque function `simple_launch`'s `arg()` returns a `SimpleSubstitution` object,
+      which is always truthy — so `not sl.arg('will_use_rosbag')` is always `False` and
+      the branch is unreachable regardless of what is passed. `ros2 launch blueboat_sss
+      SSS_processing_launch.py with_acquisition:=True` starts `sss_processor` alone.
+      The same pattern would break `will_use_rosbag:=True`. Both flags are documented as
+      working in `CLAUDE.md`'s Commands section and in the launch file's own docstring.
+      Fix with launch-time conditions (`IfCondition` / `sl.group(if_arg=...)`) evaluated
+      as substitutions, not with Python truthiness. `SSS_simple_launch.py` is unaffected
+      — its equivalent guard at `:30` is commented out.
+
+---
+
+## Unresolved technical questions
+
+- [ ] **Which transfer ships as the default — `power` (γ 0.7) or `db_window`?** Both
+      exist since 2026-09-15 (`display.transfer`); the power law stays the default by
+      decision until a **paired comparison on real data** exists: the same field
+      `.svlog` rendered by SonarView (screenshot, its id-12 view state recorded:
+      `gamma 0.2`, `signal_range_min/max`) and by the GCS under each transfer, judged on
+      seabed CV, shadow contrast and target visibility (`project_review.md` §3.2/§3.5,
+      §5). **BLOCKED — needs a SonarView machine** (none here).
+
+- [ ] **Record one post-patch mission with our stack.** Every local `.svlog` was
+      recorded by SonarLink or by the July processor; nothing in the corpus exercises
+      the 2026-09-15 changes end to end (gain compensation with the real gain ladder,
+      the along-track estimator at 20 Hz, the threaded export at STOP). One harbour
+      session at 20 m / 20 Hz with Record ON, then `tests`' corpus items re-checked
+      against it. **BLOCKED — needs the boat.**
+
+- [x] **SonarView still renders better than us at identical range settings.**
+      Resolved 2026-09-05 for the waterfall, the AI pictures and the mosaic by the one
+      display model (`core/display_model.py`; `docs/SCIENTIFIC_BACKGROUND.md`): TL
+      removed, per-side seabed curve in `r/h` (histogram mode), power-law transfer, no
+      low handle; live path fed the raw profiles (`core/live_native.py`); true-scale
+      view; square-pixel pictures. Rendered against SonarView's picture of the same
+      2026-09-04 simulation log: black nadir with the thin bottom line, uniform seabed
+      near-to-far, black shadows behind the walls, no vertical bands
+      (`gamma 0.7`, `hi_pct 95` matched SonarView's median seabed brightness).
+- [ ] **Live re-check of the 2026-09-05 raw-profile attach.** On a real 20 Hz two-sided
+      stream (processor + GCS on the sim graph or in a real-robot run) confirm the console never
+      prints the "rows had no raw profile in time" line at rest, `profile_misses`
+      stays near 0 on the listener, the live waterfall shows the water column and the
+      thin bottom line exactly like the replay of the recorded `.svlog`, and the
+      model freezes after `display.warmup_rows` (every tile re-renders once). Needs a
+      running processor — unverifiable from this repository.
+- [ ] **Square-pixel seabed pictures are PROVISIONAL (`seabed.row_geometry: square`,
+      2026-09-05).** Evaluate on the first real labelled set whether the detector does
+      better than with one-row-per-ping tiles; if not, revert with the one config line
+      `seabed.row_geometry: ping` (the old contract, kept in code and tests).
+- [ ] **Display model on the field corpus.** `gamma` / `hi_pct` / `warmup_rows` were
+      calibrated on the simulation log and two local field logs; check the per-side
+      curves on the external corpus (80 m logs, low altitudes) and the mosaic's
+      normalised planes against SonarView's mosaic at the same range/colormap.
+      **Blocked on field data (see below).**
+- [ ] **`RINGING_SEARCH_MAX` is a sample count, so its physical meaning moves with
+      the range setting.** `src/sss_processor_node.py:114` fixes the ringing search
+      horizon at 60 samples and `find_noise_window_start`'s fallback at 30
+      (`src/_custom_libraries/sss_helper.py:44`), and `detect_fbr_slant_m` starts its
+      bottom search at `nw_start + NOISE_FLOOR_WINDOW` — no earlier than sample ~50.
+      That is a minimum detectable altitude of 1.67 m at the 20 m / 600 default, 2.5 m
+      at 30 m / 600 and 6.7 m at 80 m / 600, which is why the 80 m sea trial (bottom at
+      sample 49) could not detect bottom at all. Express the horizon and the fallback as
+      distances converted through the ping's own `length_mm / num_results` instead. This
+      changes detection behaviour, so it needs a recording to validate — pair it with
+      the range-change `.svlog` under *Needed field data*.
+- [ ] **Altitude estimate is unstable on long-range logs** (4.7 m to 45 m on the 80 m
+      file, p10 4.67 / p90 15.23). May resolve itself at 20 m range; re-measure rather
+      than assume. **Blocked on field data (see below).**
+
+---
+
+## Needed field data
+
+All three are **blocked on a field session** — not attemptable from this machine.
+
+- [ ] A short `.svlog` recorded **after** the range change (20 m) to confirm the
+      predicted ping-rate and resolution gains on our own hardware.
+- [ ] A `.svlog` recorded **after** the retag patch, to confirm 0 % mis-tagging.
+- [ ] A same-day paired recording (ours vs SonarView, identical settings) for the
+      quality comparison above.
+- [ ] **A recording with the GPS velocities present** (2026-09-18): every corpus
+      `.svlog` written by this node so far carries `vx = vy = vz = 0`, so no
+      existing file exercises the fix, and a replay's along-track scale still falls
+      back to the pose-chord estimator on all of them.
+- [ ] **A fixed-gain pass, and a pass at ≥ 3 m altitude over the same ground**
+      (from the simulator's review): the first separates the device's gain
+      regulation from the level, the second separates shadow fill from TVG. Both
+      are cheap to take on any beach day and neither can be substituted offline.
+
+---
+
+## Needs a real-sonar session
+
+- [ ] **First real run with the GCS's Sonar selector on *Real sonars*
+      (2026-09-28).** Confirm: the pipeline launch starts `sss_node.py` (console:
+      "Sonar: Real — the pipeline also starts sss_node.py"), it connects to both
+      units at 192.168.2.92 / .93 through the BlueBoat Base Station WiFi, START's
+      enable is sent once the driver subscribes, STOP ends the driver and the sweep
+      leaves no `sss_node.py` behind, and a switch to *Simulation* while running
+      asks, stops and relaunches the processor alone. Also the first live run of the
+      new defaults (1200 bins, pulse 0.00125): the reported `pulse_duration_sec`
+      should read 44.3 µs at 20 m, raw frames 2462 B, and the live waterfall should
+      match the replay of the recorded `.svlog`. Offline, `tests/test_sonar_source.py`
+      covers the command, the guard, ownership and the deferred enable; none of this
+      can be run without the boat.
+
+## Needs a sourced ROS 2 environment
+
+Listed so they are not mistaken for unchecked oversights. Each needs a sourced ROS 2
+environment (`~/ros2_ws`, `source env.sh`).
+
+- [x] Confirm `colcon build --packages-select blueboat_sss` succeeds and that
+      `CMakeLists.txt` installs everything the nodes import at runtime (the flat-import
+      trick in `sss_processor_node.py` depends on all five scripts landing in
+      `lib/blueboat_sss/`). **Done** (ROS 2 Jazzy): build clean,
+      all five scripts present in `install/blueboat_sss/lib/blueboat_sss/`.
+- [x] Confirm every `ros2 launch` line in CLAUDE.md actually runs, and that
+      `SSS_processing_launch.py` resolves `simple_launch`. **Done**: both launch files
+      pass `--show-args` with the expected arguments, and `SSS_processing_launch.py`
+      brings `sss_processor` up clean from the installed tree.
+- [ ] Confirm the GCS START button end-to-end: launch subprocess, `/rosout` capture,
+      ping-enable round trip, and the `pgrep -f sss_processor_node` orphan sweep
+      (`pgrep` does not exist on Windows, so `_sweep_leftovers` is untestable here).
+- [ ] Confirm `svlog_to_rosbag.py` still converts (needs `rclpy`, `rosbag2_py`,
+      `blueboat_interfaces`, `mavros_msgs`, `geographic_msgs`). Note its `main()` has
+      no argparse: `INPUT_FILE` and `OUTPUT_BAG` are hard-coded constants at `:89`–`:90`
+      that must be edited before each standalone run. The GCS replay window drives the
+      same `Converter` class with GUI-supplied paths instead.
+
+---
+
+## Project work not started
+
+Tracked here so it is not mistaken for existing capability. From the thesis plan:
+the beach dataset campaign (critical-path bottleneck), the detection module, the
+belief layer implementation, the adaptive replanner, and the evaluation framework.
+The aspect-response experiment is the scientific keystone and should be run early
+enough that a negative result is actionable.
+
+---
+
+## Automation candidates
+
+Not yet justified: anything around deployment, packaging, or CI — no recurring
+evidence.

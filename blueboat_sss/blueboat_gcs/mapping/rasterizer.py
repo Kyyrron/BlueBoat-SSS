@@ -69,8 +69,8 @@ _MAX_VIRTUAL_PINGS = 64          # hard cap per ping pair (safety)
 
 @dataclass
 class _PrevPing:
-    x: float
-    y: float
+    x: float                 # the transducers' point (SonarPing.sensor_x/y),
+    y: float                 # not the navigation point
     yaw: float
     y_port: np.ndarray
     v_port: np.ndarray
@@ -150,7 +150,10 @@ class PingRasterizer:
 
         y_p, v_p = side(y > 0, False)
         y_s, v_s = side(y < 0, True)
-        return _PrevPing(ping.robot_x, ping.robot_y, ping.yaw,
+        # The ping is placed from the transducers' point (the fore/aft arm
+        # along the heading), so the virtual pings between two real ones
+        # follow the transducers' own track, not the navigation point's.
+        return _PrevPing(ping.sensor_x, ping.sensor_y, ping.yaw,
                          y_p, v_p, y_s, v_s)
 
     def _project(self, prev: _PrevPing, f: float, cur: _PrevPing

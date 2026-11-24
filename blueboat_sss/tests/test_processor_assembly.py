@@ -1,0 +1,1118 @@
+"""Processor row assembly: never drop a ping (CLAUDE.md NC #2 / root CM-6).
+
+Unlike the rest of this suite these tests need a sourced ROS 2 environment,
+because they drive the real ``sss_processor_node`` — the node under test *is*
+the thing whose behaviour NC #2 constrains, and a reimplementation would test
+nothing. They skip cleanly on a laptop without ROS, so the suite stays
+laptop-runnable as documented.
+
+The node is driven directly rather than spun: ``_on_port`` / ``_on_starboard``
+are the real callbacks, and ``_pub.publish`` is captured. That keeps the tests
+deterministic and off the DDS graph.
+
+Three properties are under test:
+
+* every ping that arrives with a pose leaves as a row, one-sided if that is
+  all that arrived, and nothing is held forever;
+* the first ping of a mission is published, rather than withheld until the
+  FBR tracker locks;
+* the two devices' independent ping counters are aligned before grouping,
+  so the halves of a merged row are the same acquisition instant.
+
+The field ``.svlog`` files are opened **read-only** — they are primary field
+data (NC #6 / CM-7).
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import math
+import struct
+import sys
+import time
+from functools import lru_cache
+from pathlib import Path
+
+import pytest
+
+from conftest import PKG_PARENT
+
+# Availability is probed with find_spec rather than pytest.importorskip:
+# a module-level importorskip raises Skipped during collection, which on
+# pytest 7.4.4 here aborts the WHOLE session — the GCS tests silently stop
+# running. `pytestmark` skips this module without touching the rest.
+REQUIRED = ("rclpy", "blueboat_interfaces", "mavros_msgs", "geographic_msgs")
+MISSING = [m for m in REQUIRED if importlib.util.find_spec(m) is None]
+
+pytestmark = pytest.mark.skipif(
+    bool(MISSING),
+    reason=f"node-side tests need a sourced ROS 2 env (missing: {MISSING})")
+
+
+# ---------------------------------------------------------------------------
+# Loading the node under test
+# ---------------------------------------------------------------------------
+# CMakeLists.txt installs the five src/ scripts flat into lib/blueboat_sss/,
+# which is what makes the node's own bare `from sss_helper import ...` work.
+# From the source tree the helpers sit one directory deeper, so put that on
+# sys.path and load the node by path — this tests the source, not whatever
+# happens to be installed.
+HELPERS = PKG_PARENT / "src" / "_custom_libraries"
+if str(HELPERS) not in sys.path:
+    sys.path.insert(0, str(HELPERS))
+
+if not MISSING:
+    import rclpy
+    from blueboat_interfaces.msg import OmniscanProfile
+    from nav_msgs.msg import Odometry
+
+    _spec = importlib.util.spec_from_file_location(
+        "sss_processor_node", PKG_PARENT / "src" / "sss_processor_node.py")
+    proc = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(proc)
+
+NUM_RESULTS = 600
+LENGTH_MM = 20000
+MIN_DB, MAX_DB = -100.0, 0.0
+SAMPLE_MM = LENGTH_MM / (NUM_RESULTS - 1)
+
+
+def make_profile(channel: int, ping_number: int, stamp_ns: int,
+                 bottom_sample: int | None = 200) -> OmniscanProfile:
+    """One synthetic profile. ``bottom_sample=None`` gives a flat, bottomless
+    ping, which is how the FBR tracker is held unlocked."""
+    msg = OmniscanProfile()
+    msg.header.stamp.sec = stamp_ns // 1_000_000_000
+    msg.header.stamp.nanosec = stamp_ns % 1_000_000_000
+    msg.side = "port" if channel == 0 else "starboard"
+    msg.ping_number = ping_number
+    msg.start_mm = 0
+    msg.length_mm = LENGTH_MM
+    msg.num_results = NUM_RESULTS
+    msg.channel_number = channel
+    msg.transducer_heading_deg = -90.0 if channel == 0 else 90.0
+    msg.min_pwr_db = MIN_DB
+    msg.max_pwr_db = MAX_DB
+    # Quiet water column (-90 dB), with a hard return at bottom_sample.
+    pwr = [6553] * NUM_RESULTS
+    if bottom_sample is not None:
+        for i in range(bottom_sample, min(bottom_sample + 40, NUM_RESULTS)):
+            pwr[i] = 60000
+    msg.pwr_results = pwr
+    return msg
+
+
+def make_odom(stamp_ns: int, x: float = 0.0, y: float = 0.0) -> Odometry:
+    odom = Odometry()
+    odom.header.stamp.sec = stamp_ns // 1_000_000_000
+    odom.header.stamp.nanosec = stamp_ns % 1_000_000_000
+    odom.pose.pose.position.x = x
+    odom.pose.pose.position.y = y
+    odom.pose.pose.orientation.w = 1.0
+    return odom
+
+
+@pytest.fixture
+def node():
+    """A real SSSProcessorNode with its publisher captured.
+
+    ``.svlog`` logging is OFF at construction and never enabled here, so
+    nothing is written to the data root.
+    """
+    rclpy.init()
+    n = proc.SSSProcessorNode()
+    published = []
+    n._pub.publish = published.append          # capture instead of transmit
+    n.published = published
+    assert not n._svlog.active, "logging must be off; a test must never write .svlog"
+    try:
+        yield n
+    finally:
+        n.destroy_node()
+        rclpy.shutdown()
+
+
+def feed_odom(node, count=50, period_ns=50_000_000):
+    """Fill the odom buffer from t=0.
+
+    Keep ``count * period_ns`` inside the buffer's 5 s window
+    (ODOM_BUFFER_SECONDS): ``push()`` prunes to the last 5 s, and
+    ``nearest()`` refuses samples farther than the 1 s tolerance from
+    the ping stamp — pre-feeding a longer span than the window silently
+    drops the early samples the pings at t≈0 need. In the field odom is
+    continuous at ~20 Hz, so every ping has a fresh neighbour."""
+    for i in range(count):
+        node._odom_buf.push(make_odom(i * period_ns, x=float(i)))
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — assembly
+# ---------------------------------------------------------------------------
+PING_PERIOD_NS = 50_000_000
+
+
+def test_every_ping_is_emitted_despite_gaps_and_late_arrivals(node):
+    """NC #2: emitted rows == distinct pings received. No silent losses.
+
+    One side is missing on every 10th ping and one side arrives >50 ms late
+    on every 7th — the two cases the old arrival-time matcher discarded.
+    """
+    feed_odom(node, count=70, period_ns=PING_PERIOD_NS)   # covers 0..3.45 s
+    n_pings = 60
+    late = []
+    for i in range(n_pings):
+        pn = 1000 + i
+        t = i * PING_PERIOD_NS
+        node._on_port(make_profile(0, pn, t))
+        if i % 10 == 9:
+            continue                      # starboard half never arrives
+        stbd = make_profile(1, pn, t + 1_000_000)
+        if i % 7 == 6:
+            # 4 ping periods late — far outside the old 50 ms window.
+            stbd.header.stamp.sec = (t + 4 * PING_PERIOD_NS) // 1_000_000_000
+            stbd.header.stamp.nanosec = (t + 4 * PING_PERIOD_NS) % 1_000_000_000
+            late.append(pn)
+        node._on_starboard(stbd)
+    node._flush_pending(drain_all=True)
+
+    assert len(node.published) == n_pings, (
+        f"{len(node.published)} rows for {n_pings} pings — "
+        "pings are being dropped (NC #2)"
+    )
+    assert node._dropped_no_odom == 0
+
+    # Every ping number appears exactly once, on the port side.
+    seen = [m.port_ping_number for m in node.published]
+    assert sorted(seen) == [1000 + i for i in range(n_pings)]
+
+    # The six one-sided rows are exactly the ones whose starboard half never came.
+    one_sided = [m for m in node.published if not m.starboard_ping_number]
+    assert len(one_sided) == 6
+    assert sorted(m.port_ping_number for m in one_sided) == \
+        [1000 + i for i in range(n_pings) if i % 10 == 9]
+
+    # Late arrivals still merged into a two-sided row rather than being split.
+    for m in node.published:
+        if m.port_ping_number in late:
+            assert m.starboard_ping_number == m.port_ping_number
+
+
+def test_one_sided_rows_carry_the_documented_convention(node):
+    """The absent side is unambiguous: ping_number 0, zero stamp, empty arrays."""
+    feed_odom(node)
+    node._on_port(make_profile(0, 500, 0))
+    node._flush_pending(drain_all=True)
+
+    assert len(node.published) == 1
+    m = node.published[0]
+    assert m.port_ping_number == 500
+    assert len(m.port_y) > 0
+    # Presence is the ping number; the absent side is fully blanked and never
+    # borrows the present side's values.
+    assert m.starboard_ping_number == 0
+    assert m.starboard_stamp.sec == 0 and m.starboard_stamp.nanosec == 0
+    assert len(m.starboard_y) == 0
+    assert len(m.starboard_intensity_db) == 0
+    # +y = port is preserved on a one-sided row (NC #1).
+    assert all(v > 0 for v in m.port_y)
+
+
+def test_incomplete_group_is_flushed_not_held(node):
+    """A group with one side must not be held forever when the stream stops."""
+    feed_odom(node, count=200, period_ns=PING_PERIOD_NS)
+    # Get past the pre-roll so a real group exists to age out.
+    for i in range(proc.OFFSET_PREROLL_MAX):
+        t = i * PING_PERIOD_NS
+        node._on_port(make_profile(0, 900 + i, t))
+        node._on_starboard(make_profile(1, 900 + i, t + 1_000_000))
+    node.published.clear()
+
+    node._on_port(make_profile(0, 5000, 100 * PING_PERIOD_NS))
+    assert node.published == [], "a fresh group should wait briefly for its partner"
+    assert 5000 in node._groups
+
+    # The stream stops (no arrival for the lag, on the wall clock); the
+    # timer path emits it one-sided. Message stamps play no part.
+    node._last_arrival_wall_ns -= 2 * proc.ASSEMBLY_MAX_LAG_NS
+    node._flush_pending()
+    assert len(node.published) == 1
+    assert node.published[0].port_ping_number == 5000
+    assert 5000 not in node._groups
+
+
+class _FakeSimClock:
+    """``node.get_clock()`` of a simulation graph: /clock, set by the test."""
+
+    def __init__(self, ns):
+        self.ns = int(ns)
+
+    def now(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(nanoseconds=self.ns)
+
+
+def test_sim_graph_judges_the_stream_stopped_on_the_sim_clock(node, monkeypatch):
+    """Launched with use_sim_time (the GCS does under a /clock publisher), the
+    arrival clock is the node clock: a simulation slowed below real time
+    (seconds of wall time between pings) does not look stopped while sim time
+    has not moved, and does once it has (2026-11-07)."""
+    feed_odom(node, count=200, period_ns=PING_PERIOD_NS)
+    for i in range(proc.OFFSET_PREROLL_MAX):
+        t = i * PING_PERIOD_NS
+        node._on_port(make_profile(0, 900 + i, t))
+        node._on_starboard(make_profile(1, 900 + i, t + 1_000_000))
+    node.published.clear()
+    clock = _FakeSimClock(50_000_000_000)
+    monkeypatch.setattr(node, "_sim_clock", True)
+    monkeypatch.setattr(node, "get_clock", lambda: clock)
+    node._on_port(make_profile(0, 5000, 100 * PING_PERIOD_NS))
+    assert node._last_arrival_wall_ns == clock.ns, "arrival stamped on the sim clock"
+    clock.ns += proc.ASSEMBLY_MAX_LAG_NS // 2
+    node._flush_pending()
+    assert node.published == [] and 5000 in node._groups, "half a lag of sim time: alive"
+    clock.ns += proc.ASSEMBLY_MAX_LAG_NS
+    node._flush_pending()
+    assert len(node.published) == 1 and node.published[0].port_ping_number == 5000
+
+
+def test_real_launch_keeps_the_wall_arrival_clock(node):
+    """Every real-robot launch: no use_sim_time, monotonic arrival clock."""
+    assert node._sim_clock is False
+    before = time.monotonic_ns()
+    assert before <= node._arrival_ns() <= time.monotonic_ns()
+
+
+def test_a_clock_appearing_after_start_switches_to_sim_time_and_back(node, monkeypatch):
+    """The GCS starts the processor before Gazebo, so 'auto' resolves to wall
+    time; once a /clock publisher appears the arrival clock, the
+    stream-stopped check and the rate watchdog switch to sim time, and back to
+    wall time after CLOCK_FOLLOW_LOST_S without one (2026-11-09)."""
+    assert node._clock_auto and node._sim_clock is False
+    pubs = {"n": 0}
+    monkeypatch.setattr(node, "count_publishers", lambda topic: pubs["n"])
+    node._last_arrival_wall_ns = 123
+    node._follow_clock()
+    assert node._sim_clock is False                       # no /clock yet
+    pubs["n"] = 1
+    node._follow_clock()
+    assert node._sim_clock is True
+    assert node.get_parameter("use_sim_time").value is True
+    assert node._last_arrival_wall_ns is None and node._watch_reset
+    node._check_rates()                                   # window restarted, no warning
+    assert node._watch_reset is False
+    pubs["n"] = 0
+    steps = int(round(proc.CLOCK_FOLLOW_LOST_S / proc.CLOCK_FOLLOW_PERIOD_S))
+    for _ in range(steps - 1):
+        node._follow_clock()
+    assert node._sim_clock is True                        # a short gap is tolerated
+    node._follow_clock()
+    assert node._sim_clock is False
+    assert node.get_parameter("use_sim_time").value is False
+
+
+def test_preroll_is_bounded_and_never_strands_a_ping(node):
+    """A run shorter than the pre-roll still delivers every ping it produced."""
+    feed_odom(node)
+    node._on_port(make_profile(0, 42, 0))
+    assert node.published == [], "held while the counter offset is unknown"
+
+    # Stream stops. The timer path must still deliver it once the stream
+    # has been silent for the lag.
+    node._last_arrival_wall_ns -= 2 * proc.ASSEMBLY_MAX_LAG_NS
+    node._flush_pending()
+    assert len(node.published) == 1
+    assert node.published[0].port_ping_number == 42
+
+
+def _run_pairs(node, first_pn, count, t0_ns, period_ns=PING_PERIOD_NS,
+               stamp_offset_ns=0):
+    """Feed ``count`` port/starboard pairs numbered from ``first_pn``."""
+    for i in range(count):
+        t = t0_ns + i * period_ns
+        node._on_port(make_profile(0, first_pn + i, t))
+        node._on_starboard(make_profile(1, first_pn + i, t + stamp_offset_ns))
+
+
+def test_counter_restart_under_a_live_processor_rebases(node):
+    """Measured 2026-09-03: the simulator was relaunched under a running
+    processor, its counter restarted at 1 while ``_max_key_seen`` stayed
+    near 10 000, and every ping was published as two one-sided rows for
+    the rest of the run. A restart must re-base the assembly instead."""
+    node._odom_buf = proc._OdomBuffer(int(600e9), tolerance_ns=int(600e9))
+    for i in range(400):
+        node._odom_buf.push(make_odom(i * PING_PERIOD_NS))
+    _run_pairs(node, 10_000, 150, 0)
+    assert all(m.port_ping_number and m.starboard_ping_number
+               for m in node.published), "healthy stream pairs every row"
+    node.published.clear()
+
+    # The sonar node is relaunched: counter back to 1, stamps continue.
+    _run_pairs(node, 1, 120, 150 * PING_PERIOD_NS)
+    node._flush_pending(drain_all=True)
+    rows = node.published
+    two_sided = [m for m in rows if m.port_ping_number and m.starboard_ping_number]
+    torn = [m for m in rows if not (m.port_ping_number and m.starboard_ping_number)]
+    assert node._counter_restarts == 1
+    # Every post-restart ping leaves exactly once, and after the offset is
+    # re-learned through the pre-roll the rows are two-sided again.
+    assert len(two_sided) * 2 + len(torn) == 240
+    assert len(two_sided) >= 120 - proc.OFFSET_PREROLL_MAX
+    assert two_sided[-1].port_ping_number == 120
+    assert two_sided[-1].starboard_ping_number == 120
+
+
+def test_flush_timer_never_compares_wall_time_with_stamps(node):
+    """Under Gazebo the stamps are sim time (~1e11 ns) while the node runs
+    on the wall clock (~1.8e18 ns). The 5 Hz flush timer used to judge
+    every group stale on that arithmetic and tear any pair in flight."""
+    node._odom_buf = proc._OdomBuffer(int(600e9), tolerance_ns=int(600e9))
+    sim_t0 = 123_600_000_000            # 123.6 s of sim time, like a real run
+    for i in range(200):
+        node._odom_buf.push(make_odom(sim_t0 + i * PING_PERIOD_NS))
+    _run_pairs(node, 2461, proc.OFFSET_PREROLL_MAX + 4, sim_t0)
+    node.published.clear()
+    base = proc.OFFSET_PREROLL_MAX + 4
+    for i in range(40):
+        t = sim_t0 + (base + i) * PING_PERIOD_NS
+        node._on_port(make_profile(0, 2461 + base + i, t))
+        node._flush_pending()            # the timer fires between the halves
+        node._on_starboard(make_profile(1, 2461 + base + i, t))
+    assert len(node.published) == 40
+    assert all(m.port_ping_number and m.starboard_ping_number
+               for m in node.published)
+
+
+def test_torn_stream_is_warned_about_once(node):
+    """A stream that is mostly one-sided is a defect somewhere upstream and
+    must not stay silent (the 2026-09-03 tearing went unnoticed for a whole
+    session). The node warns once per episode and re-arms when it heals."""
+    node._odom_buf = proc._OdomBuffer(int(600e9), tolerance_ns=int(600e9))
+    for i in range(proc.TORN_WINDOW_ROWS + 10):
+        node._odom_buf.push(make_odom(i * PING_PERIOD_NS))
+    warned = []
+    node.get_logger().warn = lambda msg, *a, **k: warned.append(str(msg))
+    for i in range(proc.TORN_WINDOW_ROWS + 5):
+        node._emit_group({"first_ns": i * PING_PERIOD_NS,
+                          0: make_profile(0, 300 + i, i * PING_PERIOD_NS)})
+    torn_msgs = [m for m in warned if "one-sided" in m]
+    assert len(torn_msgs) == 1, warned
+    assert node._torn_warned
+
+
+def test_group_buffer_is_bounded(node):
+    """The live group buffer never grows without limit.
+
+    What is under test is the group cap, so the odom dimension is taken
+    out of the way: piling 1024 one-sided groups spans ~51 s of stamps
+    (the flush timer never runs in this synchronous harness, which never
+    happens live — the 1 s lag flush drains groups long before the odom
+    window or the nearest-stamp tolerance could matter)."""
+    node._odom_buf = proc._OdomBuffer(int(120e9), tolerance_ns=int(120e9))
+    feed_odom(node, count=4 * proc.ASSEMBLY_MAX_GROUPS + 10,
+              period_ns=PING_PERIOD_NS)
+    for i in range(4 * proc.ASSEMBLY_MAX_GROUPS):
+        node._on_port(make_profile(0, 2000 + i, i * PING_PERIOD_NS))
+    assert len(node._groups) <= proc.ASSEMBLY_MAX_GROUPS + 1
+    # Everything evicted was published, not discarded.
+    assert len(node.published) + len(node._groups) == 4 * proc.ASSEMBLY_MAX_GROUPS
+
+
+def test_side_comes_from_the_packet_not_the_topic(node):
+    """NC #1: a profile delivered to the wrong topic still lands on its own side."""
+    feed_odom(node)
+    # channel_number says starboard, but it arrives on the port callback.
+    node._on_port(make_profile(1, 700, 0))
+    node._flush_pending(drain_all=True)
+
+    m = node.published[0]
+    assert m.starboard_ping_number == 700 and m.port_ping_number == 0
+    assert all(v < 0 for v in m.starboard_y), "-y = starboard"
+
+
+def test_channel_255_routes_by_the_wrapped_bearing(node):
+    """Two field logs carry channel_number 255 on every packet; the
+    bearing decides — wrapped, so an absolute-bearing writer's 270 (port
+    transducer, boat heading north) is port, not starboard."""
+    feed_odom(node)
+    m = make_profile(255, 800, 0)
+    m.transducer_heading_deg = 270.0
+    node._on_starboard(m)                     # wrong topic as well
+    node._flush_pending(drain_all=True)
+    row = node.published[0]
+    assert row.port_ping_number == 800 and row.starboard_ping_number == 0
+    assert all(v > 0 for v in row.port_y), "+y = port"
+    assert node._unresolved_side == 0
+
+
+def test_unresolved_side_falls_to_the_arrival_topic_on_both_paths(node):
+    """channel 255 and a bearing with no sign (0.0): the message path
+    used to call that port silently while the raw path took the topic —
+    the .svlog src byte and the published row could disagree. Both now
+    take the arrival topic, and the case is counted and warned once."""
+    import svlog_helper
+    feed_odom(node)
+    m = make_profile(255, 900, 0)
+    m.transducer_heading_deg = 0.0
+    node._on_starboard(m)
+    node._flush_pending(drain_all=True)
+    row = node.published[0]
+    assert row.starboard_ping_number == 900 and row.port_ping_number == 0
+    assert node._unresolved_side == 1 and node._unresolved_warned
+    # The raw frame of the same packet, arriving on the starboard raw topic.
+    head = struct.pack("<IIIIIHHHBBffffff", 900, 0, LENGTH_MM, 0, 0, 4,
+                       NUM_RESULTS, 15000, 255, 0, 66.5e-6, 1.0,
+                       MAX_DB, MIN_DB, 0.0, 0.0)
+    payload = head + struct.pack(f"<{NUM_RESULTS}H", *([6553] * NUM_RESULTS))
+    raw = svlog_helper.frame_packet(proc.OS_MONO_PROFILE_ID, payload,
+                                    src=proc.DEVICE_ID_STBD, dst=0)
+    assert node._src_from_packet(raw, proc.DEVICE_ID_STBD) == proc.DEVICE_ID_STBD
+    assert node._src_from_packet(raw, proc.DEVICE_ID_PORT) == proc.DEVICE_ID_PORT
+    assert node._unresolved_side == 3
+    # A bearing with a sign still decides on the raw path (wrapped).
+    head270 = struct.pack("<IIIIIHHHBBffffff", 901, 0, LENGTH_MM, 0, 0, 4,
+                          NUM_RESULTS, 15000, 255, 0, 66.5e-6, 1.0,
+                          MAX_DB, MIN_DB, 270.0, 0.0)
+    raw270 = svlog_helper.frame_packet(
+        proc.OS_MONO_PROFILE_ID,
+        head270 + struct.pack(f"<{NUM_RESULTS}H", *([6553] * NUM_RESULTS)),
+        src=proc.DEVICE_ID_STBD, dst=0)
+    assert node._src_from_packet(raw270, proc.DEVICE_ID_STBD) == proc.DEVICE_ID_PORT
+    assert node._unresolved_side == 3
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — the bootstrap gate is gone
+# ---------------------------------------------------------------------------
+def test_first_ping_is_published_before_the_tracker_locks(node):
+    """NC #2: no ping is withheld while the FBR tracker bootstraps."""
+    feed_odom(node)
+    node._on_port(make_profile(0, 1, 0, bottom_sample=None))
+    node._on_starboard(make_profile(1, 1, 1_000_000, bottom_sample=None))
+    node._flush_pending(drain_all=True)
+
+    assert len(node.published) == 1, "the first ping of a mission must be emitted"
+    assert node.published[0].port_ping_number == 1, "ping #1, not the tenth"
+    assert not node._fbr.locked
+    assert node._unlocked_pings == 1
+
+
+def test_unlocked_altitude_is_an_identity_transform_not_a_guess(node):
+    """With nothing ever detected, water_depth is 0 and no correction is applied."""
+    feed_odom(node)
+    node._on_port(make_profile(0, 1, 0, bottom_sample=None))
+    node._flush_pending(drain_all=True)
+
+    m = node.published[0]
+    # Baseline repair 2026-10-16: since 994a74b water_depth = altitude +
+    # submersion and y = ±(lever + ground), so an unlocked (0) altitude
+    # reads as the submersion alone and every y carries the lever arm.
+    assert m.water_depth == pytest.approx(proc.TRANSDUCER_SUBMERSION_M), \
+        "an unlocked altitude must be distinguishable"
+    lever = proc.TRANSDUCER_Y_OFFSET_PORT_M
+    # altitude 0 => ground range == slant range. project_side keeps
+    # `slant > altitude`, so only the degenerate zero-range sample goes; the
+    # water column is not cut, and every y is lever + the raw slant range.
+    assert len(m.port_y) == NUM_RESULTS - 1
+    assert m.port_y[0] == pytest.approx(lever + SAMPLE_MM / 1000.0, abs=1e-6)
+    assert m.port_y[-1] == pytest.approx(lever + LENGTH_MM / 1000.0, abs=1e-3)
+
+
+def test_bootstrap_counter_counts_emissions_never_drops(node):
+    """The old _dropped_bootstrap counted discarded pings; nothing is discarded now."""
+    feed_odom(node, count=40, period_ns=PING_PERIOD_NS)   # covers 0..1.95 s
+    for i in range(30):
+        t = i * PING_PERIOD_NS
+        node._on_port(make_profile(0, 1 + i, t, bottom_sample=None))
+        node._on_starboard(make_profile(1, 1 + i, t + 1_000_000, bottom_sample=None))
+
+    assert len(node.published) == 30
+    assert node._unlocked_pings == 30
+    assert node._dropped_no_odom == 0
+    assert not hasattr(node, "_dropped_bootstrap")
+
+
+def test_pose_remains_a_hard_gate(node):
+    """The odom gate is deliberately untouched: a ping with no pose is unplaceable."""
+    node._on_port(make_profile(0, 1, 0))
+    node._on_starboard(make_profile(1, 1, 1_000_000))
+    node._flush_pending(drain_all=True)
+    assert node.published == []
+    assert node._dropped_no_odom == 1
+
+
+# ---------------------------------------------------------------------------
+# Stage 0 + 3 — the ping counters, and real field logs
+# ---------------------------------------------------------------------------
+FIELD_ROOT = Path("/media/kyyrron/OS/Users/killi/Desktop/Research Kyutech/"
+                  "BlueBoat/allSvlogData")
+
+# Offsets measured over the whole corpus; see
+# blueboat_gcs/docs/SONARVIEW_SVLOG_ANALYSIS.md.
+FIELD_CASES = [
+    ("ShiraishiJima/TireExamples/Tire4-25m.svlog", 0),
+    ("ShiraishiJima/toOptimize-harbourScan.svlog", -1),
+    ("ShiraishiJima/diffDepthCompensation.svlog", 60),
+    ("ShiraishiJima/No_sonarVNotOK_usOK_SimpleCurve/2026-07-21-15-50-26.svlog", 60),
+    ("harbor_scan_combined.svlog", 0),          # single-sided
+]
+
+field_log = pytest.mark.skipif(not FIELD_ROOT.is_dir(),
+                               reason="field .svlog corpus not mounted")
+
+# Profiles fed through the full processor pipeline per log.
+PROCESSOR_FEED_LIMIT = 3000
+
+# load_svlog decodes and processes an entire file, which is far and away the
+# slowest thing here. The offset and time-adjacency properties are checked on
+# every log by the cheap header-only tests above; this end-to-end pass over
+# the replay implementation runs on two representatives — the +60 case it
+# exists to catch, and a single-transducer log.
+REPLAY_CASES = [c for c in FIELD_CASES
+                if c[0].endswith(("diffDepthCompensation.svlog",
+                                  "harbor_scan_combined.svlog"))]
+
+
+# The largest log is ~17 000 profiles; decoding one is the expensive part of
+# these tests and several of them want the same file. This suite is wired
+# into the pre-commit hook, so the cache is what keeps it usable.
+@lru_cache(maxsize=None)
+def read_profiles(path: Path):
+    """(channel, ping_number, timestamp_ms) per profile packet, in file order.
+
+    Read-only: these are primary field data (NC #6).
+    """
+    from blueboat_gcs.core.svlog import (OS_MONO_PROFILE_ID,
+                                         decode_os_mono_profile, side_of,
+                                         walk_packets)
+    out = []
+    for pkt in walk_packets(path.read_bytes()):
+        if struct.unpack_from("<H", pkt, 4)[0] != OS_MONO_PROFILE_ID:
+            continue
+        try:
+            d = decode_os_mono_profile(pkt[8:-2])
+        except ValueError:
+            continue
+        out.append((side_of(d), d["ping_number"], d["timestamp_ms"]))
+    return tuple(out)
+
+
+@field_log
+@pytest.mark.parametrize("rel,expected", FIELD_CASES)
+def test_counter_offset_is_recovered_from_every_field_log(rel, expected):
+    """Stage 0: the two devices' counters differ by an arbitrary constant.
+
+    0, -1 and +60 all occur in the corpus, so the raw counter is not a shared
+    key. The estimator must recover the offset decisively — a bimodal
+    estimator would sit near 50 % and inject a one-ping mis-pairing.
+    """
+    est = proc.PingCounterOffset()
+    profiles = read_profiles(FIELD_ROOT / rel)
+    for channel, pn, ts in profiles:
+        est.observe(channel, pn, ts)
+
+    if len({c for c, _, _ in profiles}) < 2:      # single-sided log
+        assert est.votes == 0
+        return
+    assert est.offset == expected
+    assert est.confidence >= 0.90, "estimator is not decisive on this log"
+
+
+@field_log
+@pytest.mark.parametrize("rel,expected", FIELD_CASES)
+def test_field_log_replays_without_losing_a_ping(rel, expected, node):
+    """Stage 3: nothing is lost replaying a real log through the processor.
+
+    Arrival stamps come from each ping's own device ``timestamp_ms``, which
+    is its acquisition instant. File order is not a usable substitute: the
+    ``.svlog`` writer batches the two channels in blocks, so on the +60 logs
+    the two halves of one ping sit ~124 packets apart in the file while
+    having been acquired ~1 ms apart.
+    """
+    # A prefix exercises every path the whole file does — the offset lock,
+    # both-sided merges, one-sided flushes — at a fraction of the runtime,
+    # and this suite gates every commit.
+    profiles = read_profiles(FIELD_ROOT / rel)[:PROCESSOR_FEED_LIMIT]
+    span_ms = profiles[-1][2] - profiles[0][2]
+    feed_odom(node, count=int(span_ms / 1000) + 20, period_ns=1_000_000_000)
+
+    t0 = profiles[0][2]
+    for channel, pn, ts in profiles:
+        node._on_port(make_profile(channel, pn, (ts - t0) * 1_000_000))
+    node._flush_pending(drain_all=True)
+
+    # The invariant NC #2 actually states: every profile that went in comes
+    # out on some row. Counting sides rather than rows is what makes this
+    # airtight — a lost half would otherwise hide inside a one-sided row.
+    sides_out = sum(bool(m.port_ping_number) + bool(m.starboard_ping_number)
+                    for m in node.published)
+    assert sides_out == len(profiles), "a ping was dropped (NC #2)"
+    assert node._dropped_no_odom == 0
+
+    # And every distinct ping is represented.
+    keys = {pn if c == 0 else pn + node._offset.offset for c, pn, _ in profiles}
+    emitted = set()
+    for m in node.published:
+        if m.port_ping_number:
+            emitted.add(m.port_ping_number)
+        if m.starboard_ping_number:
+            emitted.add(m.starboard_ping_number + node._offset.offset)
+    assert emitted == keys
+    assert len(node.published) == len(keys), (
+        "a ping number produced more than one row: its two halves were "
+        "split across the flush window"
+    )
+
+
+@field_log
+@pytest.mark.parametrize("rel,expected",
+                         [c for c in FIELD_CASES if c[1] not in (0,)])
+def test_merged_halves_are_the_same_acquisition_instant(rel, expected):
+    """The point of the offset: a merged row must not span seconds of travel.
+
+    On the +60 logs, grouping on the raw counter merges halves ~1.7-3.0 s
+    apart — the boat has moved metres between them.
+    """
+    profiles = read_profiles(FIELD_ROOT / rel)
+    offset, confidence = _replay_offset(FIELD_ROOT / rel)
+    assert offset == expected and confidence >= 0.90
+
+    groups: dict = {}
+    for channel, pn, ts in profiles:
+        key = pn if channel == 0 else pn + offset
+        groups.setdefault(key, {})[channel] = ts
+    deltas = [abs(v[0] - v[1]) for v in groups.values() if 0 in v and 1 in v]
+    assert deltas, "expected two-sided rows in this log"
+    assert max(deltas) < 200, (
+        f"merged halves are up to {max(deltas)} ms apart — the counters are "
+        "not aligned"
+    )
+
+
+def _replay_offset(path: Path):
+    from blueboat_gcs.core.svlog import estimate_counter_offset
+    return estimate_counter_offset(read_profiles(path))
+
+
+@field_log
+@pytest.mark.parametrize("rel,expected", REPLAY_CASES)
+def test_replay_path_agrees_with_the_processor(rel, expected):
+    """The GCS replay path assembles the same rows as the processor.
+
+    They are two implementations of one rule; a divergence here means one of
+    them is losing or inventing rows.
+    """
+    from blueboat_gcs.core.svlog import load_svlog
+
+    path = FIELD_ROOT / rel
+    mission = load_svlog(path)
+    profiles = read_profiles(path)
+    keys = {pn if c == 0 else pn + mission.counter_offset
+            for c, pn, _ in profiles}
+
+    assert mission.counter_offset == expected
+    assert mission.ping_count + mission.dropped_no_pose == len(keys)
+
+
+# ---------------------------------------------------------------------------
+# _OdomBuffer nearest-stamp tolerance (the "pings pile on one point" bug)
+# ---------------------------------------------------------------------------
+def test_odom_buffer_serves_a_fresh_nearby_sample():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000, x=3.0))
+    odom = buf.nearest(10_400_000_000)
+    assert odom is not None and odom.pose.pose.position.x == 3.0
+
+
+def test_odom_buffer_refuses_a_sample_beyond_the_tolerance():
+    """A pose 2 s from the ping is a clock mismatch or a dying topic —
+    serving it stamped every ping with one stale pose. The lookup must
+    refuse (the sanctioned NC #2 drop) and record the measured skew."""
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000))
+    assert buf.nearest(12_000_000_000) is None
+    assert buf.last_refused_dt_ns == 2_000_000_000
+
+
+def test_odom_buffer_prunes_stale_samples_at_lookup():
+    """push() only prunes on arrival, so a topic that went silent kept
+    serving its last sample forever; nearest() now prunes against the
+    lookup stamp too."""
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000))
+    assert buf.nearest(60_000_000_000) is None       # 50 s later
+    assert not buf.has_data(), "the stale sample survived the lookup"
+    # A fresh sample brings the buffer back to life.
+    buf.push(make_odom(60_000_000_000, x=7.0))
+    odom = buf.nearest(60_100_000_000)
+    assert odom is not None and odom.pose.pose.position.x == 7.0
+
+
+def test_odom_buffer_keys_a_zero_stamp_on_arrival():
+    """Real-robot launch: mavros has use_sim_time and no /clock, so
+    /blueboat/odom is stamped 0 while the profiles carry wall time. Keyed
+    on 0 the sample was pruned by the first lookup and every ping dropped."""
+    wall = 1_793_080_445_000_000_000
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(0, x=4.0), arrival_ns=wall)
+    assert buf.zero_stamped == 1 and buf.pushed == 1
+    odom = buf.nearest(wall + 200_000_000)
+    assert odom is not None and odom.pose.pose.position.x == 4.0
+
+
+def test_odom_buffer_zero_stamp_without_arrival_is_unchanged():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(0))
+    assert buf.nearest(1_793_080_445_000_000_000) is None
+    assert not buf.has_data() and buf.pushed == 1
+
+
+def test_odom_buffer_drops_an_out_of_epoch_head():
+    """Replay, 2026-10-28: one zero-stamped odom before /clock was keyed on
+    wall time (~1.79e18 ns), every later one on sim time. The wall sample sat
+    at the head of the deque, head-only pruning never got past it, and the
+    buffer grew for the whole run."""
+    wall = 1_793_080_445_000_000_000
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(0, x=-1.0), arrival_ns=wall)
+    for i in range(400):                               # 20 s of sim time at 20 Hz
+        buf.push(make_odom(100_000_000_000 + i * 50_000_000, x=float(i)))
+    assert buf.epoch_dropped == 1 and buf.zero_stamped == 1 and buf.pushed == 401
+    assert len(buf._samples) <= 101, "pruning is stuck behind the wall-time head"
+    assert all(ts < wall for ts, _ in buf._samples)
+    odom = buf.pose_at(100_000_000_000 + 399 * 50_000_000)
+    assert odom is not None and odom.pose.pose.position.x == pytest.approx(399.0)
+    # The lookup-side pruning works again too.
+    assert buf.nearest(200_000_000_000) is None and not buf.has_data()
+
+
+def test_odom_buffer_keeps_small_reorderings():
+    """Only a jump back by more than the window is an epoch change."""
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000, x=1.0))
+    buf.push(make_odom(10_100_000_000, x=2.0))
+    buf.push(make_odom(10_050_000_000, x=3.0))         # late by 50 ms
+    assert buf.epoch_dropped == 0 and len(buf._samples) == 3
+
+
+def test_zero_stamped_odom_is_warned_once(node, monkeypatch):
+    """`zero_stamped` stays at 1 after one zero stamp: the old `== 1` test
+    warned on every later odom (1339 warnings in one replay)."""
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    node._on_odom(make_odom(0))
+    for i in range(50):
+        node._on_odom(make_odom(100_000_000_000 + i * 50_000_000))
+    node._on_odom(make_odom(0))
+    assert len(log.warnings) == 1 and "stamped 0" in log.warnings[0]
+
+
+def test_zero_stamped_odom_places_pings_on_the_node(node):
+    """End to end: a zero-stamped odom stream must not drop wall-stamped pings."""
+    t0 = 1_793_080_445_000_000_000
+    node._odom_buf = proc._OdomBuffer(int(5e9))
+    for i in range(70):
+        node._odom_buf.push(make_odom(0, x=float(i)), arrival_ns=t0 + i * PING_PERIOD_NS)
+    node._on_port(make_profile(0, 1, t0 + 10 * PING_PERIOD_NS))
+    node._on_starboard(make_profile(1, 1, t0 + 10 * PING_PERIOD_NS))
+    node._flush_pending(drain_all=True)
+    assert node._dropped_no_odom == 0
+    assert len(node.published) == 1
+
+
+# ---------------------------------------------------------------------------
+# Pose interpolation (odom at 4 Hz / ~13 Hz under 20 Hz pings)
+# ---------------------------------------------------------------------------
+def _odom_yaw(stamp_ns, x, yaw):
+    o = make_odom(stamp_ns, x=x)
+    o.pose.pose.orientation.z = math.sin(yaw / 2)
+    o.pose.pose.orientation.w = math.cos(yaw / 2)
+    return o
+
+
+def test_pose_at_interpolates_between_the_bracketing_samples():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(_odom_yaw(10_000_000_000, 0.0, 0.0))
+    buf.push(_odom_yaw(10_250_000_000, 1.0, math.pi / 2))
+    p = buf.pose_at(10_062_500_000)                    # a quarter of the way
+    assert p.pose.pose.position.x == pytest.approx(0.25)
+    q = p.pose.pose.orientation
+    assert 2 * math.atan2(q.z, q.w) == pytest.approx(math.pi / 8, abs=0.02)
+    # nearest() is untouched: it still snaps.
+    assert buf.nearest(10_062_500_000).pose.pose.position.x == 0.0
+
+
+def test_pose_at_crosses_the_yaw_wrap_on_the_short_arc():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(_odom_yaw(0, 0.0, math.radians(179)))
+    buf.push(_odom_yaw(100_000_000, 0.0, math.radians(-179)))
+    q = buf.pose_at(50_000_000).pose.pose.orientation
+    yaw = math.degrees(2 * math.atan2(q.z, q.w))
+    assert abs(abs(yaw) - 180.0) < 0.5                 # not through 0
+
+
+def test_pose_at_falls_back_to_nearest_and_keeps_the_refusal():
+    buf = proc._OdomBuffer(int(5e9), tolerance_ns=int(1e9))
+    buf.push(make_odom(10_000_000_000, x=3.0))
+    assert buf.pose_at(10_400_000_000).pose.pose.position.x == 3.0
+    assert buf.pose_at(12_000_000_000) is None
+    assert buf.last_refused_dt_ns == 2_000_000_000
+
+
+# ---------------------------------------------------------------------------
+# SonarView parity: time_boot_ms, mavlink envelopes, header, rates
+# ---------------------------------------------------------------------------
+def test_burst_clock_groups_arrivals_like_one_autopilot_burst():
+    clock = proc._BurstClock(window_ns=5_000_000)
+    a = clock.burst_ns(1_000_000_000)
+    assert clock.burst_ns(1_003_000_000) == a          # same burst
+    b = clock.burst_ns(1_080_000_000)                  # next burst, ~13 Hz later
+    assert b == 1_080_000_000 and b != a
+
+
+def test_zero_stamped_mavros_no_longer_freezes_time_boot_ms(node):
+    """Every 2026-10-27 field .svlog carried one time_boot_ms (4288904828)
+    on all its poses: mavros stamps 0 on the real launch."""
+    zero = proc.TimeMsg()
+    first = node._time_boot_ms(zero)
+    assert node._time_boot_ms(zero) == first           # same burst
+    time.sleep(0.02)
+    assert node._time_boot_ms(zero) != first           # time moves on
+    stamped = proc.TimeMsg(sec=1_793_080_000, nanosec=0)
+    assert node._time_boot_ms(stamped) == node._time_boot_ms(stamped)
+
+
+def test_heartbeat_and_statustext_take_sonarviews_shape(node):
+    from mavros_msgs.msg import State, StatusText
+    s = State(connected=True, armed=True, guided=False, manual_input=True,
+              mode="AUTO", system_status=4)
+    hb = node._build_heartbeat_envelope(s)["message"]
+    assert hb["type"] == "HEARTBEAT" and hb["custom_mode"] == 10
+    assert hb["base_mode"] == {"bits": 1 | 64 | 128}
+    assert hb["system_status"] == {"type": "MAV_STATE_ACTIVE"}
+    assert hb["mavtype"] == {"type": "MAV_TYPE_SURFACE_BOAT"}
+    st = node._build_statustext_envelope(
+        StatusText(severity=4, text="LinkGuard: no laptop 3 s"))["message"]
+    assert st["severity"] == {"type": "MAV_SEVERITY_WARNING"}
+    assert len(st["text"]) == 50 and "".join(st["text"]).startswith("LinkGuard")
+
+
+def test_svlog_header_is_session_metadata_then_view_config(node):
+    from blueboat_gcs.core.svlog import walk_packets
+    header = node._build_metadata()
+    frames = list(walk_packets(header))
+    assert [f[4] | (f[5] << 8) for f in frames] == [10, 12]
+    assert all((f[6], f[7]) == (0, 0xFF) for f in frames)
+    meta = json.loads(frames[0][8:-2])
+    assert all(d["options"]["doppler_enable"] for d in meta["session_devices"])
+
+
+def test_mavlink_wrapper_is_tagged_and_serialised_as_sonarview_does():
+    from svlog_helper import build_mavlink_wrapper
+    pkt = build_mavlink_wrapper({"message": {"type": "ATTITUDE", "yaw": 1.0},
+                                 "header": {"system_id": 1}})
+    assert (pkt[6], pkt[7]) == (0xFF, 0)
+    body = pkt[8:-2].decode()
+    assert body.startswith('{\n  "header"')            # sorted keys, indent 2
+
+
+class _FakeFuture:
+    def __init__(self):
+        self.callbacks = []
+
+    def add_done_callback(self, cb):
+        self.callbacks.append(cb)
+
+
+class _FakeRateClient:
+    def __init__(self, ready=True):
+        self.ready = ready
+        self.requests = []
+
+    def service_is_ready(self):
+        return self.ready
+
+    def call_async(self, req):
+        self.requests.append((req.message_id, req.message_rate))
+        return _FakeFuture()
+
+
+def test_sonarviews_message_rates_are_requested_while_the_sonar_streams(node):
+    from svlog_helper import DEFAULT_PERIODIC_MESSAGES
+    client = _FakeRateClient()
+    node._rate_client = client
+    node._assert_mavlink_rates()
+    assert client.requests == [], "no sonar stream yet: nothing requested"
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    node._assert_mavlink_rates()
+    assert client.requests == [
+        (e["message_id"], pytest.approx(e["frequency_hz"]))
+        for e in DEFAULT_PERIODIC_MESSAGES]
+    assert (30, 30.0) in client.requests and (33, 30.0) in client.requests
+    node._assert_mavlink_rates()                       # within 30 s: not repeated
+    assert len(client.requests) == len(DEFAULT_PERIODIC_MESSAGES)
+    node._rate_request_mono -= proc.MAVLINK_RATE_REASSERT_S + 1
+    node._assert_mavlink_rates()                       # re-asserted
+    assert len(client.requests) == 2 * len(DEFAULT_PERIODIC_MESSAGES)
+
+
+def test_missing_rate_service_is_skipped_quietly(node):
+    node._rate_client = _FakeRateClient(ready=False)
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    node._assert_mavlink_rates()
+    assert node._rate_client.requests == [] and node._rate_service_missing_logged
+
+
+class _FixedRate:
+    """Stands in for _PoseRateMeter: sample() returns ``hz``."""
+    def __init__(self, hz=None):
+        self.hz = hz
+
+    def sample(self, now):
+        return self.hz
+
+    def count(self, name):
+        pass
+
+
+def test_rate_request_is_renewed_when_the_pose_rate_drops(node):
+    """2026-10-28 water run: 30 Hz held ~9 s of every 30 s, then 4 Hz. A
+    measured pose rate below POSE_RATE_WARN_HZ renews the request, at most
+    once per POSE_RENEW_HOLDOFF_S; the 30 s re-assert stays the fallback."""
+    from svlog_helper import DEFAULT_PERIODIC_MESSAGES
+    n = len(DEFAULT_PERIODIC_MESSAGES)
+    client = _FakeRateClient()
+    node._rate_client = client
+    node._pose_rate = _FixedRate(4.0)
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    node._assert_mavlink_rates()                       # first request
+    assert len(client.requests) == n
+    node._assert_mavlink_rates()                       # 4 Hz, inside the hold-off
+    assert len(client.requests) == n
+    node._rate_request_mono -= proc.POSE_RENEW_HOLDOFF_S + 0.1
+    node._pose_rate.hz = 25.0                          # rate holds: nothing sent
+    node._assert_mavlink_rates()
+    assert len(client.requests) == n
+    node._pose_rate.hz = None                          # no full window yet
+    node._assert_mavlink_rates()
+    assert len(client.requests) == n
+    node._pose_rate.hz = 4.0                           # rate fell back: renewed
+    node._assert_mavlink_rates()
+    assert len(client.requests) == 2 * n and node._rate_renewals == 1
+    assert client.requests[n:] == client.requests[:n]
+
+
+def test_rate_renewal_requests_nothing_without_the_service(node):
+    """Simulation: the service is absent, nothing is ever requested."""
+    node._rate_client = _FakeRateClient(ready=False)
+    node._pose_rate = _FixedRate(0.0)
+    node._last_arrival_wall_ns = time.monotonic_ns()
+    for _ in range(3):
+        node._assert_mavlink_rates()
+        if node._rate_request_mono is not None:
+            node._rate_request_mono -= proc.POSE_RENEW_HOLDOFF_S + 0.1
+    assert node._rate_client.requests == [] and node._rate_renewals == 0
+
+
+def test_pose_rate_meter_reports_the_slowest_message_over_the_window():
+    meter = proc._PoseRateMeter(window_s=3.0)
+    assert meter.sample(100.0) is None
+    for tick in range(1, 4):
+        for _ in range(30):
+            meter.count("ATTITUDE")
+            meter.count("LOCAL_POSITION_NED")
+        for _ in range(4):
+            meter.count("GLOBAL_POSITION_INT")
+        hz = meter.sample(100.0 + tick)
+    assert hz == pytest.approx(4.0)                    # the slowest of the three
+    for _ in range(3):                                 # GPI recovers
+        for name in proc.POSE_MESSAGES:
+            for _ in range(30):
+                meter.count(name)
+        tick += 1
+        hz = meter.sample(100.0 + tick)
+    assert hz == pytest.approx(30.0)
+
+
+class _LogCapture:
+    def __init__(self):
+        self.warnings, self.infos = [], []
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+    def info(self, msg):
+        self.infos.append(msg)
+
+
+def test_rate_watchdog_flags_a_4hz_pose_and_a_free_running_sonar(node, monkeypatch):
+    """The 2026-10-27 field logs: 4 Hz pose, 34.5 pings/s at 20 m."""
+    from types import SimpleNamespace
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=True))
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {"ATTITUDE": 40, "GLOBAL_POSITION_INT": 130,
+                          "LOCAL_POSITION_NED": 130}
+    node._watch_pings, node._watch_range_m = [345, 200], 20.0
+    node._check_rates()
+    assert len(log.warnings) == 1
+    assert "ATTITUDE 4.0 Hz" in log.warnings[0] and "port sonar 34.5" in log.warnings[0]
+    assert "starboard" not in log.warnings[0]          # 20 pings/s is SonarView's
+    # Same condition next window: not repeated. Recovery is announced.
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {"ATTITUDE": 40, "GLOBAL_POSITION_INT": 130,
+                          "LOCAL_POSITION_NED": 130}
+    node._watch_pings = [345, 200]
+    node._check_rates()
+    assert len(log.warnings) == 1
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {k: 128 for k in node._watch_counts}
+    node._watch_pings = [200, 200]
+    node._check_rates()
+    assert len(log.warnings) == 1 and "back at SonarView's rates" in log.infos[-1]
+
+
+def test_rate_watchdog_window_opens_at_the_first_logged_envelope(node, monkeypatch):
+    """The first window used to start at the previous tick, before the .svlog
+    opened, which diluted its rate (2.8 Hz reported, 2026-10-28)."""
+    from types import SimpleNamespace
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=True))
+    profile = SimpleNamespace(start_mm=0, length_mm=20000)
+    assert node._watch_t0 is None
+    node._watch_ping(profile, 0)                       # no window yet: not counted
+    assert node._watch_pings == [0, 0]
+    node._watch_pose("ATTITUDE")                       # first logged envelope
+    assert node._watch_t0 is not None
+    node._check_rates()                                # window too short: carried
+    assert log.warnings == [] and node._watch_counts["ATTITUDE"] == 1
+    # A whole window at SonarView's rates after the first envelope: no warning,
+    # however long the node had been up before the recording started.
+    node._watch_t0 = time.monotonic() - 10.0
+    node._watch_counts = {k: 128 for k in node._watch_counts}
+    node._watch_pings = [200, 200]
+    node._check_rates()
+    assert log.warnings == []
+
+
+def test_rate_watchdog_still_reports_a_pose_that_never_arrives(node, monkeypatch):
+    from types import SimpleNamespace
+    log = _LogCapture()
+    monkeypatch.setattr(node, "get_logger", lambda: log)
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=True))
+    node._check_rates()                                # recording, nothing logged
+    assert node._watch_t0 is not None and log.warnings == []
+    node._watch_t0 -= 10.0
+    node._check_rates()
+    assert len(log.warnings) == 1 and "ATTITUDE 0.0 Hz" in log.warnings[0]
+    monkeypatch.setattr(node, "_svlog", SimpleNamespace(active=False))
+    node._check_rates()                                # recording stopped: closed
+    assert node._watch_t0 is None
+
+
+def test_sonarview_ping_rate_law():
+    assert proc.sonarview_ping_hz(20.0) == pytest.approx(20.0)
+    assert proc.sonarview_ping_hz(35.0) == pytest.approx(20.0, abs=0.1)
+    assert proc.sonarview_ping_hz(95.6) == pytest.approx(1000 / (2000 * 95.6 / 1500 + 3))

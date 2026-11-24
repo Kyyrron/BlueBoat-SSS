@@ -9,37 +9,42 @@ in ``_connect_signals`` — nothing else changes.
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace as dc_replace
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtCore import QRectF, QRunnable, Qt, QThreadPool, QTimer
 from PySide6.QtGui import QCloseEvent, QImage
-from PySide6.QtWidgets import (QDockWidget, QMainWindow, QScrollArea,
-                               QStackedWidget)
+from PySide6.QtWidgets import (QDockWidget, QMainWindow, QMessageBox,
+                               QScrollArea, QStackedWidget)
 
 from ..config.settings import AppConfig
+from ..core.geo_service import GeoService
 from ..core.mosaic_service import MosaicService
 from ..core.recording_session import RecordingManager
 from ..core.signals import AppSignals
+from ..core.stream_clock import now as stream_now
 from ..core.waterfall_service import WaterfallService
-from ..mapping.coordinate_converter import CoordinateConverter
 from ..mapping.tiles import TileFetcher
 from ..models.detection import Detection, PingerFix
 from ..models.path import PlannedPath
 from ..models.robot_state import RobotState
 from ..models.sonar import SonarPing
-from ..utils.pose_alignment import FrozenPoseDetector, robot_to_world
+from ..ros import sonar_source as ss
+from ..utils.pose_alignment import (FrozenPoseDetector, HeadingPolicy,
+                                    robot_to_world)
 from . import left_panel as lp
 from . import right_panel as rp
 from .left_panel import LeftPanel
 from .log_console import LogConsole
+from ..core.seabed_imager import LEVER_ARM_M, waterfall_pixel_to_world
+from ..utils.attitude import AttitudeBuffer
+from ..utils.geodesy import format_latlon
 from .map_layers import (DetectionLayer, MeasureLayer, MosaicLayer,
-                         PingerLayer, PlannedPathLayer, SwathLayer,
-                         TileLayer, TrajectoryLayer)
+                         PingerLayer, PlannedPathLayer, SelectionLayer,
+                         SwathLayer, TileLayer, TrajectoryLayer, WorldRoot)
 from .map_view import MapMode, MapView
 from .right_panel import RightPanel
 from .toolbar import AcquisitionToolbar
@@ -77,15 +82,31 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._stack)
         scene = self.map_view.scene()
 
-        self.waterfall_service = WaterfallService(config)
+        # ONE display model for the waterfall, the AI pictures and the
+        # mosaic of this window (core/display_model.py): fed by the
+        # waterfall service, frozen after the warm-up, shared by all three
+        # so every picture maps dB to grey identically.
+        from ..core.display_model import DisplayModel
+        self.display_model = DisplayModel(config)
+        self.waterfall_service = WaterfallService(config, self.display_model)
+        mosaic_service.set_model(self.display_model)
         self.recording = RecordingManager(config, signals,
                                           mosaic_service,
                                           self.waterfall_service)
         # Live AI seabed imaging (waterfall domain, core/seabed_imager.py):
-        # every stride pings -> image + metadata + dummy analysis; written
-        # to <session>/seabed_images while a recording session is active.
+        # every stride rows -> image + metadata, written to
+        # <session>/seabed_images while a recording session is active, and
+        # ALWAYS published for BlueBoat-Perception -- the station's one
+        # detection source since 2026-10-16 (its detections come back on
+        # /sss_ai/detections through ros/detections_listener.py). One
+        # dedicated thread encodes + publishes, in order, off the GUI thread.
         from ..core.seabed_imager import SeabedImager
-        self.seabed_imager = SeabedImager(config)
+        self.seabed_imager = SeabedImager(config, model=self.display_model)
+        self._perception_pool = QThreadPool(self)
+        self._perception_pool.setMaxThreadCount(1)
+        # Latest /mavros/imu/data attitude, attached to every live ping for
+        # the seabed-image metadata (utils/attitude.py; never geometry).
+        self._attitude = AttitudeBuffer()
         self._frozen_detector = FrozenPoseDetector(
             eps_m=config.alignment.frozen_epsilon_m,
             after=config.alignment.frozen_after_pings)
@@ -98,32 +119,51 @@ class MainWindow(QMainWindow):
         # pose re-syncs instantly with no phantom segment.
         self._telemetry_stale = False
         self._last_state_walltime: Optional[float] = None
+        self._last_pinger_walltime: Optional[float] = None
         self._stale_after_s = 3.0
         self._watchdog = QTimer(self)
         self._watchdog.setInterval(1000)
         self._watchdog.timeout.connect(self._check_telemetry_staleness)
         self._watchdog.start()
 
-        self.converter = CoordinateConverter(config.map.frame_yaw_offset_deg)
+        # GPS anchor (ported from BlueBoat-MCS): the scene is EN metres
+        # about the first accepted fix; every world-anchored layer lives
+        # under one WorldRoot whose position is the odom->EN translation
+        # and whose visibility is the readiness gate. The compass is the
+        # live heading reference (alignment.heading_source).
+        self.geo = GeoService(config.geo, config.map.require_gps_anchor)
+        self._heading = HeadingPolicy(config.alignment.compass_stale_s)
         tile_url = (config.map.satellite_url if config.map.use_satellite
                     else config.map.osm_url)
         self._tile_fetcher = TileFetcher(
             tile_url, Path(config.map.tile_cache_dir).expanduser(),
-            config.map.max_concurrent_tile_requests, parent=self)
-        self.tile_layer = TileLayer(scene, self._tile_fetcher, self.converter)
-        self.mosaic_layer = MosaicLayer(scene)
-        self.trajectory_layer = TrajectoryLayer(scene)
-        self.planned_path_layer = PlannedPathLayer(scene)
-        self.swath_layer = SwathLayer(scene)
-        self.detection_layer = DetectionLayer(scene)
-        self.pinger_layer = PingerLayer(scene)
-        self.measure_layer = MeasureLayer(scene)
+            config.map.max_concurrent_tile_requests, parent=self,
+            detect_placeholders=config.map.use_satellite)
+        # Tiles are pinned to (lat0, lon0), never to the translation —
+        # imagery must not slide when the anchor refits.
+        self.tile_layer = TileLayer(scene, self._tile_fetcher,
+                                    lambda: self.geo.origin)
+        self.world_root = WorldRoot(scene)
+        root = self.world_root.item
+        self.mosaic_layer = MosaicLayer(scene, root)
+        self.trajectory_layer = TrajectoryLayer(scene, root)
+        self.planned_path_layer = PlannedPathLayer(scene, root)
+        self.swath_layer = SwathLayer(scene, root)
+        self.detection_layer = DetectionLayer(scene, root)
+        self.pinger_layer = PingerLayer(scene, root)
+        self.selection_layer = SelectionLayer(scene, root)
+        self.measure_layer = MeasureLayer(scene)   # EN space: distances only
+        self.world_root.set_ready(self.geo.ready)
+        self.map_view.set_waiting(not self.geo.ready)
+        self.map_view.set_interactive(self.geo.ready)
 
         # ---- side panels ------------------------------------------------------
         self.left_panel = LeftPanel()
         self.addDockWidget(Qt.LeftDockWidgetArea,
                            self._dock("Mission", self.left_panel))
-        self.right_panel = RightPanel()
+        self.right_panel = RightPanel(acquisition_range=(
+            config.acquisition.range_min_m, config.acquisition.range_max_m),
+            config=config)
         self.addDockWidget(Qt.RightDockWidgetArea,
                            self._dock("Tools", self.right_panel))
 
@@ -154,6 +194,16 @@ class MainWindow(QMainWindow):
         self._mission_timer.timeout.connect(self._update_mission_time)
         self._mission_timer.start()
 
+        # Swath-line coalescing: the range line is a scene mutation, and
+        # mutating it per ping forces a full-viewport repaint at ping
+        # rate. Latest-wins, flushed at the mosaic render cadence.
+        self._pending_swath = None
+        self._swath_timer = QTimer(self)
+        self._swath_timer.setInterval(
+            max(1, int(1000 / config.mosaic.render_hz)))
+        self._swath_timer.timeout.connect(self._flush_swath)
+        self._swath_timer.start()
+
         self._connect_signals()
 
     @staticmethod
@@ -178,17 +228,33 @@ class MainWindow(QMainWindow):
         s.detection.connect(self._on_detection)
         s.pinger_fix.connect(self._on_pinger)
         s.planned_path.connect(self._on_planned_path)
+
+        # GPS anchor: pair fixes with fresh odom, follow the fit.
+        s.gps_fix.connect(self.geo.on_gps_fix)
+        s.compass_heading.connect(self._heading.update_compass)
+        s.attitude.connect(self._attitude.update)
+        self.geo.fit_changed.connect(
+            lambda fit: self.world_root.set_translation(fit.tx, fit.ty))
+        self.geo.anchored.connect(self._on_anchored)
+        self.geo.pairing_blocked.connect(
+            lambda msg: self._signals.status_message.emit(msg))
         s.pipeline_state.connect(self.toolbar.on_pipeline_state)
+        s.pipeline_state.connect(self._on_pipeline_state)
         s.status_message.connect(
             lambda msg: self.statusBar().showMessage(msg, 8000))
         s.status_message.connect(
             lambda msg: self.console.append_line("app", msg))
         s.log_line.connect(self.console.append_line)
         self._mosaic_service.raster_updated.connect(self._on_raster)
-        self.waterfall_service.image_updated.connect(
-            self.waterfall_view.on_image)
+        self.waterfall_service.layout_changed.connect(
+            self.waterfall_view.on_layout)
+        self.waterfall_service.tile_updated.connect(
+            self.waterfall_view.on_tile)
+        self.waterfall_view.tiles_requested.connect(
+            self.waterfall_service.request_rows)
         self.waterfall_service.detections_updated.connect(
             self.waterfall_view.on_detections)
+        self.waterfall_view.point_selected.connect(self._on_waterfall_point)
 
         # Map interactions.
         self.map_view.point_clicked.connect(self._on_point_clicked)
@@ -210,11 +276,20 @@ class MainWindow(QMainWindow):
         self.right_panel.priority_changed.connect(
             self.recording.note_priority_mode)
         self.right_panel.display_changed.connect(self._on_display_changed)
+        # The panel's construction-time emission reached nobody: push the
+        # slider's value to both services and the session metadata now,
+        # so the screen, the pictures and metadata.json start on the same
+        # transfer (RightPanel.emit_display).
+        self.right_panel.emit_display()
+        self.right_panel.resolution_changed.connect(self._on_resolution_changed)
+        self.right_panel.depth_mode_changed.connect(self._on_depth_mode_changed)
         self.right_panel.clear_overlays_clicked.connect(
             self._on_clear_overlays)
         self.right_panel.clear_sss_clicked.connect(self._on_clear_sss)
         self.right_panel.sss_opacity_changed.connect(
             self.mosaic_layer.set_opacity)
+        self.right_panel.range_apply_requested.connect(self._on_range_apply)
+        s.sonar_params_result.connect(self._on_sonar_params_result)
         self._mosaic_service.cleared.connect(self.mosaic_layer.clear)
         self.recording.recording_state.connect(
             self.toolbar.on_recording_state)
@@ -226,6 +301,14 @@ class MainWindow(QMainWindow):
         self.toolbar.stop_clicked.connect(self._on_stop)
         self.toolbar.record_toggled.connect(self._on_record_toggled)
         self.toolbar.console_toggled.connect(self._console_dock.setVisible)
+        # Sonar source (Simulation / Real sonars): only a ROS pipeline has
+        # one to choose; the built-in --sim simulator does not.
+        has_source = hasattr(self._acquisition, "set_source")
+        self.toolbar.set_sonar_selector_available(has_source)
+        if has_source:
+            self.toolbar.set_sonar_source(self._acquisition.source)
+        self.toolbar.sonar_source_changed.connect(
+            self._on_sonar_source_changed)
 
         # Apply the initial (all-disabled) layer states to the scene so
         # checkboxes and items agree at startup.
@@ -245,24 +328,39 @@ class MainWindow(QMainWindow):
         """
         if not self._viz_enabled:
             return
+        self._apply_backpressure(ping)
         ping = self._align_ping_pose(ping)
+        ping = self._attitude.attach(ping, stream_now())
         self._mosaic_service.on_sonar_ping(ping)
         self.waterfall_service.on_sonar_ping(ping)
         self.seabed_imager.on_sonar_ping(ping)
         self.right_panel.altitude_plot.append(ping.water_depth)
         # Sonar range line: extent taken from the actual samples, so it
-        # tracks the current sonar configuration automatically.
+        # tracks the current sonar configuration automatically. Stored
+        # latest-wins and flushed by _swath_timer, never drawn per ping.
         if ping.y_local.size:
-            self.swath_layer.update(ping.robot_x, ping.robot_y, ping.yaw,
-                                    float(np.abs(ping.y_local).max()))
+            # Through the transducers' point: the line is where this ping
+            # was acquired, the fore/aft arm behind the navigation point.
+            self._pending_swath = (ping.sensor_x, ping.sensor_y, ping.yaw,
+                                   float(np.abs(ping.y_local).max()))
+
+    def _flush_swath(self) -> None:
+        if self._pending_swath is not None:
+            self.swath_layer.update(*self._pending_swath)
+            self._pending_swath = None
 
     def _on_planned_path(self, path: PlannedPath) -> None:
-        # A new message fully replaces the previously displayed path.
+        # A new path fully replaces the previously displayed one (an empty
+        # one clears it). World-frame poses, drawn as they come: the
+        # listener asks the running path server for the whole mission
+        # (ros/path_listener.py), /set_path being its fallback.
         self.planned_path_layer.set_path(path.points)
 
     def _on_robot_state(self, state: RobotState) -> None:
         self._last_robot_state = state
-        self._last_state_walltime = time.monotonic()
+        self._last_state_walltime = stream_now()
+        self.geo.on_robot_state(state)          # freshest pose for pairing
+        self._heading.update_odom(self._last_state_walltime, state.yaw)
         if self._telemetry_stale:
             # Telemetry resumed: the break armed by the watchdog makes
             # this pose start a fresh polyline segment — instant re-sync.
@@ -270,19 +368,48 @@ class MainWindow(QMainWindow):
             self.trajectory_layer.set_stale(False)
             self.statusBar().showMessage("Telemetry resumed.", 4000)
         self.left_panel.on_robot_state(state)
-        self.trajectory_layer.add_pose(state.x, state.y, state.yaw)
+        marker_yaw = self._heading.heading(stream_now())
+        self.trajectory_layer.add_pose(
+            state.x, state.y,
+            state.yaw if marker_yaw is None else marker_yaw)
         # Live distances (#6/#7): selected point + both measure points +
         # the pinger panel update continuously as the robot moves.
         for card in (self.left_panel.coordinate_card,
                      self.right_panel.point_a, self.right_panel.point_b):
             card.update_robot_position(state.x, state.y)
-        # Bind the GPS origin exactly once, on the first full state.
-        if not self.converter.ready and state.lat is not None:
-            self.converter.bind_origin(state.lat, state.lon, state.x, state.y)
-            self._signals.origin_bound.emit(state.lat, state.lon)
-            self.statusBar().showMessage(
-                f"GPS origin bound at {state.lat:.6f}, {state.lon:.6f}", 8000)
-            self._refresh_tiles()
+
+    def _on_anchored(self, lat0: float, lon0: float) -> None:
+        """The odom<->GPS anchor became valid: open the map."""
+        self.world_root.set_ready(True)
+        self.map_view.set_waiting(False)
+        self.map_view.set_interactive(True)
+        self._refresh_tiles()
+        self._signals.geo_anchored.emit(lat0, lon0)
+        rms = self.geo.rms_m
+        self.statusBar().showMessage(
+            f"Map anchored at {lat0:.6f}, {lon0:.6f}"
+            + (f" (rms {rms:.1f} m)" if rms else ""), 8000)
+
+    def _apply_backpressure(self, ping: SonarPing) -> None:
+        """The sonar_ping queue has no backpressure: when the GUI thread
+        falls behind, pings pile up in Qt's event queue and latency
+        grows without bound ("slower and slower, then dies"). Rows always
+        enter the buffers; only *rendering* pauses until the queue has
+        drained, and the operator is told once per episode."""
+        limit = int(getattr(self._config.mosaic, "ping_lag_throttle", 0))
+        latest = int(getattr(self._signals, "sonar_latest_seq", 0))
+        if limit <= 0 or not ping.seq or not latest:
+            return
+        lag = latest - ping.seq
+        behind = lag > limit
+        if behind != getattr(self, "_ping_lag_throttled", False):
+            self._ping_lag_throttled = behind
+            self._mosaic_service.throttle(behind)
+            self.waterfall_service.throttle(behind)
+            if behind:
+                self._signals.status_message.emit(
+                    f"SONAR: display {lag} pings behind the stream -- "
+                    "rendering paused until it catches up (no data lost)")
 
     def _on_detection(self, det: Detection) -> None:
         self.left_panel.on_detection(det)
@@ -290,6 +417,24 @@ class MainWindow(QMainWindow):
         # Same detection on the waterfall view (row found by ping time).
         self.waterfall_service.add_detection(det.t, det.x, det.y,
                                              det.class_name)
+
+    # ---- display settings ---------------------------------------------------
+    def _on_resolution_changed(self, cell_m: float) -> None:
+        """0 = auto (best the data supports, kept up to date), else a
+        fixed GSD. Either way accumulated data is preserved."""
+        if cell_m <= 0.0:
+            self._mosaic_service.enable_auto_resolution()
+            self.statusBar().showMessage(
+                "Mosaic resolution: auto (from the sonar's sample spacing).", 6000)
+        else:
+            self._mosaic_service.set_fixed_cell_size(cell_m)
+
+    def _on_depth_mode_changed(self, mode: str, manual_m: float) -> None:
+        self._config.depth.mode = mode
+        self._config.depth.manual_m = manual_m
+        self.statusBar().showMessage(
+            f"Depth compensation: {mode}"
+            + (f" ({manual_m:.1f} m)" if mode == "manual" else ""), 6000)
 
     # ---- sea-trial pose alignment ------------------------------------------------
     def _align_ping_pose(self, ping: SonarPing) -> SonarPing:
@@ -301,9 +446,10 @@ class MainWindow(QMainWindow):
         elsewhere — the live '(0,0) pings with GPS on' pathology (the
         processor's /blueboat/odom is zeroed or clock-mismatched; rosbag
         replays are sane because their odom is synthesized). A console
-        warning identifies the robot-side root cause once.
+        warning identifies the upstream root cause once.
         """
         mode = self._config.alignment.pose_source
+        ping = self._restamp_ping_heading(ping)
         if mode == "embedded":
             return ping
         state = self._last_robot_state
@@ -318,54 +464,74 @@ class MainWindow(QMainWindow):
                     "app",
                     "ALIGNMENT: ProcessedSSSPing poses are frozen at (0,0) "
                     "while the boat moves — re-stamping pings from GCS "
-                    "telemetry. Root cause is robot-side: /blueboat/odom "
+                    "telemetry. Root cause is upstream: /blueboat/odom "
                     "seen by sss_processor_node is zeroed or its stamps "
                     "are on a different clock than the sonar profiles "
                     "(see HANDOVER 'Sea-trial pose alignment').")
             if not engaged:
                 return ping
-        if state is None:
-            return ping                        # nothing better available
-        return dc_replace(ping, robot_x=state.x, robot_y=state.y,
-                          yaw=state.yaw)
+        if state is None or self._telemetry_stale:
+            # No replacement pose, or only a stale one: re-stamping a
+            # frozen ping from an equally frozen GCS pose would recreate
+            # the very pile-up this path exists to break.
+            return ping
+        return self._restamp_ping_heading(dc_replace(
+            ping, robot_x=state.x, robot_y=state.y, yaw=state.yaw))
+
+    def _restamp_ping_heading(self, ping: SonarPing) -> SonarPing:
+        """Live heading fix (alignment.heading_source: compass).
+
+        The field bug: the embedded odom-quaternion yaw drew SSS pings
+        misaligned with the boat's true heading, while replay (mavlink
+        ATTITUDE yaw) was correct. The compass is the true-north
+        reference, so live pings are re-stamped from it — replay never
+        passes through here.
+        """
+        if self._config.alignment.heading_source != "compass":
+            return ping
+        yaw = self._heading.heading(stream_now())
+        if yaw is None:
+            return ping
+        return dc_replace(ping, yaw=yaw)
 
     def _on_pinger(self, fix: PingerFix) -> None:
-        # Frame handling (alignment.pinger_frame): a USBL natively
-        # reports vehicle-relative coordinates, so "robot" (default)
-        # rotates [x fwd, y port] through the robot pose nearest the
-        # fix; "world" passes coordinates through unchanged.
-        if self._config.alignment.pinger_frame == "robot":
+        # Frame handling (alignment.pinger_frame): "auto" trusts the
+        # frame the listener derived from the wire shape (3-vector =
+        # body, 2-vector = world); "robot"/"world" force one
+        # interpretation. Body-frame fixes rotate [x fwd, y port]
+        # through the robot pose nearest the fix.
+        mode = self._config.alignment.pinger_frame
+        frame = (fix.frame if mode == "auto"
+                 else ("body" if mode == "robot" else "world"))
+        if frame == "body":
             state = self._last_robot_state
             if state is None:
                 return                      # cannot place it yet
+            yaw = self._heading.heading(stream_now())
             wx, wy = robot_to_world(fix.x, fix.y, state.x, state.y,
-                                    state.yaw)
-            fix = dc_replace(fix, x=wx, y=wy)
+                                    state.yaw if yaw is None else yaw)
+            fix = dc_replace(fix, x=wx, y=wy, frame="world")
+        self._last_pinger_walltime = stream_now()
         self.pinger_layer.update(fix)
         self.left_panel.on_pinger(fix.x, fix.y,
-                                  self.converter.local_to_gps(fix.x, fix.y))
+                                  self.geo.local_to_gps(fix.x, fix.y))
 
     # ---- AI seabed imaging (live) -----------------------------------------------
     def _on_seabed_image(self, image) -> None:
-        """Every completed seabed image: publish the analysis (metadata +
-        detections, never pixels) and show detections on the map."""
-        payload = image.analysis_json(getattr(image, "_png_path", None),
-                                      getattr(image, "_metadata_path", None))
+        """Every completed seabed image: publish the analysis (metadata,
+        never pixels; ``detections: []``) and the image itself for
+        BlueBoat-Perception. The station draws no detection of its own:
+        Perception is its one detection source, whose results arrive on
+        /sss_ai/detections like any other (one path, never duplicates)."""
+        png_path = getattr(image, "_png_path", None)
+        meta_path = getattr(image, "_metadata_path", None)
+        payload = image.analysis_json(png_path, meta_path)
         # PipelineLauncher exposes the ros manager; Simulator has none.
         ros = getattr(self._acquisition, "_ros", None)
         if ros is not None:
             ros.publish_seabed_analysis(payload)
-        self.console.append_line(
-            "app", f"seabed image {image.image_id}: "
-                   f"{len(image.detections)} detection(s) published")
-        for k, det in enumerate(image.detections):
-            t_row = float(det.get("t_s", image.row_t[-1]))
-            self._signals.detection.emit(Detection(
-                uid=1_000_000 + image.image_id * 16 + k,
-                t=t_row,
-                x=float(det["world"][0]), y=float(det["world"][1]),
-                class_name=det["class_name"],
-                confidence=float(det["confidence"]), extent_m=1.0))
+            self._perception_pool.start(
+                _PerceptionPublishJob(ros, image, png_path, meta_path))
 
     def _on_open_svlog(self) -> None:
         from .replay_window import open_svlog_dialog
@@ -384,9 +550,18 @@ class MainWindow(QMainWindow):
         self.waterfall_service.set_enabled(waterfall)
 
     def _check_telemetry_staleness(self) -> None:
+        # Pinger staleness: a marker with no recent fix is hidden — the
+        # last known position of a silent pinger is not a position.
+        stale_s = self._config.alignment.pinger_stale_after_s
+        if (stale_s > 0 and self._last_pinger_walltime is not None
+                and stream_now() - self._last_pinger_walltime > stale_s):
+            self._last_pinger_walltime = None
+            self.pinger_layer.clear()      # re-shows on the next fix
+            self.statusBar().showMessage(
+                "Pinger signal lost — marker hidden.", 6000)
         if self._telemetry_stale or self._last_state_walltime is None:
             return
-        if time.monotonic() - self._last_state_walltime > self._stale_after_s:
+        if stream_now() - self._last_state_walltime > self._stale_after_s:
             self._telemetry_stale = True
             self.trajectory_layer.set_stale(True)
             self.trajectory_layer.begin_new_segment()
@@ -398,6 +573,17 @@ class MainWindow(QMainWindow):
         # One settings object drives both views identically.
         self._mosaic_service.set_display(settings)
         self.waterfall_service.set_display(settings)
+        # ... and the pictures too. The transfer exponent lives on the
+        # display model, which is what the seabed imager writes its PNGs
+        # through; until 2026-09-18 the slider reached the screen and the
+        # mosaic but not `DisplayModel.gamma`, so a session run at the
+        # operator's contrast saved its AI pictures at the config's
+        # (0.48 on screen, 0.7 on disk -- 2026-09-18 review par. 3.11).
+        # Every picture stores the gamma it was written with, so old
+        # sessions stay interpretable either way.
+        g = float(getattr(settings, "gamma", self.display_model.gamma))
+        if np.isfinite(g) and g > 0.0:
+            self.display_model.gamma = g
         self.recording.note_display_settings(settings)
 
     def _on_clear_sss(self) -> None:
@@ -406,6 +592,7 @@ class MainWindow(QMainWindow):
         the view transform). New pings keep accumulating immediately."""
         self._mosaic_service.clear()          # emits cleared -> layer wipes
         self.waterfall_service.clear()        # emits null image -> view wipes
+        self.display_model.reset()            # a fresh mission: re-warm
         self.statusBar().showMessage(
             "SSS data cleared — overlays, map position and zoom preserved.",
             8000)
@@ -429,20 +616,67 @@ class MainWindow(QMainWindow):
             cleared.append("pinger")
         if self.left_panel.is_layer_enabled(lp.LAYER_PLANNED_PATH):
             self.planned_path_layer.clear()
+            # The listener drops verbatim re-sends of the path it last
+            # forwarded and asks the path server once per deployment;
+            # forget both so the next poll (or /set_path's next 5 s
+            # refresh) redraws the mission the operator just cleared.
+            reset = getattr(self._acquisition, "reset_planned_path", None)
+            if reset is not None:
+                reset()
             cleared.append("planned path")
-        # Measurements and the range line have no visibility checkbox:
-        # they are on screen, hence "currently displayed" -> cleared.
+        # Measurements, the selected point and the range line have no
+        # visibility checkbox: they are on screen, hence "currently
+        # displayed" -> cleared.
+        self.selection_layer.clear()
+        self.waterfall_view.set_selected(None)
         self.measure_layer.clear()
         self.right_panel.set_measure_active(False)
+        self._pending_swath = None
         self.swath_layer.clear()
         cleared.append("measurements")
         self.statusBar().showMessage(
             "Cleared: " + ", ".join(cleared)
             + ".  Mosaic and hidden overlays preserved.", 8000)
 
+    # ---- waterfall click -> map point ------------------------------------------------
+    def _on_waterfall_point(self, row: int, col: int) -> None:
+        """A click in the waterfall selects the same physical point on
+        the world map, with its GPS coordinates."""
+        meta = self.waterfall_service.row_meta(row)
+        if meta is None:
+            self.statusBar().showMessage(
+                "No position for that waterfall point (gap row, or the "
+                "history was discarded).", 6000)
+            return
+        # As the seabed pictures (georef convention 3): the row's tracked
+        # bottom, the lateral lever arm (row_georef) and the row's fore/aft
+        # arm (row_lever_x; 0 = convention 2).
+        rx, ry, yaw, bottom = self.waterfall_service.row_georef(row)
+        wx, wy = waterfall_pixel_to_world(
+            rx, ry, yaw, bottom, self.waterfall_service.pitch_m,
+            float(col), self.waterfall_service.columns, *LEVER_ARM_M,
+            lever_x=self.waterfall_service.row_lever_x(row))
+        wx, wy = float(wx), float(wy)
+        gps = self.geo.local_to_gps(wx, wy)
+        self.selection_layer.show_at(
+            wx, wy, format_latlon(*gps) if gps else "")
+        self.waterfall_view.set_selected(row, col)
+        self.left_panel.coordinate_card.set_point(wx, wy, gps)
+        if self.geo.ready:
+            self.map_view.center_on_world(*self.geo.world_to_en(wx, wy))
+        gps_txt = f"   |   {gps[0]:.7f}, {gps[1]:.7f}" if gps else ""
+        self.statusBar().showMessage(
+            f"Waterfall point:  x {wx:+.2f} m,  y {wy:+.2f} m{gps_txt}",
+            15000)
+
     # ---- map interaction slots -------------------------------------------------------
-    def _on_point_clicked(self, x: float, y: float) -> None:
-        gps = self.converter.local_to_gps(x, y)
+    # MapView clicks arrive in EN scene coordinates (y-up); the exact
+    # inverse of the fit (world = EN - t) recovers the robot's world
+    # frame, and lat/lon comes from the same fit. Distances are frame-
+    # independent (the fit is a pure translation).
+    def _on_point_clicked(self, ex: float, ey: float) -> None:
+        x, y = self.geo.en_to_world(ex, ey)
+        gps = self.geo.local_to_gps(x, y)
         self.left_panel.coordinate_card.set_point(x, y, gps)
         gps_txt = f"   |   {gps[0]:.7f}, {gps[1]:.7f}" if gps else ""
         self.statusBar().showMessage(
@@ -453,17 +687,19 @@ class MainWindow(QMainWindow):
         if not on:
             self.measure_layer.clear()
 
-    def _on_measure_started(self, x: float, y: float) -> None:
-        self.measure_layer.show_first(x, y)
+    def _on_measure_started(self, ex: float, ey: float) -> None:
+        self.measure_layer.show_first(ex, ey)   # measure layer lives in EN
         self.right_panel.on_first_point()
-        self.right_panel.point_a.set_point(x, y, self.converter.local_to_gps(x, y))
+        x, y = self.geo.en_to_world(ex, ey)
+        self.right_panel.point_a.set_point(x, y, self.geo.local_to_gps(x, y))
         self.right_panel.point_b.clear()
 
-    def _on_measure_done(self, x1: float, y1: float,
-                         x2: float, y2: float, dist: float) -> None:
-        self.measure_layer.show_measurement((x1, y1), (x2, y2), dist)
+    def _on_measure_done(self, ex1: float, ey1: float,
+                         ex2: float, ey2: float, dist: float) -> None:
+        self.measure_layer.show_measurement((ex1, ey1), (ex2, ey2), dist)
+        x2, y2 = self.geo.en_to_world(ex2, ey2)
         self.right_panel.point_b.set_point(
-            x2, y2, self.converter.local_to_gps(x2, y2))
+            x2, y2, self.geo.local_to_gps(x2, y2))
         self.right_panel.show_distance(dist)
 
     def _on_viewport_changed(self, world_rect: QRectF, mpp: float) -> None:
@@ -478,7 +714,8 @@ class MainWindow(QMainWindow):
         if pos is None and self._last_robot_state is not None:
             pos = (self._last_robot_state.x, self._last_robot_state.y)
         if pos is not None:
-            self.map_view.center_on_world(*pos)  # one-shot, camera stays free
+            # One-shot centering; the view lives in EN, poses in world.
+            self.map_view.center_on_world(*self.geo.world_to_en(*pos))
 
     # ---- layer toggles ------------------------------------------------------------------
     def _on_layer_toggled(self, key: str, on: bool) -> None:
@@ -505,7 +742,7 @@ class MainWindow(QMainWindow):
     # node is restarted. STOP terminates the nodes (and START relaunches
     # them if pressed again). Recording is fully independent.
     def _on_start(self) -> None:
-        self._mission_start = time.monotonic()
+        self._mission_start = stream_now()
         # Robot-state re-sync (as if the application had just launched),
         # while PRESERVING any displayed trajectory: forget the cached
         # pose and break the track polyline so no phantom segment joins
@@ -513,18 +750,62 @@ class MainWindow(QMainWindow):
         self._last_robot_state = None
         self.trajectory_layer.begin_new_segment()
         self._mosaic_service.reset_tracking()  # no interp across the break
+        self._pending_swath = None
         self.swath_layer.clear()          # redrawn by the first new ping
+        # Per-mission state that must NOT leak into the new session (the
+        # "pings pile on one point in sessions 2+" field bug): the frozen-
+        # pose detector's engagement, the sonar pair's counter-offset
+        # expectations, and any seabed-image rows buffered before STOP.
+        self._frozen_detector.reset()
+        self._acquisition.reset_stream_health()
+        self.seabed_imager.reset()        # discard pre-STOP rows, no emit
         if not getattr(self._acquisition, "running", False):
-            self._acquisition.start()     # relaunch after a STOP
+            # Relaunch after a STOP. A refusal (launcher still in its
+            # SIGINT->SIGKILL ladder, or spawn failure) must not flip the
+            # viz gate: doing so greyed START out with nothing running,
+            # which is how a second field session got stuck.
+            if not self._acquisition.start():
+                return
         self._acquisition.enable_pinging()
         self._viz_enabled = True
         self.toolbar.on_viz_state(True)
         self.statusBar().showMessage("Live acquisition started.", 6000)
 
+    def _on_sonar_source_changed(self, source: str) -> None:
+        """Toolbar "Sonar" selector. The choice is remembered; a pipeline
+        that is up is stopped (STOP: pinging off, an open recording session
+        saved) and launched again with it, after the operator confirms."""
+        acq = self._acquisition
+        if not hasattr(acq, "set_source"):
+            return
+        state = getattr(getattr(acq, "state", None), "value", "stopped")
+        up = state in ("starting", "running", "stopping")
+        if up:
+            text = (f"Switch the sonar to {ss.LABELS[ss.normalise(source)]}?"
+                    "\n\nThe processing pipeline is stopped and started again"
+                    + (", and the recording session is closed and saved"
+                       if self.recording.active else "") + ".")
+            answer = QMessageBox.question(self, "Sonar source", text)
+            if answer != QMessageBox.StandardButton.Yes:
+                self.toolbar.set_sonar_source(acq.source)
+                return
+            self._on_stop()
+        ss.store_source(source)
+        acq.set_source(source, relaunch=up)
+        self.statusBar().showMessage(
+            f"Sonar: {ss.LABELS[ss.normalise(source)]}"
+            + (" — restarting the pipeline." if up
+               else " — used by the next pipeline start."), 8000)
+
     def _on_record_toggled(self, on: bool) -> None:
         """Record ON/OFF — independent from visualization."""
         if on:
-            self._acquisition.set_recording(True)   # publish log_enable
+            if not self._acquisition.set_recording(True):
+                # The processor never saw log_enable: opening a session
+                # would produce a folder with no .svlog ever adopted
+                # (the "only the first session records" field bug).
+                self.toolbar.on_recording_state(False)
+                return
             self.recording.begin()
             # Live seabed images stream into the session from now on.
             self.seabed_imager.set_output_dir(
@@ -535,8 +816,43 @@ class MainWindow(QMainWindow):
             self.seabed_imager.set_output_dir(None)
             saved = self.recording.end()            # save every artifact
             if saved is not None:
+                # Adoption is deferred so the processor's in-flight
+                # log_enable=False lands before the file is moved
+                # (recording_session.py module docstring).
+                QTimer.singleShot(
+                    int(self._config.recording.adopt_delay_s * 1000),
+                    self.recording.adopt_now)
                 self.statusBar().showMessage(
                     f"Recording session saved to {saved}", 15000)
+
+    def _on_range_apply(self, range_m: float) -> None:
+        """Right-panel 'Apply range': hand the dance to the launcher
+        (the simulator refuses gracefully — its swath is fixed)."""
+        self._acquisition.set_range(range_m)
+
+    def _on_sonar_params_result(self, ok: bool, _detail: str) -> None:
+        if ok:
+            # Honest seam: the waterfall's column scale follows each
+            # ping's slant_range_m, so rows before and after the change
+            # are on different horizontal scales — mark the boundary.
+            self.waterfall_service.break_row()
+
+    def _on_pipeline_state(self, state: str) -> None:
+        """Pipeline died or stopped while a session is open: close the
+        session properly (the toolbar only unchecks its button, which is
+        cosmetic — RecordingManager would stay active and silently reuse
+        this session's folder on the next Record ON)."""
+        self.right_panel.set_acquisition_enabled(state == "running")
+        if state in ("stopped", "error") and self.recording.active:
+            self.seabed_imager.flush()
+            self.seabed_imager.set_output_dir(None)
+            saved = self.recording.end()
+            # The processor is gone — nothing can write any more, so the
+            # adoption sweep is safe to run synchronously.
+            self.recording.adopt_now()
+            if saved is not None:
+                self.statusBar().showMessage(
+                    f"Pipeline stopped — session saved to {saved}", 15000)
 
     def _on_stop(self) -> None:
         """Full stop: pinging off, session closed (if any), nodes down."""
@@ -549,14 +865,19 @@ class MainWindow(QMainWindow):
             self.seabed_imager.flush()   # truncated last picture
             self.seabed_imager.set_output_dir(None)
             saved = self.recording.end()
+            # Pinging is off, so the processor writes nothing more:
+            # adopting synchronously here is race-free.
+            self.recording.adopt_now()
             if saved is not None:
                 self.statusBar().showMessage(f"Saved to {saved}", 15000)
+        else:
+            self.recording.adopt_now()   # flush a pending deferred adoption
         self._acquisition.stop()                   # terminate ROS 2 nodes
 
     def _update_mission_time(self) -> None:
         self.left_panel.set_mission_time(
             None if self._mission_start is None
-            else time.monotonic() - self._mission_start)
+            else stream_now() - self._mission_start)
 
     # ---- shutdown --------------------------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
@@ -565,6 +886,30 @@ class MainWindow(QMainWindow):
         if self.recording.active:
             self._acquisition.set_recording(False)
             self.recording.end()
+        self.recording.adopt_now()   # never lose a deferred adoption on exit
         self._acquisition.disable_pinging()
         self._acquisition.stop()
+        # The mosaic/waterfall export and the seabed-image saves run on
+        # the pool; the process must not exit under them.
+        self.recording.wait_for_exports()
         super().closeEvent(event)
+
+
+class _PerceptionPublishJob(QRunnable):
+    """Encode one seabed image and publish its three parts for
+    BlueBoat-Perception (core/perception_bridge.py). Runs on the window's
+    single-thread pool: the GUI thread never encodes, and images go out
+    in emission order. The image is never mutated after emission."""
+
+    def __init__(self, ros, image, png_path, meta_path) -> None:
+        super().__init__()
+        self._ros, self._image = ros, image
+        self._paths = (png_path, meta_path)
+        self.setAutoDelete(True)
+
+    def run(self) -> None:  # noqa: D401
+        from ..core.perception_bridge import publish_parts
+        try:
+            self._ros.publish_seabed_image(*publish_parts(self._image, *self._paths))
+        except Exception as exc:  # pragma: no cover - reported, never raised
+            print(f"seabed image publish failed: {exc}")

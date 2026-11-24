@@ -3,30 +3,68 @@
 Rendering strategy (decision)
 -----------------------------
 The waterfall is *not* a map layer: its axes are ping index (vertical,
-time) × across-track distance (horizontal), i.e. the raw acquisition
-domain — the domain in which future AI datasets will be generated. It
-therefore gets its own numpy ring buffer and its own view widget instead
-of being forced into the georeferenced QGraphicsScene.
+time) × across-track slant range (horizontal) — the raw acquisition
+domain, exactly as SonarView draws it. It therefore gets its own numpy
+buffer and its own view widget instead of being forced into the
+georeferenced QGraphicsScene.
 
-* Each incoming ping is resampled onto a fixed number of across-track
-  columns spanning its own full swath (port left, starboard right —
-  matching SonarView row layout; per-row scaling is exactly how a raw
-  waterfall behaves when the range setting changes mid-survey).
-* Rows live in a preallocated ``(rows, columns)`` float32 ring buffer:
-  ingestion is O(columns) per ping, memory is constant, and the newest
-  ping is always the bottom row.
-* Rendering reuses the *same* ``MosaicRenderer``/``DisplaySettings``
-  pipeline as the mosaic on the same throttled QTimer cadence — one
-  value→pixel path for both views, so the display controls behave
-  identically everywhere.
+Native slant-bin rows (replaces the fixed-width ground scatter)
+---------------------------------------------------------------
+The old implementation scattered each ping's slant-corrected ground
+samples into a fixed 800-column grid. Ground-range spacing is not
+uniform (it stretches toward nadir), so at short range up to ~25 % of
+every row's columns received no sample and rendered as dark holes:
+pepper noise, persistent vertical dark stripes, and a wide fake
+"nadir gap" band — none of it in the data. All of that is gone:
 
-Raw data is never modified; interpolation does not apply here (there are
-no spatial gaps in the acquisition domain).
+* A row is the ping's **native device range bins, verbatim** — one
+  column per bin, no resampling, no interpolation, hole-free by
+  construction (`models.sonar.build_slant_row`). Column width adapts to
+  the acquisition: nothing is forced to 800 columns any more.
+* The centre gap that remains is the **physical water column** (bins
+  with slant range below the tracked altitude, cut upstream): its width
+  follows per ping from the geometry, not from column aliasing.
+* When the range setting changes mid-mission the buffer re-lays itself
+  out to the largest extent seen (finest bin pitch wins); rows at a
+  coarser pitch paint by pure pixel stretch — values verbatim.
+* Genuine acquisition loss (a jump in the device's own ping counter,
+  `SonarPing.gap_before`) is drawn as blank lines, so real dropouts are
+  visible and distinguishable from display artifacts.
+
+Growable tiled buffer
+---------------------
+* Rows live in fixed-height **tiles** of ``_TILE_ROWS`` × columns
+  (float32 data + float64 per-row metadata), appended as the mission
+  grows. A row's index is its chronological ping index forever, which
+  is what makes row → pose lookups (:meth:`row_meta`) trivial.
+* Each render pass re-colormaps **dirty tiles only** and emits them
+  individually (:attr:`tile_updated`); the view keeps one pixmap item
+  per tile, positioned at its absolute row. Scene y == ping index.
+* Memory is bounded by ``mosaic.waterfall_max_rows``. Past the cap the
+  **oldest whole tile** is dropped and ``_row0`` advances, so later
+  indices stay valid. Replay calls :meth:`reserve` with the mission's
+  ping count so an entire file is scrollable.
+
+Display normalization
+---------------------
+The device stream is pre-TVG (60–70 dB of range falloff across a ping on
+the field logs), so a single linear dB->grey window over the raw values
+cannot show near and far seabed at once. By default (``mosaic.
+nadir_contrast``) every tile is rendered through the window's ONE
+``DisplayModel`` (``core/display_model``): two-way transmission loss
+removed, the empirical seabed curve in normalised slant range divided
+out, then a power-law transfer with no low handle — the same model the
+AI pictures and the mosaic use, so all three read alike and every export
+inverts back to dB. The buffered dB is never modified; the model is
+recorded on export. With ``nadir_contrast`` off the plain raw-value
+histogram window applies and no normalisation is done.
 """
 
 from __future__ import annotations
 
-from typing import Optional
+import math
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -34,78 +72,424 @@ from PySide6.QtGui import QImage
 
 from ..config.settings import AppConfig
 from ..mapping.renderer import DisplaySettings, MosaicRenderer
-from ..models.sonar import SonarPing
+from ..models.sonar import SonarPing, build_slant_row, native_bins
+from .along_track import AlongTrackEstimator
+from .display_model import DisplayModel, DisplayModelSnapshot
+from .svlog import TRANSDUCER_Y_OFFSET_PORT_M, TRANSDUCER_Y_OFFSET_STBD_M
+
+#: Rows per tile. 512 × ~1200 float32 ≈ 2.5 MB data + 20 KB meta; small
+#: enough that re-colormapping the dirty tail tile at 4 Hz is trivial.
+_TILE_ROWS = 512
+
+#: Fixed histogram span for the plain raw-value fallback window [dB]
+#: (nadir_contrast off). Sonar intensities (scale_to_db output, simulator,
+#: field corpus) all live well inside it; out-of-range samples clamp to
+#: the edge bins.
+_HIST_LO, _HIST_HI, _HIST_BINS = -140.0, 100.0, 960
+
+#: Re-render every tile when the auto window moved more than this
+#: fraction of its own span since the last full pass.
+_LIMITS_REFRESH_FRACTION = 0.03
+
+#: Cap on blank rows inserted per detected ping-counter gap: loss stays
+#: visible without a large gap scrolling the image away.
+_MAX_GAP_ROWS = 5
+
+#: PNG quick-look decimation threshold (export_into).
+_PNG_MAX_ROWS = 20_000
+
+#: Per-row metadata columns: t, x, y, yaw, water_depth, bottom_slant_m,
+#: gain_port_db, gain_stbd_db (receive-gain offsets the display model
+#: removes, core/display_model.gain_offset_db), x_offset_m (the ping's
+#: fore/aft arm, SonarPing.x_offset_m: a click places the row from the
+#: transducers' point). In memory only; waterfall_raw.npz is unchanged.
+_META_COLS = 9
 
 
 class WaterfallService(QObject):
-    """Ring buffer of the most recent pings, rendered on a throttle."""
+    """Growable tiled buffer of all pings, rendered on a throttle."""
 
-    #: QImage (row 0 = oldest ping, last row = newest), current range [m]
-    image_updated = Signal(QImage, float)
-    #: Detection overlay in buffer pixel coordinates:
-    #: list of {"row": int, "col": int, "label": str} for the emitted image.
+    #: Buffer geometry: (row0, total_rows, columns, half-extent [m],
+    #: along-track metres per row). Rows [row0, total_rows) exist; row0 > 0
+    #: means the oldest rows were evicted by the memory cap. total_rows ==
+    #: row0 == 0 after clear() — the view drops everything. The last value
+    #: (ground speed × ping period from the shared along-track estimator,
+    #: core/along_track.py) lets the view draw true scale; 0 until two
+    #: placed rows exist.
+    layout_changed = Signal(int, int, int, float, float)
+    #: One re-rendered tile: (absolute first row, QImage of the tile).
+    tile_updated = Signal(int, QImage)
+    #: Detection overlay in ABSOLUTE buffer coordinates:
+    #: list of {"row": int, "col": int, "label": str}.
     detections_updated = Signal(object)
 
-    def __init__(self, config: AppConfig) -> None:
+    #: Stale (window-moved) tiles re-rendered per pass, newest first: the
+    #: rest follow on later passes, so a window move never freezes the
+    #: GUI for a full-buffer re-colormap (586 ms at 15 k rows, seconds at
+    #: the cap).
+    _STALE_PER_PASS = 2
+    #: Past this many buffered rows the auto window is frozen unless it
+    #: moves by _LIMITS_REFRESH_FRACTION_LATE: the EGN statistics have
+    #: converged and every later move would only re-render the world.
+    _LIMITS_FREEZE_ROWS = 2000
+    _LIMITS_REFRESH_FRACTION_LATE = 0.15
+    _DISPLAY_DEBOUNCE_MS = 120
+
+    def __init__(self, config: AppConfig,
+                 model: Optional[DisplayModel] = None) -> None:
         super().__init__()
-        self._rows = int(config.mosaic.waterfall_rows)
-        self._cols = int(config.mosaic.waterfall_columns)
-        self._buf = np.full((self._rows, self._cols), np.nan,
-                            dtype=np.float32)
-        # Per-row ping metadata (t, x, y, yaw, half-range) — needed to
-        # place world-frame detections on their exact ping line.
-        self._meta = np.full((self._rows, 5), np.nan, dtype=np.float64)
-        self._detections: list = []       # dicts: t_s, x, y, label
-        self._head = 0                  # next row to write
-        self._filled = 0                # rows written so far (<= _rows)
-        self._range_m = 0.0             # current per-side swath [m]
+        self._max_rows = int(config.mosaic.waterfall_max_rows)
+        self._max_samples = int(getattr(config.mosaic, "waterfall_max_samples", 0))
+        self._capacity = self._max_rows
+        self._reserved = 0
+        self._stale_tiles: set = set()  # window moved: re-render lazily
+        self._throttled = False
+        self._pending_settings = None
+        # Layout: slant-bin pitch [m/column] and columns per side. Both
+        # adapt to the data (0 until the first ping arrives).
+        self._pitch = 0.0
+        self._half = 0
+        # Tiles: parallel lists of (data, meta) arrays. meta columns are
+        # (t, x, y, yaw, water_depth, bottom_slant_m, gain_port_db,
+        # gain_stbd_db) — the first five feed the detections overlay and
+        # the waterfall-click → world lookup; bottom_slant_m and the two
+        # receive-gain offsets are what the display model needs per row,
+        # so a remap or a re-render never re-estimates them.
+        self._tiles: List[np.ndarray] = []
+        self._metas: List[np.ndarray] = []
+        self._row0 = 0                  # absolute index of the oldest row
+        self._total = 0                 # absolute index one past the newest
+        self._dirty_tiles: set = set()  # tile list indices needing render
+        self._detections: list = []     # dicts: t_s, x, y, label
+        # The overlay (detections in buffer coordinates) is re-sent only
+        # when it can have changed: a detection added/cleared, the view
+        # enabled, a layout change, or an eviction moving row0 — not on
+        # every render pass (one repaint of the overlay per pass at 20 Hz
+        # was pure load, project_review.md §3.4).
+        self._overlay_dirty = True
+        self._overlay_key: Optional[tuple] = None   # (columns, pitch, row0)
         self._dirty = False
+        self._layout_dirty = False
         self._enabled = False           # render only while the view is shown
         self._renderer = MosaicRenderer(
             percentiles=tuple(config.mosaic.contrast_percentiles))
+        # Seeded from the same config value the Contrast slider shows, so
+        # a tile rendered before the panel's first emission is already on
+        # the mission transfer (the window re-emits the slider too).
+        self._renderer.settings = DisplaySettings(
+            gamma=float(getattr(config.display, "gamma", 1.0)))
+        self._pcts = tuple(config.mosaic.contrast_percentiles)
+        # Plain raw-value histogram: the fallback window when the
+        # nadir-aware seabed EGN is disabled (nadir_contrast off).
+        self._hist = np.zeros(_HIST_BINS, dtype=np.int64)
+        self._hist_edges = np.linspace(_HIST_LO, _HIST_HI, _HIST_BINS + 1)
+        # The window's ONE display model (core/display_model.py): injected
+        # by the window so the waterfall, the AI imager and the mosaic map
+        # dB to grey identically; owned here only when nothing is injected
+        # (bench / tests). It lives in physical units (slant range, the
+        # row's altitude), so a layout remap never touches it.
+        self._model = model if model is not None else DisplayModel(config)
+        self._owns_model = model is None
+        self._nadir_contrast = bool(config.mosaic.nadir_contrast)
+        self._rendered_version: Optional[Tuple[int, bool]] = None
+        # Unit-domain renderer for the model path: the model applies the
+        # transfer (gamma), the renderer only colours [0, 1] + brightness.
+        self._unit_renderer = MosaicRenderer()
+        self._unit_renderer.settings = DisplaySettings(gamma=1.0)
+        self._last_limits: Optional[Tuple[float, float]] = None
+        # Along-track metres per row (true-scale view): the one estimator
+        # the seabed imager shares (ground speed × ping period from the
+        # ping poses, core/along_track.py).
+        self._along = AlongTrackEstimator.from_config(config)
 
         self._timer = QTimer(self)
         self._timer.setInterval(int(1000.0 / config.mosaic.render_hz))
         self._timer.timeout.connect(self._render_if_dirty)
         self._timer.start()
+        self._display_timer = QTimer(self)
+        self._display_timer.setSingleShot(True)
+        self._display_timer.setInterval(self._DISPLAY_DEBOUNCE_MS)
+        self._display_timer.timeout.connect(self._apply_pending_display)
+
+    def throttle(self, on: bool) -> None:
+        """Skip renders while the GUI thread is behind the ping stream;
+        rows still enter the buffer (never dropped)."""
+        self._throttled = bool(on)
+
+    def _recompute_capacity(self) -> None:
+        """Row cap = min(row cap, sample cap / columns), never below a
+        replay reservation."""
+        cap = self._max_rows
+        if self._max_samples > 0 and self.columns > 0:
+            cap = min(cap, max(self._max_samples // self.columns, 2 * _TILE_ROWS))
+        self._capacity = max(cap, self._reserved)
+
+    # ---- geometry helpers ------------------------------------------------------
+    @property
+    def total_rows(self) -> int:
+        return self._total
+
+    @property
+    def first_row(self) -> int:
+        return self._row0
+
+    @property
+    def columns(self) -> int:
+        """Current buffer width (0 before the first ping)."""
+        return 2 * self._half
+
+    @property
+    def pitch_m(self) -> float:
+        """Slant metres per column (0 before the first ping)."""
+        return self._pitch
+
+    @property
+    def half_extent_m(self) -> float:
+        return self._half * self._pitch
+
+    @property
+    def model(self) -> DisplayModel:
+        """The display model this service renders through."""
+        return self._model
+
+    @property
+    def row_pitch_m(self) -> float:
+        """Along-track metres per row (0 until two placed rows exist):
+        ground speed × ping period from the shared estimator."""
+        return float(self._along.row_pitch_m)
+
+    @property
+    def along_track(self) -> AlongTrackEstimator:
+        """The estimator behind ``row_pitch_m`` (speed, period, cumulative)."""
+        return self._along
+
+    def reserve(self, rows: int) -> int:
+        """Raise the row capacity (never lowers it); returns the cap.
+
+        The replay window calls this with the mission's ping count so a
+        whole file stays scrollable instead of losing its head to the
+        live-mode memory cap.
+        """
+        self._reserved = max(self._reserved, int(rows))
+        self._capacity = max(self._capacity, self._reserved)
+        return self._capacity
+
+    def _tail_slot(self) -> Tuple[np.ndarray, np.ndarray, int]:
+        """(data tile, meta tile, offset) for the next row to write."""
+        idx = self._total - self._row0
+        tile_i, off = divmod(idx, _TILE_ROWS)
+        if tile_i == len(self._tiles):
+            self._tiles.append(np.full((_TILE_ROWS, self.columns), np.nan,
+                                       dtype=np.float32))
+            self._metas.append(np.full((_TILE_ROWS, _META_COLS), np.nan,
+                                       dtype=np.float64))
+        return self._tiles[tile_i], self._metas[tile_i], off
+
+    def _advance(self) -> None:
+        self._total += 1
+        self._dirty_tiles.add((self._total - 1 - self._row0) // _TILE_ROWS)
+        self._dirty = True
+        self._layout_dirty = True
+        # Memory cap: drop the oldest whole tile. Absolute indices keep
+        # their meaning — row_meta() for evicted rows returns None.
+        if self._total - self._row0 > self._capacity and len(self._tiles) > 1:
+            self._tiles.pop(0)
+            self._metas.pop(0)
+            self._row0 += _TILE_ROWS
+            self._overlay_dirty = True
+            self._dirty_tiles = {i - 1 for i in self._dirty_tiles if i > 0}
+            self._stale_tiles = {i - 1 for i in self._stale_tiles if i > 0}
+
+    # ---- adaptive layout -------------------------------------------------------
+    def _ensure_layout(self, bin_size_m: float, extent_bins: int) -> None:
+        """Adopt / widen the (pitch, half-columns) layout for a new row.
+
+        The buffer always spans the **largest range seen** at the
+        **finest bin pitch seen** (the user-facing rule: a recording
+        holding two range settings gets a picture sized to the bigger
+        one). Both changes remap the existing tiles by pure pixel
+        stretch — verbatim values, no interpolation.
+        """
+        if bin_size_m <= 0 or extent_bins <= 0:
+            return
+        extent_m = bin_size_m * extent_bins
+        if self._pitch == 0.0:
+            self._pitch = bin_size_m
+            self._half = extent_bins
+            # Rows buffered before the first ping (pre-layout break_row
+            # seams) were zero-width; give them the adopted width.
+            for i, tile in enumerate(self._tiles):
+                if tile.shape[1] != self.columns:
+                    self._tiles[i] = np.full((tile.shape[0], self.columns),
+                                             np.nan, dtype=np.float32)
+            self._reset_stats()
+            self._recompute_capacity()
+            return
+        new_pitch = self._pitch
+        if bin_size_m < self._pitch * (1.0 - 1e-6):
+            new_pitch = bin_size_m
+        new_half = max(self._half if new_pitch == self._pitch else 0,
+                       int(math.ceil(max(extent_m, self.half_extent_m)
+                                     / new_pitch - 1e-9)))
+        if new_pitch == self._pitch and new_half == self._half:
+            return
+        self._remap(new_pitch, new_half)
+
+    def _remap(self, new_pitch: float, new_half: int) -> None:
+        """Re-lay existing tiles onto a new (pitch, half) grid."""
+        old_pitch, old_half = self._pitch, self._half
+        w_new = 2 * new_half
+        # For each new column, the old column whose slant interval covers
+        # it (or -1 = outside the old buffer → NaN).
+        k_new = np.arange(new_half, dtype=np.float64)
+        k_old = np.floor((k_new + 0.5) * new_pitch / old_pitch).astype(np.int64)
+        valid = k_old < old_half
+        port_src = np.where(valid, old_half - 1 - k_old, 0)
+        stbd_src = np.where(valid, old_half + k_old, 0)
+        for i, tile in enumerate(self._tiles):
+            out = np.full((tile.shape[0], w_new), np.nan, dtype=np.float32)
+            port = tile[:, port_src]
+            port[:, ~valid] = np.nan
+            stbd = tile[:, stbd_src]
+            stbd[:, ~valid] = np.nan
+            out[:, :new_half] = port[:, ::-1]
+            out[:, new_half:] = stbd
+            self._tiles[i] = out
+        self._pitch, self._half = new_pitch, new_half
+        self._reset_stats(rebuild=True)
+        self._recompute_capacity()
+        self._dirty_tiles.update(range(len(self._tiles)))
+        self._dirty = self._layout_dirty = True
+
+    def _reset_stats(self, rebuild: bool = False) -> None:
+        """Reset (and optionally rebuild from the tiles) the raw-value
+        histogram of the legacy window. The display model is NOT touched:
+        it lives in physical units, so a remap leaves it valid."""
+        self._hist.fill(0)
+        self._last_limits = None
+        if not rebuild:
+            return
+        for tile in self._tiles:
+            finite = np.isfinite(tile)
+            if finite.any():
+                self._hist += np.histogram(tile[finite], bins=self._hist_edges)[0]
 
     # ---- ingestion -------------------------------------------------------------
     def on_sonar_ping(self, ping: SonarPing) -> None:
-        y = ping.y_local
-        if y.size < 2:
+        nb = native_bins(ping)
+        if nb is None or nb.extent_bins == 0:
             return
-        r = float(np.abs(y).max())
-        if r <= 0.0:
+        # Genuine acquisition loss (device counter jumped): blank lines.
+        for _ in range(min(int(ping.gap_before), _MAX_GAP_ROWS)):
+            self.break_row()
+        self._ensure_layout(nb.bin_size_m, nb.extent_bins)
+        if self._half == 0:
             return
-        self._range_m = r
-        # Across-track column: port (+y) on the LEFT, starboard on the right.
-        col = np.clip(((r - y) / (2.0 * r) * (self._cols - 1)).astype(np.int32),
-                      0, self._cols - 1)
-        row = np.full(self._cols, np.nan, dtype=np.float32)
-        row[col] = ping.intensity_db          # duplicates: last sample wins
-        self._buf[self._head] = row
-        self._meta[self._head] = (ping.t, ping.robot_x, ping.robot_y,
-                                  ping.yaw, r)
-        self._head = (self._head + 1) % self._rows
-        self._filled = min(self._filled + 1, self._rows)
-        self._dirty = True
+        row = build_slant_row(nb, self._pitch, self._half)
+        buf, meta, off = self._tail_slot()
+        buf[off] = row
+        # The row's altitude for the display model: the tracked bottom,
+        # else the processor's own correction altitude (its tracker).
+        h = float(ping.bottom_slant_m)
+        if h <= 0.0:
+            h = max(float(ping.water_depth), 0.0)
+        gains = self._model.gain_offsets(ping)
+        arm = float(getattr(ping, "x_offset_m", 0.0))
+        meta[off] = (ping.t, ping.robot_x, ping.robot_y, ping.yaw,
+                     max(float(ping.water_depth), 0.0), h, gains[0], gains[1],
+                     arm if math.isfinite(arm) else 0.0)
+        self._along.observe(float(ping.t), float(ping.robot_x),
+                            float(ping.robot_y))
+        finite = np.isfinite(row)
+        if finite.any():
+            self._hist += np.histogram(row[finite], bins=self._hist_edges)[0]
+            self._model.observe_row(row, self._pitch, h, gains)
+        self._advance()
+
+    def break_row(self) -> None:
+        """Insert one blank row, so the rows either side are not neighbours.
+
+        The waterfall's vertical axis is ping index, not time, so nothing in it
+        can express a pause on its own: pings minutes apart would stack as
+        adjacent rows and read as continuous seabed. A ``.svlog`` holding two
+        recording sessions is exactly that case — Cerulean's harbour demo has a
+        397.8 s gap — and the replay window calls this on the ``MissionGap``
+        event; live mode inserts one per ping the device counter says was
+        lost. An all-NaN row renders as background, i.e. a visible seam.
+        A pre-layout break (no ping seen yet) still counts a row: the
+        zero-width tiles are re-sized when the first ping fixes the
+        layout.
+        """
+        buf, meta, off = self._tail_slot()
+        buf[off].fill(np.nan)
+        meta[off].fill(np.nan)
+        self._along.mark_break()             # no chord across a seam
+        self._advance()
+
+    # ---- row → pose ------------------------------------------------------------
+    def row_meta(self, row: int) -> Optional[Tuple[float, float, float,
+                                                   float, float]]:
+        """(t, robot_x, robot_y, yaw, water_depth) of an absolute row, or
+        None for a gap row, an evicted row, or an out-of-range index."""
+        if not (self._row0 <= row < self._total):
+            return None
+        idx = row - self._row0
+        m = self._metas[idx // _TILE_ROWS][idx % _TILE_ROWS]
+        if not np.all(np.isfinite(m[:5])):
+            return None
+        return tuple(float(v) for v in m[:5])
+
+    def row_georef(self, row: int) -> Optional[Tuple[float, float, float, float]]:
+        """(robot_x, robot_y, yaw, bottom) of an absolute row for the
+        pixel->world of the seabed pictures' georef convention (``bottom``
+        = the row's tracked bottom ``h``, used with the lateral transducer
+        lever arm; the fore/aft arm is :meth:`row_lever_x`), or None where
+        :meth:`row_meta` is None. The pose is the navigation pose."""
+        if self.row_meta(row) is None:
+            return None
+        idx = row - self._row0
+        m = self._metas[idx // _TILE_ROWS][idx % _TILE_ROWS]
+        return float(m[1]), float(m[2]), float(m[3]), float(m[5])
+
+    def row_lever_x(self, row: int) -> float:
+        """The fore/aft arm [m, + forward] of an absolute row's ping
+        (``SonarPing.x_offset_m``), for the pixel->world of a click: the
+        ``lever_x`` of ``waterfall_pixel_to_world`` next to
+        :meth:`row_georef`. 0.0 where the row has none (a gap row, an
+        evicted row, a ping without an arm)."""
+        if self.row_meta(row) is None:
+            return 0.0
+        idx = row - self._row0
+        v = float(self._metas[idx // _TILE_ROWS][idx % _TILE_ROWS][8])
+        return v if math.isfinite(v) else 0.0
 
     # ---- display -----------------------------------------------------------------
     def set_enabled(self, enabled: bool) -> None:
         """Called when the view mode switches; renders eagerly on entry."""
         self._enabled = enabled
         if enabled:
+            self._mark_all_dirty()
+            self._overlay_dirty = True
             self._force_render()
 
     def clear(self) -> None:
         """'Clear SSS data': drop the buffered pings; keep streaming."""
-        self._buf.fill(np.nan)
-        self._meta.fill(np.nan)
+        self._tiles.clear()
+        self._metas.clear()
         self._detections.clear()
-        self._head = 0
-        self._filled = 0
+        self._row0 = 0
+        self._total = 0
+        self._pitch = 0.0
+        self._half = 0
+        self._dirty_tiles.clear()
+        self._stale_tiles.clear()
+        self._reset_stats()
+        if self._owns_model:
+            self._model.reset()
+        self._along.reset()
         self._dirty = False
-        self.image_updated.emit(QImage(), self._range_m)  # null -> view clears
+        self._layout_dirty = False
+        self.layout_changed.emit(0, 0, 0, 0.0, 0.0)
         self.detections_updated.emit([])
 
     # ---- detections -------------------------------------------------------------
@@ -116,99 +500,343 @@ class WaterfallService(QObject):
         ``t_s`` should be the ping time of the row the object was seen on
         (SeabedImager stamps each detection with its pixel row's time).
         """
-        self._detections.append({"t_s": float(t_s), "x": float(x),
-                                 "y": float(y), "label": label})
+        det = {"t_s": float(t_s), "x": float(x), "y": float(y),
+               "label": label, "row": self._row_for_time(float(t_s))}
+        self._detections.append(det)
         if len(self._detections) > 500:
             self._detections.pop(0)
+        # The timer's next pass draws it: no synchronous full render per
+        # detection (one image = one detection = one 20-45 ms render).
+        self._overlay_dirty = True
         self._dirty = True
-        if self._enabled:
-            self._force_render()
+
+    def _row_for_time(self, t_s: float) -> Optional[int]:
+        """Absolute row of the ping nearest ``t_s``, resolved ONCE at
+        registration (the mapping never changes afterwards; scanning the
+        whole buffer per detection per render pass was O(dets x rows))."""
+        if self._total == self._row0:
+            return None
+        meta = self._meta_chrono()
+        times = meta[:, 0]
+        finite = np.isfinite(times)
+        if not finite.any():
+            return None
+        lo, hi = times[finite][0], times[finite][-1]
+        if not (lo <= t_s <= hi):
+            return None
+        return self._row0 + int(np.nanargmin(np.abs(times - t_s)))
 
     def clear_detections(self) -> None:
         self._detections.clear()
+        self._overlay_dirty = False
         self.detections_updated.emit([])
         if self._enabled:
             self._force_render()
 
-    def _overlay(self, meta_chrono: np.ndarray) -> list:
-        """Map world detections to (row, col) of the chrono buffer.
+    def _overlay(self) -> list:
+        """Map world detections to ABSOLUTE (row, col) buffer coordinates.
 
         Row: the ping whose time matches the detection's row time.
-        Column: exact inversion of the pixel->world formula —
-            y_local = (yw - y_r)·cos(yaw) − (xw − x_r)·sin(yaw)
-            col     = (r − y_local) / (2 r) · (W − 1)
-        Detections outside the buffered time span or the row's swath are
-        skipped (they scrolled out or lie off-swath at that instant).
+        Column: invert the slant layout under georef convention 2 (the
+        seabed pictures' and the clicks') — ``y_local`` from the row
+        pose, ``ground = |y_local| − lever_side`` (clamped at 0),
+        ``s = hypot(ground, h)`` with ``h`` the row's tracked bottom,
+        ``k = s / pitch``. Detections outside the buffered time span or
+        the row's swath are skipped (they were evicted or lie off-swath
+        at that instant).
         """
         out = []
-        if meta_chrono.shape[0] == 0 or not self._detections:
+        if self._total == self._row0 or not self._detections or self._half == 0:
             return out
-        times = meta_chrono[:, 0]
         for det in self._detections:
-            if not (times[0] <= det["t_s"] <= times[-1]):
-                continue
-            i = int(np.searchsorted(times, det["t_s"]))
-            i = min(max(i, 0), meta_chrono.shape[0] - 1)
-            _t, rx, ry, yaw, r = meta_chrono[i]
-            if not np.isfinite(r) or r <= 0:
+            row = det.get("row")
+            if row is None:
+                row = det["row"] = self._row_for_time(det["t_s"])
+                if row is None:
+                    continue
+            if not (self._row0 <= row < self._total):
+                continue                    # evicted by the memory cap
+            i = row - self._row0
+            tile, off = divmod(i, _TILE_ROWS)
+            _t, rx, ry, yaw, depth, h = self._metas[tile][off, :6]
+            if not (np.isfinite(depth) and np.isfinite(h)):
                 continue
             y_local = ((det["y"] - ry) * np.cos(yaw)
                        - (det["x"] - rx) * np.sin(yaw))
-            if abs(y_local) > r * 1.02:
+            lever = (TRANSDUCER_Y_OFFSET_PORT_M if y_local >= 0
+                     else TRANSDUCER_Y_OFFSET_STBD_M)
+            s = math.hypot(max(abs(y_local) - lever, 0.0), max(h, 0.0))
+            k = int(s / self._pitch)
+            if k >= self._half:
                 continue
-            col = int(round((r - y_local) / (2 * r) * (self._cols - 1)))
-            out.append({"row": i, "col": min(max(col, 0), self._cols - 1),
+            col = (self._half - 1 - k) if y_local >= 0 else (self._half + k)
+            out.append({"row": self._row0 + i,
+                        "col": col,
                         "label": det["label"]})
         return out
 
     # ---- persistence -----------------------------------------------------------
     def chronological(self) -> Optional[np.ndarray]:
-        """Raw buffer rows, oldest first (None if empty)."""
-        if self._filled == 0:
+        """All buffered rows, oldest first (None if empty)."""
+        if self._total == self._row0:
             return None
-        if self._filled < self._rows:
-            return self._buf[:self._filled].copy()
-        return np.roll(self._buf, -self._head, axis=0)
+        n = self._total - self._row0
+        return np.concatenate(self._tiles, axis=0)[:n].copy()
+
+    def _meta_chrono(self) -> np.ndarray:
+        n = self._total - self._row0
+        return np.concatenate(self._metas, axis=0)[:n]
+
+    def export_snapshot(self) -> Optional["WaterfallExport"]:
+        """An immutable copy of everything ``export_into`` writes, taken
+        on the GUI thread so the files can be written on a pool thread
+        while pings keep arriving (Record OFF no longer freezes the app
+        for the seconds the compressed npz takes — project_review.md
+        §3.4). None when the buffer is empty."""
+        chrono = self.chronological()           # already a copy
+        if chrono is None:
+            return None
+        meta = self._meta_chrono().copy()
+        active = self._model_active()
+        return WaterfallExport(
+            chrono=chrono, meta=meta, pitch_m=self._pitch,
+            half_extent_m=self.half_extent_m, columns=self.columns,
+            model=self._model.snapshot(), model_active=active,
+            unit_settings=self._unit_renderer.settings,
+            raw_settings=self._renderer.settings, percentiles=self._pcts,
+            raw_limits=None if active else self._global_limits())
 
     def export_into(self, target) -> bool:
         """Write waterfall.png (display pipeline) + waterfall_raw.npz
-        (untouched buffer, for AI dataset generation) into ``target``."""
-        chrono = self.chronological()
-        if chrono is None:
+        (the untouched native-bin buffer — an archival raw record; the
+        AI feed is the seabed **pictures**) into ``target``, synchronously
+        (the offline rebuild path; the live session hands the same
+        snapshot to a pool thread instead)."""
+        snap = self.export_snapshot()
+        if snap is None:
             return False
-        from pathlib import Path
-        import cv2
-        target = Path(target)
-        target.mkdir(parents=True, exist_ok=True)
-        rgba = self._renderer.to_rgba(chrono)
-        cv2.imwrite(str(target / "waterfall.png"),
-                    cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
-        np.savez_compressed(target / "waterfall_raw.npz",
-                            intensity_db=chrono,
-                            swath_half_range_m=self._range_m,
-                            columns=self._cols)
+        snap.write(target)
         return True
 
     def set_display(self, settings: DisplaySettings) -> None:
-        self._renderer.settings = settings
+        """Debounced: a slider drag fires one re-render, not one per
+        tick; the re-render itself is incremental (stale tiles)."""
+        self._pending_settings = settings
+        self._display_timer.start()
+
+    def _apply_pending_display(self) -> None:
+        if self._pending_settings is None:
+            return
+        self._renderer.settings = self._pending_settings
+        # Model path: gamma is the model's transfer exponent (render_unit),
+        # the renderer keeps colour map + brightness on the unit values.
+        self._unit_renderer.settings = self._pending_settings.with_(
+            gamma=1.0, auto_range=False, vmin_db=0.0, vmax_db=1.0)
+        self._pending_settings = None
+        self._last_limits = None
+        self._stale_tiles.update(range(len(self._tiles)))
+        self._dirty = self._layout_dirty = bool(self._tiles)
         if self._enabled:
             self._force_render()
 
+    def request_rows(self, first_row: int, last_row: int) -> None:
+        """The view scrolled onto rows whose pixmaps it dropped: render
+        those tiles again on the next pass."""
+        lo = max(first_row, self._row0)
+        hi = min(last_row, self._total - 1)
+        if hi < lo:
+            return
+        for tile_i in range((lo - self._row0) // _TILE_ROWS,
+                            (hi - self._row0) // _TILE_ROWS + 1):
+            if 0 <= tile_i < len(self._tiles):
+                self._dirty_tiles.add(tile_i)
+        self._dirty = True
+
+    # ---- rendering -------------------------------------------------------------
+    def _mark_all_dirty(self) -> None:
+        self._dirty_tiles.update(range(len(self._tiles)))
+        self._dirty = self._layout_dirty = bool(self._tiles)
+
+    def _model_active(self) -> bool:
+        """Render through the display model (default) — once it has seen
+        enough seabed to say anything; the raw window covers the first
+        rows of a live mission."""
+        return self._nadir_contrast and self._model.ready and self.columns > 0
+
+    def render_unit(self, rows: np.ndarray, h_rows: np.ndarray,
+                    gamma: Optional[float] = None,
+                    gain_rows: Optional[np.ndarray] = None) -> np.ndarray:
+        """Unit brightness of built rows through the model (NaN kept)."""
+        return self._model.render_unit(rows, self._pitch, h_rows, gamma,
+                                       gain_rows)
+
+    def _tile_image(self, tile_i: int, limits) -> QImage:
+        tile = self._tiles[tile_i]
+        if self._model_active():
+            meta = self._metas[tile_i]
+            unit = self._model.render_unit(tile, self._pitch, meta[:, 5],
+                                           self._renderer.settings.gamma,
+                                           gain_rows=meta[:, 6:8])
+            return self._unit_renderer.to_qimage(unit, flip=False,
+                                                 limits=(0.0, 1.0))
+        return self._renderer.to_qimage(tile, flip=False, limits=limits)
+
+    def _global_limits(self) -> Optional[Tuple[float, float]]:
+        """One contrast window for every tile (auto mode only — the manual
+        window comes from DisplaySettings).
+
+        Model path: the tiles are rendered in unit brightness, so the
+        window is the constant (0, 1) and a change of the model itself
+        (its ``version``) is what marks every tile stale. Legacy path
+        (nadir_contrast off, or the model not ready yet): the plain global
+        raw-value histogram at the configured percentiles.
+        """
+        if not self._renderer.settings.auto_range:
+            return None
+        if self._model_active():
+            return 0.0, 1.0
+        total = int(self._hist.sum())
+        if total == 0:
+            return None
+        cum = np.cumsum(self._hist) / total * 100.0
+        lo_i = int(np.searchsorted(cum, self._pcts[0]))
+        hi_i = int(np.searchsorted(cum, self._pcts[1]))
+        centers = (self._hist_edges[:-1] + self._hist_edges[1:]) / 2.0
+        lo = float(centers[min(lo_i, centers.size - 1)])
+        hi = float(centers[min(hi_i, centers.size - 1)])
+        if hi - lo < 1e-6:
+            hi = lo + 1e-6
+        return lo, hi
+
     def _render_if_dirty(self) -> None:
-        if self._enabled and self._dirty:
+        if self._throttled:
+            return
+        if self._enabled and (self._dirty or self._stale_tiles):
             self._force_render()
 
     def _force_render(self) -> None:
         self._dirty = False
-        if self._filled == 0:
+        if self._total == self._row0:
             return
-        # Chronological order, oldest first; newest ping = last row.
-        if self._filled < self._rows:
-            chrono = self._buf[:self._filled]
-            meta_chrono = self._meta[:self._filled]
+        limits = self._global_limits()
+        # The model changed (froze / re-fit) or just became usable: every
+        # tile was rendered with a different mapping and is stale.
+        key = (self._model.version, self._model_active())
+        if key != self._rendered_version:
+            if self._rendered_version is not None:
+                self._stale_tiles.update(range(len(self._tiles)))
+            self._rendered_version = key
+        if limits is not None:
+            last = self._last_limits
+            span = limits[1] - limits[0]
+            frac = (_LIMITS_REFRESH_FRACTION
+                    if self._total - self._row0 < self._LIMITS_FREEZE_ROWS
+                    else self._LIMITS_REFRESH_FRACTION_LATE)
+            if (last is None
+                    or abs(limits[0] - last[0]) > frac * span
+                    or abs(limits[1] - last[1]) > frac * span):
+                # The global window moved: every tile is stale -- but they
+                # are re-rendered a few per pass, newest first, never all
+                # at once (the full-buffer pass froze the GUI for seconds).
+                self._last_limits = limits
+                self._stale_tiles.update(range(len(self._tiles)))
+            else:
+                limits = last          # hold the window steady
+        if self._layout_dirty:
+            self._layout_dirty = False
+            # New rows alone do not move a detection's (row, col); a
+            # column/pitch remap or an eviction (row0) does.
+            key = (self.columns, self._pitch, self._row0)
+            if key != self._overlay_key:
+                self._overlay_key = key
+                self._overlay_dirty = True
+            self.layout_changed.emit(self._row0, self._total, self.columns,
+                                     self.half_extent_m, self.row_pitch_m)
+        todo = set(self._dirty_tiles)
+        self._stale_tiles -= todo
+        for tile_i in sorted(self._stale_tiles, reverse=True)[:self._STALE_PER_PASS]:
+            todo.add(tile_i)
+            self._stale_tiles.discard(tile_i)
+        for tile_i in sorted(todo):
+            if tile_i >= len(self._tiles):
+                continue
+            img = self._tile_image(tile_i, limits)
+            self.tile_updated.emit(self._row0 + tile_i * _TILE_ROWS, img)
+        self._dirty_tiles.clear()
+        if self._stale_tiles:
+            self._dirty = True          # keep the timer coming back
+        if self._overlay_dirty:
+            self._overlay_dirty = False
+            self.detections_updated.emit(self._overlay())
+
+
+@dataclass
+class WaterfallExport:
+    """Frozen export payload of a :class:`WaterfallService` (see
+    :meth:`WaterfallService.export_snapshot`); :meth:`write` is
+    thread-safe — it touches nothing but its own arrays.
+
+    The npz carries the full-fidelity float32 buffer in the native
+    slant-bin layout (``slant_pitch_m`` metres per column, transducer at
+    the centre seam). The PNG is a quick-look through the display
+    pipeline: above ``_PNG_MAX_ROWS`` rows it is vertically decimated
+    (every Nth ping) and the stride is recorded in the npz as
+    ``png_row_stride`` so nobody mistakes it for the data.
+    """
+
+    chrono: np.ndarray                  # (n, cols) raw dB, oldest first
+    meta: np.ndarray                    # (n, _META_COLS)
+    pitch_m: float
+    half_extent_m: float
+    columns: int
+    model: "DisplayModelSnapshot"
+    model_active: bool
+    unit_settings: DisplaySettings
+    raw_settings: DisplaySettings
+    percentiles: Tuple[float, float]
+    raw_limits: Optional[Tuple[float, float]]
+
+    def write(self, target) -> None:
+        from pathlib import Path
+        import cv2
+        target = Path(target)
+        target.mkdir(parents=True, exist_ok=True)
+        chrono, meta = self.chrono, self.meta
+        stride = max(1, int(np.ceil(chrono.shape[0] / _PNG_MAX_ROWS)))
+        # PNG is newest-on-top (SonarView convention, matching the live
+        # view): flip the decimated rows before colouring. The npz keeps
+        # the archival buffer oldest-first (row_order tag below).
+        rows = chrono[::stride]
+        if self.model_active:
+            # The mission model with ITS gamma (the dataset transfer), not
+            # the operator's slider: the quick-look matches the pictures.
+            e = self.model.normalise(rows, self.pitch_m, meta[::stride, 5],
+                                     meta[::stride, 6:8])
+            unit = self.model.to_unit(e)[::-1]
+            r = MosaicRenderer()
+            r.settings = self.unit_settings
+            rgba = r.to_rgba(unit, limits=(0.0, 1.0))
         else:
-            chrono = np.roll(self._buf, -self._head, axis=0)
-            meta_chrono = np.roll(self._meta, -self._head, axis=0)
-        img = self._renderer.to_qimage(chrono, flip=False)
-        self.image_updated.emit(img, self._range_m)
-        self.detections_updated.emit(self._overlay(meta_chrono))
+            r = MosaicRenderer(percentiles=self.percentiles)
+            r.settings = self.raw_settings
+            rgba = r.to_rgba(rows[::-1], limits=self.raw_limits)
+        cv2.imwrite(str(target / "waterfall.png"),
+                    cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+        # The display model (curves + window + TL parameters), each row's
+        # altitude and the receive-gain offset removed, so the PNG inverts
+        # back to the raw dB kept in intensity_db (see
+        # DisplayModelSnapshot.to_json()["mapping"]).
+        np.savez_compressed(target / "waterfall_raw.npz",
+                            intensity_db=chrono,
+                            layout="slant_bins_centered",
+                            row_order="oldest_first",
+                            png_row_order="newest_first",
+                            slant_pitch_m=self.pitch_m,
+                            swath_half_range_m=self.half_extent_m,
+                            columns=self.columns,
+                            png_row_stride=stride,
+                            row_altitude_m=meta[:, 5].astype(np.float32),
+                            row_gain_db=meta[:, 6:8].astype(np.float32),
+                            row_t_s=meta[:, 0].astype(np.float64),
+                            value_domain="raw_db",
+                            **self.model.npz_items())

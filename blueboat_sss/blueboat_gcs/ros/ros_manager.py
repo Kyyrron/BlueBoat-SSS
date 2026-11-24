@@ -18,6 +18,8 @@ from typing import Optional
 from ..config.settings import AppConfig
 from ..core.signals import AppSignals
 
+_PARAM_TIMEOUT_S = 5.0
+
 try:  # pragma: no cover - environment dependent
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
@@ -27,6 +29,16 @@ try:  # pragma: no cover - environment dependent
 except ImportError:  # pragma: no cover
     rclpy = None  # type: ignore[assignment]
     ROS_AVAILABLE = False
+
+
+#: /rosout logger names (and their dotted sub-loggers) shown in the console.
+SSS_LOGGERS = ("side_scan_sonar", "sss_processor")
+
+
+def is_sss_logger(name: str) -> bool:
+    """True for a /rosout logger that belongs to the SSS module."""
+    name = (name or "").lstrip("/")
+    return any(name == n or name.startswith(n + ".") for n in SSS_LOGGERS)
 
 
 class RosManager:
@@ -41,6 +53,14 @@ class RosManager:
         self._ping_pub = None
         self._svlog_pub = None
         self._analysis_pub = None
+        self._image_pubs = None             # (32FC1, mono8, metadata) for Perception
+        self._image_cls = None
+        # Set by main.py once the listeners exist; used by
+        # reset_stream_health() at every acquisition START and by
+        # reset_planned_path() when the operator clears the overlay.
+        self.sonar_listener = None
+        self.path_listener = None
+        self._param_client = None
 
     # ---- lifecycle -----------------------------------------------------------
     @property
@@ -67,7 +87,10 @@ class RosManager:
         # AI seabed analysis output (JSON payload; schema in HANDOVER).
         self._analysis_pub = self._node.create_publisher(
             String, self._config.topics.seabed_analysis, 10)
+        self._create_image_publishers()
         self._subscribe_rosout()
+        self._subscribe_clock()
+        self._subscribe_sim_run_info()
         self._executor = SingleThreadedExecutor()
         self._executor.add_node(self._node)
         self._thread = threading.Thread(
@@ -76,13 +99,89 @@ class RosManager:
         self._signals.ros_connected.emit(True)
         return True
 
-    def _subscribe_rosout(self) -> None:
-        """ROS 2 log messages from ALL nodes -> embedded console.
+    def _create_image_publishers(self) -> None:
+        """Every seabed image for BlueBoat-Perception (core/perception_bridge).
 
-        /rosout (rcl_interfaces/Log) carries every node's logger output,
-        including sss_processor_node's — so the operator sees ROS logs
-        without an external terminal. Our own node is filtered out to
-        avoid duplicating lines already captured by the logging bus.
+        RELIABLE / KEEP_LAST 32 / VOLATILE -- the profile Perception
+        subscribes with (CM-4: changed at both ends or not at all): a large
+        sample is fragmented, and BEST_EFFORT would lose a whole image to
+        one lost fragment. sensor_msgs is imported here, inside ros/ only
+        (NC #10)."""
+        try:
+            from rclpy.qos import (DurabilityPolicy, HistoryPolicy,
+                                   QoSProfile, ReliabilityPolicy)
+            from sensor_msgs.msg import Image
+        except ImportError:                # pragma: no cover - environment
+            self._signals.status_message.emit(
+                "sensor_msgs not found — seabed images are not published "
+                "for BlueBoat-Perception (no detections).")
+            return
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         history=HistoryPolicy.KEEP_LAST, depth=32,
+                         durability=DurabilityPolicy.VOLATILE)
+        t = self._config.topics
+        self._image_cls = Image
+        self._image_pubs = (
+            self._node.create_publisher(Image, t.seabed_image, qos),
+            self._node.create_publisher(Image, t.seabed_image_png, qos),
+            self._node.create_publisher(String, t.seabed_image_meta, qos))
+
+    def _subscribe_clock(self) -> None:
+        """``/clock`` -> ``core.stream_clock`` (2026-11-07).
+
+        Only a simulation graph has a ``/clock`` publisher (Gazebo, or a bag
+        replay's Gazebo); there every world-timing rule of the GCS --
+        attitude / compass freshness, telemetry staleness, the recording's
+        ``duration_s`` -- runs on sim seconds, so a simulation slowed below
+        real time (the ray-cast sonar) records what a real-speed one does.
+        A real-robot graph never feeds it: wall time, unchanged.
+        BEST_EFFORT matches the bridge's publisher whatever its reliability."""
+        try:
+            from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+            from rosgraph_msgs.msg import Clock
+        except ImportError:                        # pragma: no cover
+            return
+        from ..core.stream_clock import stream_clock
+        clock = stream_clock()
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST, depth=10)
+
+        def _on_clock(msg) -> None:
+            clock.feed(msg.clock.sec + msg.clock.nanosec * 1e-9)
+
+        self._clock_sub = self._node.create_subscription(Clock, "/clock", _on_clock, qos)
+
+    def _subscribe_sim_run_info(self) -> None:
+        """The simulated sonar's run record -> ``core.sim_run_info``
+        (2026-11-11), for a session's ``metadata.json["simulation"]``.
+
+        Only a simulation graph has this topic. The publisher is latched
+        (RELIABLE / TRANSIENT_LOCAL / 1), so the subscription is too (CM-4):
+        a GCS started after the sonar still receives the record."""
+        try:
+            from rclpy.qos import (DurabilityPolicy, HistoryPolicy,
+                                   QoSProfile, ReliabilityPolicy)
+        except ImportError:                        # pragma: no cover
+            return
+        from ..core import sim_run_info
+        node = self._node
+        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
+                         history=HistoryPolicy.KEEP_LAST, depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        sim_run_info.set_alive_probe(
+            lambda: node.count_publishers(sim_run_info.TOPIC) > 0)
+        self._sim_run_sub = node.create_subscription(
+            String, sim_run_info.TOPIC,
+            lambda msg: sim_run_info.feed(msg.data), qos)
+
+    def _subscribe_rosout(self) -> None:
+        """ROS 2 log messages of the SSS module -> embedded console.
+
+        /rosout (rcl_interfaces/Log) carries every node's logger output;
+        only the sonar driver (``side_scan_sonar``, real or simulated) and
+        ``sss_processor`` — with their sub-loggers — are forwarded. Control
+        and navigation nodes (master_control, robot_interface, mavros, …)
+        belong to the Mission Control Station, never to this console.
         """
         try:
             from rcl_interfaces.msg import Log
@@ -92,7 +191,7 @@ class RosManager:
                    40: "ERROR", 50: "FATAL"}
 
         def on_log(msg: "Log") -> None:
-            if msg.name == "blueboat_gcs":
+            if not is_sss_logger(msg.name):
                 return
             level = _LEVELS.get(int(msg.level), str(msg.level))
             self._signals.log_line.emit(
@@ -122,6 +221,24 @@ class RosManager:
         if self._ping_pub is not None:
             self._ping_pub.publish(Bool(data=enable))
 
+    @staticmethod
+    def _subscribers(pub) -> Optional[int]:
+        if pub is None:
+            return None
+        try:
+            return int(pub.get_subscription_count())
+        except Exception:                 # pragma: no cover - rclpy teardown
+            return None
+
+    def ping_enable_subscribers(self) -> Optional[int]:
+        """How many nodes subscribe to ping/enable (the sonar node is one),
+        or None when ROS is unavailable."""
+        return self._subscribers(self._ping_pub)
+
+    def svlog_enable_subscribers(self) -> Optional[int]:
+        """The same for log/enable (``sss_processor`` is the one)."""
+        return self._subscribers(self._svlog_pub)
+
     def publish_svlog_enable(self, enable: bool) -> None:
         if self._svlog_pub is not None:
             self._svlog_pub.publish(Bool(data=enable))
@@ -131,3 +248,98 @@ class RosManager:
         never the pixels) on topics.seabed_analysis."""
         if self._analysis_pub is not None:
             self._analysis_pub.publish(String(data=payload_json))
+
+    def publish_seabed_image(self, key: str, stamp, db, png8, meta_json: str) -> bool:
+        """Publish one seabed image's three parts (any thread: rclpy
+        publishers are thread-safe). ``stamp`` = (sec, nanosec)."""
+        if self._image_pubs is None:
+            return False
+        Image = self._image_cls
+        for arr, enc, size, pub in ((db, "32FC1", 4, self._image_pubs[0]),
+                                    (png8, "mono8", 1, self._image_pubs[1])):
+            m = Image()
+            m.header.stamp.sec, m.header.stamp.nanosec = int(stamp[0]), int(stamp[1])
+            m.header.frame_id = key
+            m.height, m.width = int(arr.shape[0]), int(arr.shape[1])
+            m.encoding = enc
+            m.is_bigendian = 0
+            m.step = int(arr.shape[1]) * size
+            m.data = arr.astype("<f4" if size == 4 else "u1", copy=False).tobytes()
+            pub.publish(m)
+        self._image_pubs[2].publish(String(data=meta_json))
+        return True
+
+    def reset_stream_health(self) -> None:
+        """New acquisition START: re-establish the per-power-up stream
+        expectations (sonar counter offset etc.)."""
+        if self.sonar_listener is not None:
+            self.sonar_listener.reset_pairing()
+
+    def reset_planned_path(self) -> None:
+        """The planned-path overlay was cleared: let the listener
+        forward path_publisher's next (verbatim) re-send again."""
+        if self.path_listener is not None:
+            self.path_listener.reset()
+
+    # ---- runtime sonar parameters ---------------------------------------------
+    def set_sonar_range(self, range_m: float) -> bool:
+        """Set ``range_length_mm`` on the sonar node via its
+        ``set_parameters`` service.
+
+        Asynchronous: the outcome arrives on
+        ``AppSignals.sonar_params_result(ok, detail)`` (plain types, so
+        nothing ROS crosses the bus — NC #10). Returns False when the
+        request could not even be sent (no node, service absent), in
+        which case the result signal has already been emitted."""
+        if self._node is None:
+            self._signals.sonar_params_result.emit(
+                False, "ROS is not connected.")
+            return False
+        from rcl_interfaces.msg import (Parameter, ParameterType,
+                                        ParameterValue)
+        from rcl_interfaces.srv import SetParameters
+        if self._param_client is None:
+            self._param_client = self._node.create_client(
+                SetParameters,
+                f"/{self._config.acquisition.param_node}/set_parameters")
+        if not self._param_client.service_is_ready():
+            self._signals.sonar_params_result.emit(
+                False,
+                f"/{self._config.acquisition.param_node}/set_parameters is "
+                "not available — is the sonar node running "
+                "(with_acquisition)?")
+            return False
+        req = SetParameters.Request()
+        req.parameters = [Parameter(
+            name="range_length_mm",
+            value=ParameterValue(type=ParameterType.PARAMETER_INTEGER,
+                                 integer_value=int(round(range_m * 1000))))]
+        future = self._param_client.call_async(req)
+        fired = threading.Event()
+
+        def done(fut) -> None:
+            if fired.is_set():
+                return
+            fired.set()
+            try:
+                res = fut.result()
+                ok = bool(res.results) and all(r.successful
+                                               for r in res.results)
+                detail = "; ".join(r.reason for r in res.results
+                                   if r.reason) or f"range {range_m:.0f} m"
+            except Exception as exc:      # noqa: BLE001 — surfaced, not raised
+                ok, detail = False, str(exc)
+            self._signals.sonar_params_result.emit(ok, detail)
+
+        future.add_done_callback(done)
+
+        def timeout() -> None:
+            if not fired.is_set():
+                fired.set()
+                future.cancel()
+                self._signals.sonar_params_result.emit(
+                    False,
+                    f"set_parameters timed out after {_PARAM_TIMEOUT_S:.0f} s")
+
+        threading.Timer(_PARAM_TIMEOUT_S, timeout).start()
+        return True

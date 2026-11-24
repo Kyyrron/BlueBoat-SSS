@@ -17,6 +17,8 @@ COLOR_DETECTION = QColor("#ffca28")
 COLOR_PINGER = QColor("#69f0ae")
 COLOR_MEASURE = QColor("#ff8a65")
 COLOR_PLANNED_PATH = QColor("#1a4fbf")   # dark blue, distinct from the cyan track
+COLOR_WARNING = QColor("#ffb74d")        # a state the operator must notice
+                                         # (an unavailable or mixed scale)
 
 STYLESHEET = """
 QMainWindow, QWidget { background-color: #14181d; color: #d7dde4;

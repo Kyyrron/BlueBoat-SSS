@@ -22,17 +22,21 @@ The byte 6/7 ordering follows the canonical `brping.pingmessage` parser,
 which declares `header_format = "BBHHBB"` with field order
 (start_1, start_2, payload_length, message_id, src_device_id, dst_device_id).
 
-Observed conventions in reference SonarView .svlog files:
+Observed conventions in reference SonarView .svlog files (re-measured
+2026-10-27 on SonarLink 1.14.50-dev recordings: the two pool logs of that
+day, diffDepthCompensation, the September beach set):
     * Session header packets (packet_id 10, 12) carry src=0 (server),
-      dst=0xFF (broadcast).
-    * Sonar profile packets (packet_id 2198) carry src = Omniscan device_id
-      (1=port, 2=starboard), dst=0 (host).
-    * Mavlink wrapper packets (packet_id 150) carry src = platform device_id
-      (3=BlueBoat), dst=0 (host).
+      dst=0xFF (broadcast); id 12 follows id 10 immediately.
+    * Sonar profile packets (packet_id 2198) and Omniscan status packets
+      (2194) carry src = Omniscan device_id (1=port, 2=starboard), dst=0.
+    * Mavlink wrapper packets (packet_id 150) carry src=0xFF, dst=0, and a
+      mavlink2rest JSON body with sorted keys and 2-space indentation. (This
+      module wrote src=3, the platform device_id, until 2026-10-27; no reader
+      in this repository routes mavlink by its src byte.)
 
-SonarView links a packet to a device using byte 6 (src_device_id) matched
-against the device_id field declared in the session_devices / session_platform
-JSON in the file's first packet.
+SonarView links a sonar packet to a device using byte 6 (src_device_id)
+matched against the device_id field declared in the session_devices JSON in
+the file's first packet.
 """
 
 from __future__ import annotations
@@ -62,6 +66,8 @@ DEVICE_ID_PLATFORM: int = 3
 
 # Broadcast destination tag (byte 7) used on session-metadata packets.
 DST_BROADCAST: int = 0xFF
+# Source tag (byte 6) SonarView writes on every mavlink wrapper packet.
+MAVLINK_WRAPPER_SRC: int = 0xFF
 
 # Default file roll threshold (matches brping's MAX_LOG_SIZE_MB).
 MAX_LOG_SIZE_BYTES: int = 500 * 1000 * 1000
@@ -75,11 +81,11 @@ DEFAULT_MAVLINK_FILTER: str = (
     "PARAM_VALUE|VFR_HUD|STATUSTEXT|AUTOPILOT_VERSION"
 )
 
-# Mavlink message subscription list reported in session_platform.options.
-# These are the mavlink message_id + rate pairs the SonarView/SonarLink
-# server requests from BlueOS. Purely descriptive in our case -- mavros
-# does the real subscribing on the robot. Values match what SonarView
-# itself writes in reference .svlog files.
+# Mavlink message subscription list reported in session_platform.options:
+# the message_id + rate pairs SonarView/SonarLink requests from the
+# autopilot, as it writes them in its own .svlog files. Since 2026-10-27 the
+# processor requests exactly this set through mavros
+# (/mavros/set_message_interval), so the header describes what was asked for.
 DEFAULT_PERIODIC_MESSAGES: list = [
     {"message_id": 0,   "frequency_hz": 1.0},          # HEARTBEAT
     {"message_id": 30,  "frequency_hz": 30.0},         # ATTITUDE
@@ -90,6 +96,20 @@ DEFAULT_PERIODIC_MESSAGES: list = [
     {"message_id": 49,  "frequency_hz": 1.0},          # GPS_GLOBAL_ORIGIN
     {"message_id": 148, "frequency_hz": 1.0 / 60.0},   # AUTOPILOT_VERSION
 ]
+
+# SonarView's view configuration (packet id 12), as SonarLink wrote it in the
+# 2026-10-27 pool recordings: its display state when the file is reopened in
+# SonarView. No reader in this repository consumes it.
+DEFAULT_VIEW_CONFIG: dict = {
+    "platform_mesh_id": None,
+    "view": "scanner",
+    "altitude_device_id": None,
+    "altitude_m": 0,
+    "gamma": 0.2,
+    "signal_range_min": 0.08,
+    "signal_range_max": 0.85,
+    "render_priority": "sequential",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +183,7 @@ def build_session_metadata(
                 "options": {
                     "transducer_deg": -90,
                     "imu_deg": 0,
-                    "doppler_enable": False,
+                    "doppler_enable": True,     # as SonarView writes it
                 },
                 "device_id": DEVICE_ID_PORT,
                 "product_id": "os450",
@@ -175,7 +195,7 @@ def build_session_metadata(
                 "options": {
                     "transducer_deg": 90,
                     "imu_deg": 0,
-                    "doppler_enable": False,
+                    "doppler_enable": True,     # as SonarView writes it
                 },
                 "device_id": DEVICE_ID_STBD,
                 "product_id": "os450",
@@ -221,16 +241,29 @@ def build_session_metadata(
     return frame_packet(JSON_WRAPPER_ID, payload, src=0, dst=DST_BROADCAST)
 
 
+def build_view_config(view: Optional[dict] = None) -> bytes:
+    """Build SonarView's view-config packet (packet_id=12).
+
+    SonarView writes it right after the session metadata; `SvlogWriter`'s
+    metadata provider may return both packets concatenated.
+    """
+    payload = json.dumps(dict(DEFAULT_VIEW_CONFIG if view is None else view),
+                         indent=2).encode("utf-8")
+    return frame_packet(VIEW_CONFIG_ID, payload, src=0, dst=DST_BROADCAST)
+
+
 def build_mavlink_wrapper(mavlink_message: dict) -> bytes:
     """Wrap a mavlink2rest-style JSON dict as a MAVLINK_WRAPPER packet (id=150).
 
     The dict must already be in mavlink2rest's envelope shape:
         {"header":  {"system_id": ..., "component_id": ..., "sequence": ...},
          "message": {"type": "ATTITUDE" | "GLOBAL_POSITION_INT" | ..., ...}}
+    Serialised as SonarView does: sorted keys, 2-space indent, src=0xFF.
     """
-    payload = json.dumps(mavlink_message, indent=2).encode("utf-8")
+    payload = json.dumps(mavlink_message, indent=2,
+                         sort_keys=True).encode("utf-8")
     return frame_packet(
-        MAVLINK_WRAPPER_ID, payload, src=DEVICE_ID_PLATFORM, dst=0
+        MAVLINK_WRAPPER_ID, payload, src=MAVLINK_WRAPPER_SRC, dst=0
     )
 
 
@@ -246,6 +279,15 @@ class SvlogWriter:
     file-open time, which is produced by an injected `metadata_provider`
     callable so the caller controls every field.
 
+    Failures are never silent. A recording that cannot be opened or continued
+    reports through the injected `error_reporter` (stderr when none is given)
+    and leaves `active` False -- this module is ROS-free by contract, so the
+    caller supplies whatever logger it has. A run that looks successful and
+    wrote nothing is the one outcome that must be impossible.
+
+    Recorded `.svlog` files are primary field data: an existing file is never
+    truncated or deleted. A name collision rolls to a suffixed name instead.
+
     All public methods are thread-safe; the port-side sonar thread, the
     starboard-side sonar thread and the ROS executor thread may all call
     `write()` concurrently.
@@ -256,10 +298,12 @@ class SvlogWriter:
         log_dir: Path,
         metadata_provider: Callable[[], bytes],
         max_size_bytes: int = MAX_LOG_SIZE_BYTES,
+        error_reporter: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._log_dir = Path(log_dir)
         self._metadata_provider = metadata_provider
         self._max_size_bytes = max_size_bytes
+        self._error_reporter = error_reporter
 
         self._lock = threading.Lock()
         self._active = False
@@ -277,12 +321,27 @@ class SvlogWriter:
             return self._path
 
     def start(self) -> Optional[Path]:
-        """Open a new .svlog and write the session header."""
+        """Open a new .svlog and write the session header.
+
+        Returns the file, or None if the recording could not be opened -- in
+        which case the reason has already gone to the error reporter. Callers
+        must branch on the return value: reporting "recording started" on a
+        None is the silent-failure this guards against.
+        """
         with self._lock:
             if self._active:
                 return self._path
-            #self._log_dir.mkdir(parents=True, exist_ok=True)
-            self._roll_unlocked()
+            try:
+                self._log_dir.mkdir(parents=True, exist_ok=True)
+                self._roll_unlocked()
+            except OSError as exc:
+                self._path = None
+                self._bytes_written = 0
+                self._report(
+                    f"recording NOT started: cannot open a .svlog in "
+                    f"{self._log_dir}: {exc}"
+                )
+                return None
             self._active = True
             return self._path
 
@@ -297,22 +356,37 @@ class SvlogWriter:
         with self._lock:
             if not self._active or self._path is None:
                 return
-            if self._bytes_written > self._max_size_bytes:
-                self._roll_unlocked()
             try:
+                if self._bytes_written > self._max_size_bytes:
+                    self._roll_unlocked()
                 with open(self._path, "ab") as f:
                     f.write(raw_bytes)
                 self._bytes_written += len(raw_bytes)
-            except OSError:
-                # Disk full / unmounted / permissions -- stop quietly.
+            except OSError as exc:
+                # Disk full / unmounted / permissions. Recording stops here,
+                # and says so: `_active` is False from now on, so this fires
+                # once rather than once per ping.
+                failed, self._path = self._path, None
                 self._active = False
-                self._path = None
+                self._report(f"recording STOPPED: writing {failed} failed: {exc}")
+
+    def _report(self, message: str) -> None:
+        """Surface a failure through the caller's logger, else to stderr."""
+        if self._error_reporter is not None:
+            self._error_reporter(message)
+        else:
+            print(f"[svlog] {message}", file=sys.stderr, flush=True)
 
     def _roll_unlocked(self) -> None:
-        name = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-        path = self._log_dir / f"{name}.svlog"
-        if path.exists():
-            path.unlink()
+        # An existing .svlog is primary field data and is never deleted or
+        # truncated: a collision (two recordings in the same second, or a
+        # 500 MB roll inside one) takes a suffixed name instead.
+        stem = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+        path = self._log_dir / f"{stem}.svlog"
+        serial = 0
+        while path.exists():
+            serial += 1
+            path = self._log_dir / f"{stem}-{serial:03d}.svlog"
         self._path = path
         self._bytes_written = 0
         meta = self._metadata_provider()

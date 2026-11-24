@@ -16,6 +16,8 @@ install(PROGRAMS src/_custom_libraries/svlog_helper.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/_custom_libraries/math_helper.py
         DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/omniscan_link.py
+        DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS src/sss_node.py
         DESTINATION lib/${PROJECT_NAME})
