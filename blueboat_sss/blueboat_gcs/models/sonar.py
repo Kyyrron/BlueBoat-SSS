@@ -16,6 +16,7 @@ interpolated values, no empty-column holes. See :func:`native_bins` and
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -136,7 +137,15 @@ class SonarPing:
     #: every ping built before 2026-11-15 and every synthetic one. A ping is
     #: PLACED from :attr:`sensor_x` / :attr:`sensor_y`, never from
     #: ``robot_x`` / ``robot_y`` (those are the boat, e.g. its trajectory).
+    #: Always finite: a non-finite arm is no arm (``__post_init__``), so a
+    #: consumer reads the field as it is.
     x_offset_m: float = 0.0
+
+    def __post_init__(self) -> None:
+        # The one place the arm is made safe, for every producer (live
+        # listener, .svlog reader, --sim, benches, dataclasses.replace).
+        if not math.isfinite(self.x_offset_m):
+            object.__setattr__(self, "x_offset_m", 0.0)
 
     @property
     def sensor_x(self) -> float:

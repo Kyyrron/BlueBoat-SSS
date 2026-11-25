@@ -39,7 +39,6 @@ from . import left_panel as lp
 from . import right_panel as rp
 from .left_panel import LeftPanel
 from .log_console import LogConsole
-from ..core.seabed_imager import LEVER_ARM_M, waterfall_pixel_to_world
 from ..utils.attitude import AttitudeBuffer
 from ..utils.geodesy import format_latlon
 from .map_layers import (DetectionLayer, MeasureLayer, MosaicLayer,
@@ -642,21 +641,14 @@ class MainWindow(QMainWindow):
     def _on_waterfall_point(self, row: int, col: int) -> None:
         """A click in the waterfall selects the same physical point on
         the world map, with its GPS coordinates."""
-        meta = self.waterfall_service.row_meta(row)
-        if meta is None:
+        # As the seabed pictures (georef convention 3).
+        point = self.waterfall_service.pixel_to_world(row, col)
+        if point is None:
             self.statusBar().showMessage(
                 "No position for that waterfall point (gap row, or the "
                 "history was discarded).", 6000)
             return
-        # As the seabed pictures (georef convention 3): the row's tracked
-        # bottom, the lateral lever arm (row_georef) and the row's fore/aft
-        # arm (row_lever_x; 0 = convention 2).
-        rx, ry, yaw, bottom = self.waterfall_service.row_georef(row)
-        wx, wy = waterfall_pixel_to_world(
-            rx, ry, yaw, bottom, self.waterfall_service.pitch_m,
-            float(col), self.waterfall_service.columns, *LEVER_ARM_M,
-            lever_x=self.waterfall_service.row_lever_x(row))
-        wx, wy = float(wx), float(wy)
+        wx, wy = point
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(
             wx, wy, format_latlon(*gps) if gps else "")

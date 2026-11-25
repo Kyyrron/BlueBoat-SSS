@@ -85,11 +85,12 @@ _SVLOG_MIN_BYTES = 10
 
 
 def session_x_offset(arms):
-    """``metadata.json["transducer_x_offset_m"]`` from the distinct
-    fore/aft arms a session's pings carried: the value when there is one
-    (every session in practice), the list when it changed, None when the
-    session holds no ping."""
-    arms = [float(a) for a in arms]
+    """``metadata.json["transducer_x_offset_m"]`` from the fore/aft arms a
+    session's pings carried (any iterable, repeats allowed): the value when
+    there is one (every session in practice), the distinct values in order
+    of first appearance when it changed, None when the session holds no
+    ping."""
+    arms = list(dict.fromkeys(float(a) for a in arms))
     if not arms:
         return None
     return arms[0] if len(arms) == 1 else arms
@@ -188,9 +189,8 @@ class RecordingManager(QObject):
     def _count_ping(self, ping) -> None:
         if self.active:
             self._ping_count += 1
-            arm = float(getattr(ping, "x_offset_m", 0.0))
-            if arm not in self._x_offsets:
-                self._x_offsets.append(arm)
+            if ping.x_offset_m not in self._x_offsets:
+                self._x_offsets.append(ping.x_offset_m)
 
     def _log_detection(self, det: Detection) -> None:
         if self.active:

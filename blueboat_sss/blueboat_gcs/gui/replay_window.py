@@ -42,11 +42,10 @@ from PySide6.QtWidgets import (QDockWidget, QHBoxLayout, QLabel, QMainWindow,
 from ..config.settings import AppConfig
 from ..core.geo_service import GeoService
 from ..core.mosaic_service import MosaicService
-from ..core.seabed_imager import (LEVER_ARM_M, generate_from_pings,
-                                  waterfall_pixel_to_world)
+from ..core.seabed_imager import generate_from_pings
 from ..utils.geodesy import format_latlon
 from ..core.signals import AppSignals
-from ..core.svlog import SvlogMission, load_svlog
+from ..core.svlog import SvlogMission, load_svlog_with_config
 from ..core.waterfall_service import WaterfallService
 from ..mapping.tiles import TileFetcher
 from ..models.robot_state import RobotState
@@ -356,20 +355,14 @@ class ReplayWindow(QMainWindow):
     def _on_waterfall_point(self, row: int, col: int) -> None:
         """A click in the replay waterfall selects the same physical
         point on the map, with its GPS coordinates."""
-        meta = self.waterfall_service.row_meta(row)
-        if meta is None:
+        # As the seabed pictures (georef convention 3).
+        point = self.waterfall_service.pixel_to_world(row, col)
+        if point is None:
             self.statusBar().showMessage(
                 "No position for that waterfall point (session gap row).",
                 6000)
             return
-        # As the seabed pictures (georef convention 3): row_georef and the
-        # row's fore/aft arm (row_lever_x; 0 = convention 2).
-        rx, ry, yaw, bottom = self.waterfall_service.row_georef(row)
-        wx, wy = waterfall_pixel_to_world(
-            rx, ry, yaw, bottom, self.waterfall_service.pitch_m,
-            float(col), self.waterfall_service.columns, *LEVER_ARM_M,
-            lever_x=self.waterfall_service.row_lever_x(row))
-        wx, wy = float(wx), float(wy)
+        wx, wy = point
         gps = self.geo.local_to_gps(wx, wy)
         self.selection_layer.show_at(
             wx, wy, format_latlon(*gps) if gps else "")
@@ -715,20 +708,13 @@ class ReplayWindow(QMainWindow):
         slant range)."""
         self._config.depth.mode = mode
         self._config.depth.manual_m = manual_m
-        from ..core.svlog import load_svlog
         progress = QProgressDialog(
             f"Re-processing with depth compensation: {mode}...", None, 0, 100, self)
         progress.setWindowModality(Qt.WindowModal)
         try:
-            self._mission = load_svlog(
-                self._mission.path,
-                progress=lambda f: progress.setValue(int(f * 100)),
-                depth_mode=mode, manual_depth_m=manual_m,
-                blank_nadir=self._config.depth.blank_nadir,
-                nadir_blank_m=self._config.depth.nadir_blank_m,
-                nadir_max_fraction=self._config.depth.nadir_max_fraction,
-                transducer_x_offset_m=(
-                    self._config.alignment.transducer_x_offset_m))
+            self._mission = load_svlog_with_config(
+                self._mission.path, self._config,
+                progress=lambda f: progress.setValue(int(f * 100)))
         finally:
             progress.close()
         # The native rows and the tracked bottom do not depend on the depth
@@ -821,14 +807,9 @@ def open_svlog_dialog(parent, config: AppConfig) -> Optional[ReplayWindow]:
     progress.setWindowModality(Qt.WindowModal)
     progress.setMinimumDuration(0)
     try:
-        mission = load_svlog(
-            Path(path), progress=lambda f: progress.setValue(int(f * 100)),
-            depth_mode=config.depth.mode,
-            manual_depth_m=config.depth.manual_m,
-            blank_nadir=config.depth.blank_nadir,
-            nadir_blank_m=config.depth.nadir_blank_m,
-            nadir_max_fraction=config.depth.nadir_max_fraction,
-            transducer_x_offset_m=config.alignment.transducer_x_offset_m)
+        mission = load_svlog_with_config(
+            Path(path), config,
+            progress=lambda f: progress.setValue(int(f * 100)))
     except (OSError, ValueError) as exc:
         progress.close()
         QMessageBox.critical(parent, "Open SVLOG",

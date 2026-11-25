@@ -757,10 +757,9 @@ def load_svlog(path: Path,
     """
     data = Path(path).read_bytes()
     mission = SvlogMission(path=Path(path))
-    # The fore/aft arm every decoded ping carries (a non-finite value = none).
+    # The fore/aft arm every decoded ping carries (SonarPing turns a
+    # non-finite value into none).
     x_offset_m = float(transducer_x_offset_m)
-    if not math.isfinite(x_offset_m):
-        x_offset_m = 0.0
 
     clock_ns = 0
     last_boot_ms: Optional[int] = None
@@ -1139,3 +1138,20 @@ def load_svlog(path: Path,
     if progress is not None:
         progress(1.0)
     return mission
+
+
+def load_svlog_with_config(path: Path, config,
+                           progress: Optional[Callable[[float], None]] = None
+                           ) -> SvlogMission:
+    """:func:`load_svlog` with every processing setting from the GCS config
+    (``depth.*``, ``alignment.transducer_x_offset_m``): the call the replay
+    window and the session rebuild make, so a setting added here reaches
+    all of them and none falls back to :func:`load_svlog`'s own default."""
+    return load_svlog(
+        path, progress=progress,
+        depth_mode=config.depth.mode,
+        manual_depth_m=config.depth.manual_m,
+        blank_nadir=config.depth.blank_nadir,
+        nadir_blank_m=config.depth.nadir_blank_m,
+        nadir_max_fraction=config.depth.nadir_max_fraction,
+        transducer_x_offset_m=config.alignment.transducer_x_offset_m)

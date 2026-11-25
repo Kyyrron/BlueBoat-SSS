@@ -353,8 +353,8 @@ class SeabedImage:
                           "kept in the data and darkened by the display "
                           "model (not erased)",
                 "formula": (FORMULA_CONVENTION_3
-                            if int((self.georef or {}).get("convention", 0))
-                            >= GEOREF_CONVENTION_FORE_AFT
+                            if (self.georef or {}).get("convention")
+                            == GEOREF_CONVENTION_FORE_AFT
                             else FORMULA_CONVENTION_2),
             },
             "rows_data": [
@@ -551,9 +551,7 @@ class SeabedImager(QObject):
         # One fore/aft arm per picture (its ``georef`` states one): pings
         # carrying another arm end the current window, as a layout change
         # does. In practice the arm is constant for a whole stream.
-        arm = float(getattr(ping, "x_offset_m", 0.0))
-        if not math.isfinite(arm):
-            arm = 0.0
+        arm = ping.x_offset_m
         if arm != self._lever_x:
             if self._buf_rows:
                 self.break_window()

@@ -225,8 +225,9 @@ show world + GPS coordinates (coordinate card in the main window, status bar in
 replay). Gap rows and evicted history refuse with a status message. Since
 2026-10-16 clicks and overlay use the pictures' georef convention:
 `WaterfallService.row_georef` (the row's tracked bottom `h`),
-`seabed_imager.LEVER_ARM_M` (0.285 m per side) and, since 2026-11-15,
-`WaterfallService.row_lever_x` (the row's fore/aft arm, below).
+`seabed_imager.LEVER_ARM_M` (0.285 m per side) and, since 2026-11-15, the row's
+fore/aft arm (below); both windows resolve a click with one call,
+`WaterfallService.pixel_to_world(row, col)` (None on a gap or evicted row).
 
 **Fore/aft arm: a ping is placed from the transducers' point (2026-11-15, CR-SSS-2).**
 The transducers sit `a` = −0.345 m along the heading from the navigation pose (0.345 m
@@ -234,7 +235,8 @@ aft; adopted from the simulator's profile, not measured — the module `CLAUDE.m
 *Fore/aft arm*). Until this date every placement started from the navigation point, so
 one object seen on two opposite headings landed `2·|a|` = 0.69 m apart.
 - **The rule, one definition:** `models/sonar.sensor_point(x, y, yaw, a)` =
-  `(x + cos(yaw)·a, y + sin(yaw)·a)`; `SonarPing.x_offset_m` carries `a` and
+  `(x + cos(yaw)·a, y + sin(yaw)·a)`; `SonarPing.x_offset_m` carries `a` (a non-finite
+  value becomes 0.0 in `SonarPing.__post_init__`, so no consumer re-checks it) and
   `SonarPing.sensor_x` / `sensor_y` apply it to the ping's **final** pose (after the live
   re-stamping of pose and compass yaw). `a = 0` returns the pose itself, the same objects,
   so everything computed without an arm is bit for bit what it was.
@@ -242,13 +244,15 @@ one object seen on two opposite headings landed `2·|a|` = 0.69 m apart.
   (`core/live_native.transducer_x_offset_of`; the processor is the one source in a live
   graph, and one built before 2026-11-15 sends 0.0 = the old placement); replay, "Save
   pictures" and the session rebuild, `alignment.transducer_x_offset_m` (default −0.345 =
-  `core/svlog.TRANSDUCER_X_OFFSET_M`), passed to `load_svlog(transducer_x_offset_m=…)`.
+  `core/svlog.TRANSDUCER_X_OFFSET_M`), passed to `load_svlog(transducer_x_offset_m=…)` by
+  `core/svlog.load_svlog_with_config`, the one call the replay window and the rebuild make.
   `0.0` there re-places a recording as before. The `--sim` bench simulator sends no arm.
 - **Where it is applied:** the mosaic (`mapping/rasterizer.py` builds its ping line, and
   the virtual pings between two real ones, from the sensor point; the legacy scatter in
   `core/mosaic_service.py` too), the swath line (`gui/main_window.py`), the waterfall click
-  (both windows: `waterfall_pixel_to_world(..., lever_x=row_lever_x(row))`; the arm is the
-  ninth per-row metadata column, in memory only) and the seabed-picture grids (below).
+  (both windows: `WaterfallService.pixel_to_world`, which passes the row's arm as
+  `waterfall_pixel_to_world(..., lever_x=…)`; the arm is the ninth per-row metadata column,
+  in memory only) and the seabed-picture grids (below).
 - **Where it is not, on purpose:** `boat_trajectory.csv` and every boat marker (the
   navigation point); the row poses in the pictures' `rows_data` (navigation pose, the arm
   is in `georef`); the along-track estimator and the square-row sampling (unchanged, so

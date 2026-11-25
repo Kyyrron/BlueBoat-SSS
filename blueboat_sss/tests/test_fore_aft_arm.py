@@ -47,12 +47,13 @@ from blueboat_gcs.core.live_native import transducer_x_offset_of
 from blueboat_gcs.core.recording_session import session_x_offset
 from blueboat_gcs.core.seabed_imager import (FORMULA_CONVENTION_2,
                                              FORMULA_CONVENTION_3, GEOREF,
-                                             LEVER_ARM_M, SeabedImager,
-                                             feed_pings, georef_for,
+                                             LEVER_ARM_M, georef_for,
                                              waterfall_pixel_to_world)
 from blueboat_gcs.core.waterfall_service import WaterfallService
 from blueboat_gcs.mapping.rasterizer import PingRasterizer
 from blueboat_gcs.models.sonar import SonarPing, sensor_point
+
+from test_seabed_pictures import run as _images
 
 ARM = gcs_svlog.TRANSDUCER_X_OFFSET_M          # -0.345: 0.345 m aft
 
@@ -184,6 +185,12 @@ def test_no_arm_returns_the_pose_itself():
     assert sx is x and sy is y
     p = pass_pings("east", ARM, placed_with=0.0)[3]
     assert (p.sensor_x, p.sensor_y) == (p.robot_x, p.robot_y)
+    # A non-finite arm is no arm, whoever built the ping: SonarPing is
+    # the one place the value is made safe.
+    for bad in (math.nan, math.inf):
+        q = dc_replace(p, x_offset_m=bad)
+        assert q.x_offset_m == 0.0
+        assert (q.sensor_x, q.sensor_y) == (q.robot_x, q.robot_y)
 
 
 def test_pixel_to_world_without_an_arm_is_bit_identical():
@@ -254,20 +261,12 @@ def _clicked_target(cfg, pings) -> tuple:
     row = MID
     col = svc.columns // 2 - 1 - _target_bin()
     assert svc.chronological()[row, col] == 0.0, "not the target's pixel"
-    rx, ry, yaw, bottom = svc.row_georef(row)
-    wx, wy = waterfall_pixel_to_world(
-        rx, ry, yaw, bottom, svc.pitch_m, float(col), svc.columns,
-        *LEVER_ARM_M, lever_x=svc.row_lever_x(row))
-    return float(wx), float(wy)
+    return svc.pixel_to_world(row, col)
 
 
 def _pictured_target(cfg, pings) -> tuple:
     """The bright pixel's world position in the seabed pictures' own grids."""
-    imager = SeabedImager(cfg)
-    images = []
-    imager.image_ready.connect(images.append)
-    feed_pings(imager, pings)
-    for img in images:
+    for img in _images(cfg, pings):
         r, c = np.unravel_index(int(np.nanargmax(img.intensity_db)),
                                 img.intensity_db.shape)
         if img.intensity_db[r, c] == 0.0:
@@ -288,8 +287,8 @@ def _config(tmp_config, *, densify=True) -> AppConfig:
 
 PATHS = {
     "rasteriser": lambda cfg, pings: _rasterised_target(pings),
-    "mosaic": lambda cfg, pings: _mosaic_target(cfg, pings),
-    "mosaic_scatter": lambda cfg, pings: _mosaic_target(cfg, pings),
+    "mosaic": _mosaic_target,
+    "mosaic_scatter": _mosaic_target,
     "waterfall_click": _clicked_target,
     "seabed_picture": _pictured_target,
 }
@@ -342,8 +341,14 @@ def test_the_swath_line_passes_through_the_transducers(qapp, tmp_config,
         sx, sy, yaw, _range = window._pending_swath
         assert (sx, sy) == pytest.approx((ping.robot_x - ARM, ping.robot_y))
         assert yaw == ping.yaw
-        # ...and the waterfall click of that row uses the same arm.
-        assert window.waterfall_service.row_lever_x(0) == ARM
+        # ...and a waterfall click on that row is placed from the same point.
+        svc = window.waterfall_service
+        col = svc.columns // 4
+        _rx, _ry, _yaw, bottom = svc.row_georef(0)
+        assert svc.pixel_to_world(0, col) == pytest.approx(
+            waterfall_pixel_to_world(sx, sy, yaw, bottom, svc.pitch_m,
+                                     float(col), svc.columns, *LEVER_ARM_M),
+            abs=1e-9)
     finally:
         window.close()
         qapp.processEvents()
@@ -358,13 +363,10 @@ def test_the_detection_overlay_needs_no_arm(qapp, tmp_config):
     for p in pings:
         svc.on_sonar_ping(p)
     row, col = MID, svc.columns // 2 - 1 - _target_bin()
-    rx, ry, yaw, bottom = svc.row_georef(row)
-    wx, wy = waterfall_pixel_to_world(
-        rx, ry, yaw, bottom, svc.pitch_m, float(col), svc.columns,
-        *LEVER_ARM_M, lever_x=svc.row_lever_x(row))
+    wx, wy = svc.pixel_to_world(row, col)
     received = []
     svc.detections_updated.connect(received.extend)
-    svc.add_detection(pings[row].t, float(wx), float(wy), "target")
+    svc.add_detection(pings[row].t, wx, wy, "target")
     svc.set_enabled(True)
     hit = [d for d in received if d["label"] == "target"]
     assert hit and hit[-1]["row"] == row
@@ -372,14 +374,6 @@ def test_the_detection_overlay_needs_no_arm(qapp, tmp_config):
 
 
 # ---- the pictures say what they did ---------------------------------------------
-
-def _images(cfg, pings):
-    imager = SeabedImager(cfg)
-    out = []
-    imager.image_ready.connect(out.append)
-    feed_pings(imager, pings)
-    return out
-
 
 @pytest.mark.parametrize("geometry", ["ping", "square"])
 def test_pictures_without_an_arm_are_convention_2_as_before(
@@ -478,7 +472,7 @@ def test_the_listener_reads_the_field_and_nothing_else_places_a_ping():
     assert "(ping.sensor_x, ping.sensor_y, ping.yaw" in \
         (gcs / "gui" / "main_window.py").read_text()
     for window in ("main_window.py", "replay_window.py"):
-        assert "lever_x=self.waterfall_service.row_lever_x(row)" in \
+        assert "self.waterfall_service.pixel_to_world(row, col)" in \
             (gcs / "gui" / window).read_text()
 
 

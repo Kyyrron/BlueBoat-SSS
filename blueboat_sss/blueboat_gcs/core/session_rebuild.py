@@ -37,7 +37,7 @@ from ..config.settings import AppConfig
 from ..core.seabed_imager import generate_from_pings
 from .mosaic_service import MosaicService
 from .recording_session import session_x_offset, write_session_metadata
-from .svlog import SvlogMission, load_svlog
+from .svlog import SvlogMission, load_svlog_with_config
 from .waterfall_service import WaterfallService
 
 
@@ -58,19 +58,14 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
             return None
         return lambda f: progress(lo + (hi - lo) * f)
 
-    mission = load_svlog(svlog_path, progress=_p(0.0, 0.4),
-                         depth_mode=config.depth.mode,
-                         manual_depth_m=config.depth.manual_m,
-                         blank_nadir=config.depth.blank_nadir,
-                         nadir_blank_m=config.depth.nadir_blank_m,
-                         nadir_max_fraction=config.depth.nadir_max_fraction,
-                         transducer_x_offset_m=(
-                             config.alignment.transducer_x_offset_m))
+    mission = load_svlog_with_config(svlog_path, config,
+                                     progress=_p(0.0, 0.4))
+    pings = mission.pings
 
     # One display model for the three artifacts (the same rule as a
     # window): fitted over the whole log before anything is rendered.
     from .display_model import DisplayModel
-    model = DisplayModel.fit(config, mission.pings)
+    model = DisplayModel.fit(config, pings)
     mosaic = MosaicService(config, model)
     waterfall = WaterfallService(config, model)
     waterfall.reserve(mission.ping_count + len(mission.gap_times) + 16)
@@ -92,7 +87,7 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
     mosaic.save_into(session_dir / "mosaic")
     waterfall.export_into(session_dir / "waterfall")
     n_images = generate_from_pings(
-        mission.pings, session_dir / "seabed_images", config,
+        pings, session_dir / "seabed_images", config,
         progress=_p(0.7, 0.98), breaks=mission.gap_times, model=model)
 
     started = datetime.utcnow()
@@ -107,7 +102,7 @@ def rebuild_session(svlog_path: Path, session_dir: Path, config: AppConfig,
         # The fore/aft arm the rebuilt pings were placed with
         # (alignment.transducer_x_offset_m; a .svlog records none).
         "transducer_x_offset_m": session_x_offset(
-            sorted({float(p.x_offset_m) for p in mission.pings})),
+            p.x_offset_m for p in pings),
         "mosaic": {
             "cell_size_m": mosaic.cell_size_m,
             "densify": config.mosaic.densify,
